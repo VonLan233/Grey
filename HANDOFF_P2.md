@@ -102,16 +102,17 @@ cargo run -q -p grey-cli -- --no-save "hello"
 
 当前无阻塞项。
 
-建议补齐的严格验收补充项（可选）：
+严格验收补充项已完成：
 
-- Router fallback 集成测试（主 Provider 失败后验证 fallback 接管）
-- Gemini URL/body 集成测试（`alt=sse`、`x-goog-api-key`、`functionResponse` 映射）
+- Router fallback 集成测试（主 Provider 失败后验证 fallback 接管）：已通过
+- Gemini URL/body 严格集成测试（`alt=sse`、`x-goog-api-key`、`functionResponse` 映射）：已通过
 
 ### 5.2 已知技术债
 
 | # | 事项 | 说明 |
 |---|---|---|
-| 1 | Rust 工具链版本 | Homebrew rustc 版本可能低于 1.88，需固定通过 rustup 1.97.1 运行全量验收 |
+| 1 | Rust 工具链版本 | README 要求 1.97.1。当前环境下 `cargo` 可执行链路偶有回退到旧 rustc，需要在命令里显式使用 `~/.rustup/toolchains/1.97.1...`。建议加入本地统一脚本或文档提示。 |
+| 2 | 沙箱权限 | 部分 provider 流式测试（`anthropic/openai/gemini` 的监听 mock）在本沙箱报 `Operation not permitted`，属于执行环境权限限制。 |
 
 ---
 

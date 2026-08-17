@@ -266,9 +266,7 @@ fn request_body(request: &ChatRequest) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grey_core::{
-        collect, ChatMessage, ChatRequest, Role, ToolCall, ToolDefinition, ToolRisk,
-    };
+    use grey_core::{collect, ChatMessage, ChatRequest, Role, ToolCall, ToolDefinition, ToolRisk};
 
     #[test]
     fn builds_request_body_with_system_and_user() {
