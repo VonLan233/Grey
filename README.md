@@ -211,6 +211,8 @@ grey spike-c "流式测试"
 
 ```bash
 cargo fmt --all -- --check
+# 如果环境里 cargo clippy 有时回退到旧 rustc，可显式使用 rustup 1.97.1 的 cargo-clippy：
+# ~/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/cargo-clippy --workspace --all-targets --all-features -- -D warnings
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo build --workspace --release --locked
