@@ -18,7 +18,8 @@ pub use config::{
 };
 pub use context::{ContextAudit, ContextManager};
 pub use provider::{
-    collect, ChatMessage, ChatRequest, Provider, ProviderEvent, Role, ToolCall, Usage,
+    collect, ChatMessage, ChatRequest, Provider, ProviderEvent, ProviderModelRef, Role, ToolCall,
+    Usage,
 };
 pub use session::{Session, SessionStore, SessionSummary};
 pub use token::{CharApproxCounter, TiktokenCounter, TokenCounter};

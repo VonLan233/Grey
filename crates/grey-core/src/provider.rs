@@ -24,6 +24,43 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ProviderModelRef {
+    pub provider: String,
+    pub model: String,
+}
+
+impl ProviderModelRef {
+    pub fn new(provider: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            model: model.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ProviderModelRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.provider, self.model)
+    }
+}
+
+impl std::str::FromStr for ProviderModelRef {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (provider, model) = s
+            .split_once('/')
+            .ok_or_else(|| format!("expected `provider/model`, got `{s}`"))?;
+        if provider.is_empty() || model.is_empty() {
+            return Err(format!("provider and model must be non-empty in `{s}`"));
+        }
+        Ok(Self {
+            provider: provider.to_string(),
+            model: model.to_string(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: Role,

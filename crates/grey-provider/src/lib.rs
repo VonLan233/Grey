@@ -1,6 +1,7 @@
 //! Provider adapters.
 
 pub mod anthropic;
+pub mod fallback;
 pub mod mock;
 pub mod openai;
 mod sse;
