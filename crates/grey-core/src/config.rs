@@ -44,19 +44,14 @@ pub struct ModelEntry {
     pub output_limit: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum TaskKind {
     Planning,
     Coding,
     Fast,
+    #[default]
     Default,
-}
-
-impl Default for TaskKind {
-    fn default() -> Self {
-        Self::Default
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

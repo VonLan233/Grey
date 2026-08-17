@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::ChatMessage;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Session {
@@ -147,6 +147,28 @@ impl SessionStore {
             .map_err(Into::into)
     }
 
+    pub fn save_usage(&self, session_id: &str, usage_json: &str) -> Result<()> {
+        self.connection.lock().unwrap().execute(
+            "UPDATE sessions SET usage_json = ?1 WHERE id = ?2",
+            params![usage_json, session_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_usage(&self, session_id: &str) -> Result<Option<String>> {
+        self.connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT usage_json FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(|opt| opt.flatten())
+            .map_err(Into::into)
+    }
+
     fn migrate(&self) -> Result<()> {
         let connection = self.connection.lock().unwrap();
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -164,6 +186,15 @@ impl SessionStore {
                  CREATE INDEX IF NOT EXISTS sessions_workspace_updated
                    ON sessions(workspace, updated_at DESC);
                  PRAGMA user_version = 1;
+                 COMMIT;",
+            )?;
+        }
+        let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version < 2 {
+            connection.execute_batch(
+                "BEGIN;
+                 ALTER TABLE sessions ADD COLUMN usage_json TEXT;
+                 PRAGMA user_version = 2;
                  COMMIT;",
             )?;
         }
@@ -237,5 +268,57 @@ mod tests {
                 .id,
             session.id
         );
+    }
+
+    #[test]
+    fn schema_v2_migration_adds_usage_json_column() {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("sessions.db");
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                   id TEXT PRIMARY KEY,
+                   title TEXT NOT NULL,
+                   workspace TEXT NOT NULL,
+                   created_at INTEGER NOT NULL,
+                   updated_at INTEGER NOT NULL,
+                   messages_json TEXT NOT NULL
+                 );
+                 CREATE INDEX sessions_workspace_updated
+                   ON sessions(workspace, updated_at DESC);
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id, title, workspace, created_at, updated_at, messages_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params!["s1", "old", "/ws", 100, 100, "[]"],
+            )
+            .unwrap();
+        }
+
+        let store = SessionStore::open(&db_path).unwrap();
+        let loaded = store.load("s1").unwrap().unwrap();
+        assert_eq!(loaded.title, "old");
+    }
+
+    #[test]
+    fn save_and_load_usage_json_roundtrip() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(&directory.path().join("sessions.db")).unwrap();
+
+        let mut session = Session::new("test", "/workspace", vec![]);
+        store.save(&mut session).unwrap();
+
+        assert_eq!(store.load_usage(&session.id).unwrap(), None);
+
+        store
+            .save_usage(&session.id, r#"{"total_input_tokens":42}"#)
+            .unwrap();
+
+        let loaded = store.load_usage(&session.id).unwrap().unwrap();
+        assert!(loaded.contains("42"));
     }
 }

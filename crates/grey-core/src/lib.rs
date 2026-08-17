@@ -11,6 +11,7 @@ pub mod provider;
 pub mod session;
 pub mod token;
 pub mod tool;
+pub mod usage;
 
 pub use agent::{Agent, AgentEvent, AgentOptions, AgentOutcome};
 pub use cache::{CacheStats, CachedResponse, RequestCache};
@@ -26,3 +27,4 @@ pub use provider::{
 pub use session::{Session, SessionStore, SessionSummary};
 pub use token::{CharApproxCounter, TiktokenCounter, TokenCounter};
 pub use tool::{ToolDefinition, ToolExecutor, ToolResult, ToolRisk};
+pub use usage::{CostRate, SessionUsage, TurnUsage, UsageTracker};
