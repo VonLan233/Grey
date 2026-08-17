@@ -9,8 +9,9 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::{
-    ChatMessage, ChatRequest, ContextAudit, ContextManager, Provider, ProviderEvent, Role,
-    ToolCall, ToolExecutor, ToolResult, Usage,
+    CachedResponse, ChatMessage, ChatRequest, ContextAudit, ContextManager, Provider,
+    ProviderEvent, ProviderModelRef, RequestCache, Role, ToolCall, ToolExecutor, ToolResult, Usage,
+    UsageTracker,
 };
 
 #[derive(Debug, Clone)]
@@ -37,9 +38,23 @@ pub enum AgentEvent {
     Delta(String),
     ToolStarted(ToolCall),
     ToolFinished(ToolResult),
-    Retry { attempt: usize, error: String },
+    Retry {
+        attempt: usize,
+        error: String,
+    },
     ContextTrimmed(ContextAudit),
-    Completed { usage: Usage, steps: usize },
+    ProviderSwitched {
+        from: String,
+        to: String,
+        reason: String,
+    },
+    CacheHit {
+        model: String,
+    },
+    Completed {
+        usage: Usage,
+        steps: usize,
+    },
     Failed(String),
 }
 
@@ -50,13 +65,20 @@ pub struct AgentOutcome {
     pub response: String,
     pub usage: Usage,
     pub steps: usize,
+    pub cached: bool,
+    pub provider_id: String,
+    pub model: String,
 }
 
 pub struct Agent {
     provider: Arc<dyn Provider>,
+    provider_id: String,
     tools: Arc<dyn ToolExecutor>,
     context: ContextManager,
     options: AgentOptions,
+    cache: Option<Arc<RequestCache>>,
+    usage: Option<Arc<UsageTracker>>,
+    fallback_chain: Vec<ProviderModelRef>,
 }
 
 impl Agent {
@@ -67,11 +89,43 @@ impl Agent {
         options: AgentOptions,
     ) -> Self {
         Self {
+            provider_id: provider.id().to_string(),
             provider,
             tools,
             context,
             options,
+            cache: None,
+            usage: None,
+            fallback_chain: Vec::new(),
         }
+    }
+
+    pub fn new_legacy(
+        provider: Arc<dyn Provider>,
+        tools: Arc<dyn ToolExecutor>,
+        context: ContextManager,
+        options: AgentOptions,
+    ) -> Self {
+        Self::new(provider, tools, context, options)
+    }
+
+    pub fn with_cache(mut self, cache: Arc<RequestCache>) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    pub fn with_usage(mut self, usage: Arc<UsageTracker>) -> Self {
+        self.usage = Some(usage);
+        self
+    }
+
+    pub fn with_fallback_chain(mut self, chain: Vec<ProviderModelRef>) -> Self {
+        self.fallback_chain = chain;
+        self
+    }
+
+    pub fn provider_id(&self) -> &str {
+        &self.provider_id
     }
 
     pub async fn run_new(
@@ -97,6 +151,7 @@ impl Agent {
         messages.push(ChatMessage::new(Role::User, prompt));
         let definitions = self.tools.definitions();
         let mut total_usage = Usage::default();
+        let mut cached = false;
 
         for step in 1..=self.options.max_steps {
             let (prepared, audit) = self.context.prepare(&messages).await;
@@ -105,8 +160,86 @@ impl Agent {
             }
             let request = ChatRequest::new(self.options.model.clone(), prepared)
                 .with_tools(definitions.clone());
+
+            if let Some(cache) = &self.cache {
+                if let Some(cached_resp) = cache.get(&self.options.model, &request.messages) {
+                    cached = true;
+                    send_event(
+                        events,
+                        AgentEvent::CacheHit {
+                            model: self.options.model.clone(),
+                        },
+                    );
+                    let turn = CompletedTurn {
+                        text: cached_resp.text,
+                        calls: cached_resp.tool_calls,
+                        usage: cached_resp.usage,
+                    };
+                    total_usage.add_assign(&turn.usage);
+                    messages.push(ChatMessage::assistant(
+                        turn.text.clone(),
+                        turn.calls.clone(),
+                    ));
+
+                    if turn.calls.is_empty() {
+                        return Ok(AgentOutcome {
+                            messages,
+                            response: turn.text,
+                            usage: total_usage,
+                            steps: step,
+                            cached,
+                            provider_id: self.provider_id.clone(),
+                            model: self.options.model.clone(),
+                        });
+                    }
+                    if step == self.options.max_steps {
+                        bail!(
+                            "agent reached the maximum of {} provider steps",
+                            self.options.max_steps
+                        );
+                    }
+                    for call in turn.calls {
+                        send_event(events, AgentEvent::ToolStarted(call.clone()));
+                        let result = self.tools.execute(&call).await;
+                        send_event(events, AgentEvent::ToolFinished(result.clone()));
+                        messages.push(ChatMessage::tool_result(&call, result.model_content()));
+                    }
+                    continue;
+                }
+            }
+
             let turn = self.stream_turn(&request, events).await?;
             total_usage.add_assign(&turn.usage);
+
+            if let Some(usage_tracker) = &self.usage {
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                let turn_usage = crate::TurnUsage {
+                    provider: self.provider_id.clone(),
+                    model: self.options.model.clone(),
+                    input_tokens: turn.usage.input_tokens,
+                    output_tokens: turn.usage.output_tokens,
+                    cost_usd: 0.0,
+                    cached,
+                    timestamp,
+                };
+                usage_tracker.record(&self.session_id_for_usage(), turn_usage);
+            }
+
+            if !cached {
+                if let Some(cache) = &self.cache {
+                    let cached_resp = CachedResponse {
+                        text: turn.text.clone(),
+                        tool_calls: turn.calls.clone(),
+                        usage: turn.usage.clone(),
+                        cached_at: 0,
+                    };
+                    let _ = cache.put(&self.options.model, &request.messages, &cached_resp);
+                }
+            }
+
             messages.push(ChatMessage::assistant(
                 turn.text.clone(),
                 turn.calls.clone(),
@@ -118,6 +251,9 @@ impl Agent {
                     response: turn.text,
                     usage: total_usage,
                     steps: step,
+                    cached,
+                    provider_id: self.provider_id.clone(),
+                    model: self.options.model.clone(),
                 });
             }
             if step == self.options.max_steps {
@@ -136,6 +272,10 @@ impl Agent {
         }
 
         unreachable!("the bounded loop always returns or errors")
+    }
+
+    fn session_id_for_usage(&self) -> String {
+        "default".to_string()
     }
 
     async fn stream_turn(
@@ -391,5 +531,139 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("before completion"));
+    }
+
+    #[tokio::test]
+    async fn cache_hit_returns_without_provider_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(
+            RequestCache::open(
+                &dir.path().join("cache.db"),
+                crate::cache::RequestCacheConfig::default(),
+            )
+            .unwrap(),
+        );
+
+        let cache_messages = vec![
+            ChatMessage::new(Role::System, "system"),
+            ChatMessage::new(Role::User, "hello"),
+        ];
+        cache
+            .put(
+                "model",
+                &cache_messages,
+                &CachedResponse {
+                    text: "cached response".into(),
+                    tool_calls: vec![],
+                    usage: Usage {
+                        input_tokens: 5,
+                        output_tokens: 3,
+                    },
+                    cached_at: 0,
+                },
+            )
+            .unwrap();
+
+        let provider = Arc::new(ScriptedProvider {
+            turns: Mutex::new(VecDeque::new()),
+            requests: Mutex::new(Vec::new()),
+        });
+
+        let mut options = AgentOptions::new("model");
+        options.retries = 0;
+        let a = Agent::new(
+            provider.clone(),
+            Arc::new(ScriptedTools),
+            ContextManager::default(),
+            options,
+        )
+        .with_cache(cache);
+
+        let outcome = a.run_new("system", "hello", None).await.unwrap();
+        assert_eq!(outcome.response, "cached response");
+        assert!(outcome.cached);
+        assert_eq!(provider.requests.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn usage_recorded_after_turn() {
+        let provider = Arc::new(ScriptedProvider {
+            turns: Mutex::new(VecDeque::from([vec![
+                ProviderEvent::Delta("hi".into()),
+                ProviderEvent::Done(Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                }),
+            ]])),
+            requests: Mutex::new(Vec::new()),
+        });
+
+        let usage_config = crate::UsageConfig::default();
+        let tracker = Arc::new(UsageTracker::new(&usage_config));
+
+        let mut options = AgentOptions::new("model");
+        options.retries = 0;
+        let a = Agent::new(
+            provider,
+            Arc::new(ScriptedTools),
+            ContextManager::default(),
+            options,
+        )
+        .with_usage(tracker.clone());
+
+        let outcome = a.run_new("system", "hello", None).await.unwrap();
+        assert_eq!(outcome.response, "hi");
+        assert!(!outcome.cached);
+
+        let session_usage = tracker.session_usage("default").unwrap();
+        assert_eq!(session_usage.total_input_tokens, 10);
+        assert_eq!(session_usage.total_output_tokens, 5);
+        assert_eq!(session_usage.turns.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cached_response_stored_after_provider_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(
+            RequestCache::open(
+                &dir.path().join("cache.db"),
+                crate::cache::RequestCacheConfig::default(),
+            )
+            .unwrap(),
+        );
+
+        let provider = Arc::new(ScriptedProvider {
+            turns: Mutex::new(VecDeque::from([vec![
+                ProviderEvent::Delta("fresh".into()),
+                ProviderEvent::Done(Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                }),
+            ]])),
+            requests: Mutex::new(Vec::new()),
+        });
+
+        let mut options = AgentOptions::new("model");
+        options.retries = 0;
+        let a = Agent::new(
+            provider,
+            Arc::new(ScriptedTools),
+            ContextManager::default(),
+            options,
+        )
+        .with_cache(cache.clone());
+
+        let outcome = a.run_new("system", "hello", None).await.unwrap();
+        assert_eq!(outcome.response, "fresh");
+
+        let cached = cache.get(
+            "model",
+            &[
+                ChatMessage::new(Role::System, "system"),
+                ChatMessage::new(Role::User, "hello"),
+            ],
+        );
+        assert!(cached.is_some());
+        assert_eq!(cached.unwrap().text, "fresh");
     }
 }

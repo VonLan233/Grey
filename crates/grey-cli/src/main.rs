@@ -324,6 +324,10 @@ async fn run_with_text_events(
                 ),
                 AgentEvent::Completed { .. } => {}
                 AgentEvent::Failed(error) => eprintln!("[agent failed] {error}"),
+                AgentEvent::ProviderSwitched { from, to, reason } => {
+                    eprintln!("[switch] {from} → {to}: {reason}")
+                }
+                AgentEvent::CacheHit { model } => eprintln!("[cache] hit for {model}"),
             }
         }
     });

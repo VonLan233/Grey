@@ -356,6 +356,16 @@ impl AppState {
                 self.output.push_str(&format!("\n[failed] {error}\n"));
                 self.status = format!("failed: {error}");
             }
+            AgentEvent::ProviderSwitched { from, to, reason } => {
+                self.output
+                    .push_str(&format!("\n[switch] {from} → {to}: {reason}\n"));
+                self.status = format!("switched to {to}");
+            }
+            AgentEvent::CacheHit { model } => {
+                self.output
+                    .push_str(&format!("\n[cache] hit for {model}\n"));
+                self.status = "cache hit".into();
+            }
         }
         self.dirty = true;
     }
