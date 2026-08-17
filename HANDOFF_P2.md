@@ -134,6 +134,31 @@ cargo run -q -p grey-cli -- --provider openai --model gpt-5.3-codex-spark --no-s
   `GREY_PROVIDER_OPENAI_API_KEY=sk-xxx GREY_PROVIDER_OPENAI_BASE_URL=https://api.openai.com/v1 cargo run -q -p grey-cli -- --provider openai --model gpt-5.3-codex-spark --no-save --no-cache --format json "只回复 ok"`
 - 预期：HTTP 200，返回 JSON 中包含 provider/model/cached 字段及正常文本响应。
 
+### 2026-08-18 复验补充
+
+执行 `PATH=~/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin:$PATH` 下的全量门禁：
+
+- `cargo fmt --all -- --check`：通过
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`：通过
+- `cargo test --workspace --all-features`：通过（按当前记录，无失败）
+- `cargo test -p grey-cli --test p2 -- --test-threads=1`：13/13 通过
+- `cargo build --workspace --release --locked`：通过
+
+MCP/Hook 覆盖执行结果：
+
+- `crates/grey-cli/tests/p2.rs::pre_prompt_hook_rewrites_prompt_before_agent_request`：通过
+- `crates/grey-tools/tests/tools.rs::pre_tool_hook_blocks_and_post_tool_hook_runs_on_success`：通过
+- `crates/grey-tools/tests/tools.rs::post_tool_hook_error_marks_tool_failed_after_tool_success`：通过
+- `crates/grey-provider::gemini::tests::build_url_includes_alt_sse_and_model_path`：通过
+- `crates/grey-provider::gemini::tests::build_request_adds_x_goog_api_key_when_present`：通过
+- `crates/grey-provider::router::tests::stream_chat_falls_back_when_primary_fails_before_visible_output`：通过
+
+人工 smoke 运行：
+
+- 使用 `/tmp/run-grey-smoke-openai.sh` 且 `GREY_PROVIDER_OPENAI_API_KEY=sk-test-missing-token` 执行失败，返回：
+  `OpenAI provider returned 401 Unauthorized`（提示 key 无效）。  
+  说明实网调用链路与 `gpt-5.3-codex-spark` 目标路径可达，当前阻塞点为有效 `sk-` key 缺失。
+
 ---
 
 ## 六、关键数据结构速查
