@@ -707,7 +707,7 @@ ttl_hours = 12
         let cfg: GreyConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.fallback.providers, vec!["mock"]);
         assert_eq!(cfg.context.max_tokens, 65536);
-        assert_eq!(cfg.cache.enabled, true);
+        assert!(cfg.cache.enabled);
     }
 
     #[test]

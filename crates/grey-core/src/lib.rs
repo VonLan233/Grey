@@ -4,6 +4,7 @@
 //! integrations depend on this crate, never the other way around.
 
 pub mod agent;
+pub mod cache;
 pub mod config;
 pub mod context;
 pub mod provider;
@@ -12,6 +13,7 @@ pub mod token;
 pub mod tool;
 
 pub use agent::{Agent, AgentEvent, AgentOptions, AgentOutcome};
+pub use cache::{CacheStats, CachedResponse, RequestCache};
 pub use config::{
     AnthropicConfig, CacheConfig, ContextConfig, FallbackConfig, GreyConfig, LspConfig, ModelEntry,
     OpenAiConfig, ProviderEntry, RouteRule, TaskKind, UsageConfig,
