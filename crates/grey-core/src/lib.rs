@@ -12,7 +12,10 @@ pub mod token;
 pub mod tool;
 
 pub use agent::{Agent, AgentEvent, AgentOptions, AgentOutcome};
-pub use config::{AnthropicConfig, GreyConfig, LspConfig, OpenAiConfig};
+pub use config::{
+    AnthropicConfig, CacheConfig, ContextConfig, FallbackConfig, GreyConfig, LspConfig, ModelEntry,
+    OpenAiConfig, ProviderEntry, RouteRule, TaskKind, UsageConfig,
+};
 pub use context::{ContextAudit, ContextManager};
 pub use provider::{
     collect, ChatMessage, ChatRequest, Provider, ProviderEvent, Role, ToolCall, Usage,
