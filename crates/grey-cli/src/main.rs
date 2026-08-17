@@ -11,7 +11,7 @@ use grey_core::{
     config, Agent, AgentEvent, AgentOptions, AgentOutcome, ChatMessage, ChatRequest,
     ContextManager, GreyConfig, Provider, Role, Session, SessionStore, Usage,
 };
-use grey_provider::{build_provider, model_for_provider};
+use grey_provider::router::ProviderRouter;
 use grey_tools::{AlwaysApprove, Approver, BuiltinTools, DenySideEffects, StdioApprover};
 use serde::Serialize;
 use tokio::sync::mpsc;
@@ -73,8 +73,39 @@ struct Cli {
     #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
 
+    /// Task kind for routing: planning, coding, fast, or default.
+    #[arg(long, global = true, value_enum)]
+    task: Option<TaskKindArg>,
+
+    /// Disable request caching.
+    #[arg(long, global = true)]
+    no_cache: bool,
+
+    /// Disable provider fallback on failure.
+    #[arg(long, global = true)]
+    no_fallback: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum TaskKindArg {
+    Planning,
+    Coding,
+    Fast,
+    Default,
+}
+
+impl TaskKindArg {
+    fn to_core(self) -> grey_core::TaskKind {
+        match self {
+            TaskKindArg::Planning => grey_core::TaskKind::Planning,
+            TaskKindArg::Coding => grey_core::TaskKind::Coding,
+            TaskKindArg::Fast => grey_core::TaskKind::Fast,
+            TaskKindArg::Default => grey_core::TaskKind::Default,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -116,6 +147,21 @@ enum Command {
         #[command(subcommand)]
         action: SessionAction,
     },
+    /// Provider and model management.
+    Providers {
+        #[command(subcommand)]
+        action: ProviderAction,
+    },
+    /// Request cache management.
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
+    /// Usage and cost tracking.
+    Usage {
+        #[command(subcommand)]
+        action: UsageAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -143,12 +189,39 @@ enum SessionAction {
     Show { id: String },
 }
 
+#[derive(Subcommand)]
+enum ProviderAction {
+    /// List all configured providers and their models.
+    List,
+    /// Show details for a specific provider.
+    Show { id: String },
+}
+
+#[derive(Subcommand)]
+enum CacheAction {
+    /// Remove all cached responses.
+    Clear,
+    /// Print cache statistics.
+    Stats,
+}
+
+#[derive(Subcommand)]
+enum UsageAction {
+    /// Show token usage and cost for a session.
+    Show { id: String },
+    /// Show aggregate usage across all sessions.
+    Summary,
+}
+
 #[derive(Serialize)]
 struct HeadlessOutput {
     response: String,
     session_id: Option<String>,
     usage: Usage,
     steps: usize,
+    cached: bool,
+    provider: String,
+    model: String,
 }
 
 #[tokio::main]
@@ -187,6 +260,9 @@ async fn run_command(command: Command) -> Result<()> {
         }
         Command::Config { action } => run_config(action),
         Command::Sessions { action } => run_sessions(action),
+        Command::Providers { action } => run_providers(action),
+        Command::Cache { action } => run_cache(action),
+        Command::Usage { action } => run_usage(action),
     }
 }
 
@@ -227,6 +303,9 @@ async fn run_headless(
                 session_id,
                 usage: outcome.usage,
                 steps: outcome.steps,
+                cached: outcome.cached,
+                provider: outcome.provider_id.clone(),
+                model: outcome.model.clone(),
             })?
         ),
     }
@@ -243,9 +322,28 @@ fn build_agent_and_session(
         (1..=100).contains(&cli.max_steps),
         "max-steps must be between 1 and 100"
     );
-    let provider_box = build_provider(config, cli.provider.as_deref())?;
-    let provider: Arc<dyn Provider> = Arc::from(provider_box);
-    let model = model_for_provider(config, cli.provider.as_deref(), cli.model.as_deref())?;
+    let router = ProviderRouter::from_config(config)?;
+    let resolved = if let Some(provider_id) = cli.provider.as_deref() {
+        let model = cli.model.as_deref().map(String::from).unwrap_or_else(|| {
+            if provider_id == "mock" {
+                config.model.clone()
+            } else if provider_id == "openai" {
+                config.openai.model.clone()
+            } else if provider_id == "anthropic" {
+                config.anthropic.model.clone()
+            } else {
+                config.model.clone()
+            }
+        });
+        router
+            .resolve_explicit(provider_id, &model)
+            .with_context(|| format!("unknown provider `{provider_id}`"))?
+    } else {
+        let task = cli.task.map(|t| t.to_core()).unwrap_or_default();
+        router.resolve(&task)?
+    };
+    let provider: Arc<dyn Provider> = resolved.provider;
+    let model = resolved.model;
     let approver: Arc<dyn Approver> = if cli.auto_approve {
         Arc::new(AlwaysApprove)
     } else if cli.read_only || tui_mode {
@@ -256,7 +354,26 @@ fn build_agent_and_session(
     let tools = Arc::new(BuiltinTools::new(workspace, approver)?);
     let mut options = AgentOptions::new(model);
     options.max_steps = cli.max_steps;
-    let agent = Agent::new(provider, tools, ContextManager::default(), options);
+    let mut agent = Agent::new(provider, tools, ContextManager::default(), options);
+
+    if !cli.no_cache {
+        let cache_path = cache_database_path();
+        let cache = std::sync::Arc::new(
+            grey_core::RequestCache::open(
+                &cache_path,
+                grey_core::cache::RequestCacheConfig::default(),
+            )
+            .context("opening request cache")?,
+        );
+        agent = agent.with_cache(cache);
+    }
+
+    let usage_tracker = std::sync::Arc::new(grey_core::UsageTracker::new(&config.usage));
+    agent = agent.with_usage(usage_tracker);
+
+    if !cli.no_fallback && !resolved.fallback_chain.is_empty() {
+        agent = agent.with_fallback_chain(resolved.fallback_chain);
+    }
 
     let needs_store = !cli.no_save || cli.session.is_some() || cli.continue_session;
     let store = needs_store
@@ -508,14 +625,115 @@ fn run_sessions(action: SessionAction) -> Result<()> {
     Ok(())
 }
 
+fn run_providers(action: ProviderAction) -> Result<()> {
+    let config = config::load()?;
+    let router = ProviderRouter::from_config(&config)?;
+    match action {
+        ProviderAction::List => {
+            println!("{}", router.provider_list());
+        }
+        ProviderAction::Show { id } => {
+            let ids = router.list_provider_ids();
+            if !ids.contains(&id) {
+                bail!("provider not found: {id}");
+            }
+            println!("provider: {id}");
+            println!("available providers: {}", ids.join(", "));
+        }
+    }
+    Ok(())
+}
+
+fn run_cache(action: CacheAction) -> Result<()> {
+    let cache = grey_core::RequestCache::open(
+        &cache_database_path(),
+        grey_core::cache::RequestCacheConfig::default(),
+    )?;
+    match action {
+        CacheAction::Clear => {
+            let count = cache.stats().entries;
+            cache.clear()?;
+            println!("cleared {count} cache entries");
+        }
+        CacheAction::Stats => {
+            let stats = cache.stats();
+            println!("hits: {}", stats.hits);
+            println!("misses: {}", stats.misses);
+            println!("entries: {}", stats.entries);
+        }
+    }
+    Ok(())
+}
+
+fn run_usage(action: UsageAction) -> Result<()> {
+    let store = SessionStore::open(&session_database_path())?;
+    let config = config::load()?;
+    let tracker = grey_core::UsageTracker::new(&config.usage);
+    match action {
+        UsageAction::Show { id } => {
+            let json = store
+                .load_usage(&id)?
+                .with_context(|| format!("no usage data for session {id}"))?;
+            tracker
+                .load_json(&id, &json)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("{}", tracker.format_panel(&id));
+        }
+        UsageAction::Summary => {
+            let summaries = store.list(1000)?;
+            for s in &summaries {
+                if let Some(json) = store.load_usage(&s.id)? {
+                    let _ = tracker.load_json(&s.id, &json);
+                }
+            }
+            let agg = tracker.aggregate();
+            println!(
+                "Tokens: {} in / {} out\nCost: ${:.4}\nTurns: {}",
+                agg.total_input_tokens,
+                agg.total_output_tokens,
+                agg.total_cost_usd,
+                agg.turns.len()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn cache_database_path() -> PathBuf {
+    if let Some(path) = env::var_os("GREY_CACHE_DB") {
+        return PathBuf::from(path);
+    }
+    if let Some(home) = env::var_os("HOME") {
+        return PathBuf::from(home).join(".local/share/grey/cache.db");
+    }
+    PathBuf::from(".grey-cache.db")
+}
+
 async fn run_spike_c(
     config: &GreyConfig,
     prompt: &str,
     provider_override: Option<&str>,
     model_override: Option<&str>,
 ) -> Result<()> {
-    let provider = build_provider(config, provider_override)?;
-    let model = model_for_provider(config, provider_override, model_override)?;
+    let router = ProviderRouter::from_config(config)?;
+    let resolved = match (provider_override, model_override) {
+        (Some(pid), Some(mid)) => router.resolve_explicit(pid, mid)?,
+        (Some(pid), None) => {
+            let model = if pid == "mock" {
+                config.model.clone()
+            } else if pid == "openai" {
+                config.openai.model.clone()
+            } else if pid == "anthropic" {
+                config.anthropic.model.clone()
+            } else {
+                config.model.clone()
+            };
+            router.resolve_explicit(pid, &model)?
+        }
+        (None, _) => router.resolve(&grey_core::TaskKind::Default)?,
+    };
+    let provider = &resolved.provider;
+    let model = &resolved.model;
     let request = ChatRequest::new(
         model.clone(),
         vec![
