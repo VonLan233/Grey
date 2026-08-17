@@ -78,6 +78,14 @@ impl ProviderRouter {
                     },
                     if entry.max_tokens == 0 { 4096 } else { entry.max_tokens },
                 )?),
+                "gemini" => Box::new(crate::gemini::GeminiProvider::new(
+                    entry.base_url.clone(),
+                    if entry.api_key.is_empty() {
+                        None
+                    } else {
+                        Some(entry.api_key.clone())
+                    },
+                )?),
                 proto => bail!(
                     "unknown protocol `{proto}` for provider `{}`; expected: mock, openai, anthropic",
                     entry.id

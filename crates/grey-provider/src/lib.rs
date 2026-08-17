@@ -2,6 +2,7 @@
 
 pub mod anthropic;
 pub mod fallback;
+pub mod gemini;
 pub mod mock;
 pub mod openai;
 pub mod router;
