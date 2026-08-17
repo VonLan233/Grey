@@ -8,6 +8,7 @@ pub mod config;
 pub mod context;
 pub mod provider;
 pub mod session;
+pub mod token;
 pub mod tool;
 
 pub use agent::{Agent, AgentEvent, AgentOptions, AgentOutcome};
@@ -17,4 +18,5 @@ pub use provider::{
     collect, ChatMessage, ChatRequest, Provider, ProviderEvent, Role, ToolCall, Usage,
 };
 pub use session::{Session, SessionStore, SessionSummary};
+pub use token::{CharApproxCounter, TiktokenCounter, TokenCounter};
 pub use tool::{ToolDefinition, ToolExecutor, ToolResult, ToolRisk};
