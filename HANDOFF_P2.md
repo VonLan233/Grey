@@ -136,6 +136,14 @@ cargo run -q -p grey-cli -- --provider openai --model gpt-5.3-codex-spark --no-s
 
 ### 2026-08-18 复验补充
 
+
+### 2026-08-18 订阅实测补充（显式配置复核）
+
+- 用 `GREY_CONFIG=/tmp/grey-openai-smoke.toml`（显式配置 `openai`）并传入 `GREY_PROVIDER_OPENAI_API_KEY=$YUNWU_API_KEY` 复测：
+  `OpenAI provider returned 401 Unauthorized`（`invalid_api_key`）。
+- 结论：当前阻塞点仅为 `sk-...` Key 非法，与项目代码实现/配置无关。
+
+
 执行 `PATH=~/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin:$PATH` 下的全量门禁：
 
 - `cargo fmt --all -- --check`：通过
