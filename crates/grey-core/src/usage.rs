@@ -64,6 +64,7 @@ impl SessionUsage {
 pub struct UsageTracker {
     sessions: Mutex<HashMap<String, SessionUsage>>,
     cost_table: HashMap<String, CostRate>,
+    track: bool,
 }
 
 impl UsageTracker {
@@ -72,13 +73,18 @@ impl UsageTracker {
         Self {
             sessions: Mutex::new(HashMap::new()),
             cost_table,
+            track: config.track,
         }
     }
 
     pub fn record(&self, session_id: &str, mut turn: TurnUsage) {
+        if !self.track {
+            return;
+        }
         let rate = self
             .cost_table
-            .get(&turn.model)
+            .get(&format!("{}/{}", turn.provider, turn.model))
+            .or_else(|| self.cost_table.get(&turn.model))
             .copied()
             .unwrap_or(CostRate::ZERO);
         if turn.cost_usd == 0.0 && !turn.cached {

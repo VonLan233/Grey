@@ -72,53 +72,110 @@ pub struct FallbackConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextConfig {
+    #[serde(default = "default_context_max_tokens")]
     pub max_tokens: u64,
+    #[serde(default = "default_context_system_budget")]
     pub system_budget: u64,
+    #[serde(default = "default_context_history_budget")]
     pub history_budget: u64,
+    #[serde(default = "default_context_tool_output_budget")]
     pub tool_output_budget: u64,
+    #[serde(default = "default_context_input_budget")]
     pub input_budget: u64,
+    #[serde(default = "default_context_summary_threshold")]
     pub summary_threshold: usize,
+    #[serde(default = "default_context_summary_max_messages")]
     pub summary_max_messages: usize,
+}
+
+fn default_context_max_tokens() -> u64 {
+    128_000
+}
+fn default_context_system_budget() -> u64 {
+    4_096
+}
+fn default_context_history_budget() -> u64 {
+    65_536
+}
+fn default_context_tool_output_budget() -> u64 {
+    16_384
+}
+fn default_context_input_budget() -> u64 {
+    32_768
+}
+fn default_context_summary_threshold() -> usize {
+    20
+}
+fn default_context_summary_max_messages() -> usize {
+    5
 }
 
 impl Default for ContextConfig {
     fn default() -> Self {
         Self {
-            max_tokens: 128_000,
-            system_budget: 4_096,
-            history_budget: 65_536,
-            tool_output_budget: 16_384,
-            input_budget: 32_768,
-            summary_threshold: 20,
-            summary_max_messages: 5,
+            max_tokens: default_context_max_tokens(),
+            system_budget: default_context_system_budget(),
+            history_budget: default_context_history_budget(),
+            tool_output_budget: default_context_tool_output_budget(),
+            input_budget: default_context_input_budget(),
+            summary_threshold: default_context_summary_threshold(),
+            summary_max_messages: default_context_summary_max_messages(),
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheConfig {
+    #[serde(default = "default_cache_enabled")]
     pub enabled: bool,
+    #[serde(default = "default_cache_max_entries")]
     pub max_entries: usize,
+    #[serde(default = "default_cache_ttl_hours")]
     pub ttl_hours: u64,
+}
+
+fn default_cache_enabled() -> bool {
+    true
+}
+fn default_cache_max_entries() -> usize {
+    1_000
+}
+fn default_cache_ttl_hours() -> u64 {
+    24
 }
 
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
-            max_entries: 1_000,
-            ttl_hours: 24,
+            enabled: default_cache_enabled(),
+            max_entries: default_cache_max_entries(),
+            ttl_hours: default_cache_ttl_hours(),
         }
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageConfig {
+    #[serde(default = "default_usage_track")]
     pub track: bool,
     #[serde(default)]
     pub cost_per_1m_input: HashMap<String, f64>,
     #[serde(default)]
     pub cost_per_1m_output: HashMap<String, f64>,
+}
+
+fn default_usage_track() -> bool {
+    true
+}
+
+impl Default for UsageConfig {
+    fn default() -> Self {
+        Self {
+            track: default_usage_track(),
+            cost_per_1m_input: HashMap::new(),
+            cost_per_1m_output: HashMap::new(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -290,16 +347,70 @@ pub fn default_config_path() -> PathBuf {
 
 pub fn load() -> Result<GreyConfig> {
     let mut cfg = GreyConfig::default();
+    let mut legacy_file = false;
     if let Some(path) = config_path() {
         let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("reading config {}", path.display()))?;
+        let raw_value: toml::Value =
+            toml::from_str(&raw).with_context(|| format!("parsing config {}", path.display()))?;
         let file_cfg: GreyConfig =
             toml::from_str(&raw).with_context(|| format!("parsing config {}", path.display()))?;
-        cfg = merge(cfg, file_cfg);
+        legacy_file = ["provider", "model", "openai", "anthropic"]
+            .iter()
+            .any(|key| raw_value.get(*key).is_some());
+        cfg = merge_file(cfg, file_cfg, &raw_value);
     }
-    migrate_legacy(&mut cfg);
     apply_env(&mut cfg)?;
+    let legacy_env = [
+        "GREY_PROVIDER",
+        "GREY_MODEL",
+        "GREY_OPENAI_BASE_URL",
+        "GREY_OPENAI_API_KEY",
+        "GREY_OPENAI_MODEL",
+        "GREY_ANTHROPIC_BASE_URL",
+        "GREY_ANTHROPIC_API_KEY",
+        "GREY_ANTHROPIC_MODEL",
+    ]
+    .iter()
+    .any(|key| env::var_os(key).is_some());
+    migrate_legacy_with_presence(&mut cfg, legacy_file || legacy_env);
+    if legacy_file || legacy_env {
+        eprintln!("warning: legacy provider fields are deprecated; migrate to [[providers]]");
+    }
     Ok(cfg)
+}
+
+fn merge_file(base: GreyConfig, over: GreyConfig, raw: &toml::Value) -> GreyConfig {
+    let defaults = base.clone();
+    let mut merged = merge(base, over);
+    let Some(table) = raw.as_table() else {
+        return merged;
+    };
+    if !table.contains_key("default_provider") {
+        merged.default_provider = defaults.default_provider;
+    }
+    if !table.contains_key("default_model") {
+        merged.default_model = defaults.default_model;
+    }
+    if !table.contains_key("providers") {
+        merged.providers = defaults.providers;
+    }
+    if !table.contains_key("routes") {
+        merged.routes = defaults.routes;
+    }
+    if !table.contains_key("fallback") {
+        merged.fallback = defaults.fallback;
+    }
+    if !table.contains_key("context") {
+        merged.context = defaults.context;
+    }
+    if !table.contains_key("cache") {
+        merged.cache = defaults.cache;
+    }
+    if !table.contains_key("usage") {
+        merged.usage = defaults.usage;
+    }
+    merged
 }
 
 fn merge(mut base: GreyConfig, over: GreyConfig) -> GreyConfig {
@@ -321,6 +432,9 @@ fn merge(mut base: GreyConfig, over: GreyConfig) -> GreyConfig {
     if !over.fallback.models.is_empty() {
         base.fallback.models = over.fallback.models;
     }
+    base.context = over.context;
+    base.cache = over.cache;
+    base.usage = over.usage;
     // Legacy fields
     if !over.provider.is_empty() {
         base.provider = over.provider;
@@ -359,7 +473,15 @@ fn merge(mut base: GreyConfig, over: GreyConfig) -> GreyConfig {
     base
 }
 
+#[cfg(test)]
 fn migrate_legacy(cfg: &mut GreyConfig) {
+    migrate_legacy_with_presence(cfg, true);
+}
+
+fn migrate_legacy_with_presence(cfg: &mut GreyConfig, legacy_present: bool) {
+    if !legacy_present {
+        return;
+    }
     let has_openai = cfg.providers.iter().any(|p| p.id == "openai");
     let has_anthropic = cfg.providers.iter().any(|p| p.id == "anthropic");
 
@@ -415,9 +537,11 @@ fn migrate_legacy(cfg: &mut GreyConfig) {
 fn apply_env(cfg: &mut GreyConfig) -> Result<()> {
     if let Ok(v) = env::var("GREY_PROVIDER") {
         cfg.provider = v;
+        cfg.default_provider = cfg.provider.clone();
     }
     if let Ok(v) = env::var("GREY_MODEL") {
         cfg.model = v;
+        cfg.default_model = cfg.model.clone();
     }
     if let Ok(v) = env::var("GREY_OPENAI_BASE_URL") {
         cfg.openai.base_url = v;
@@ -454,6 +578,41 @@ fn apply_env(cfg: &mut GreyConfig) -> Result<()> {
             "GREY_ANTHROPIC_MAX_TOKENS must be greater than zero"
         );
         cfg.anthropic.max_tokens = max_tokens;
+    }
+    for provider in cfg.providers.iter_mut() {
+        let prefix = format!(
+            "GREY_PROVIDER_{}_",
+            provider
+                .id
+                .chars()
+                .map(|ch| if ch.is_ascii_alphanumeric() {
+                    ch.to_ascii_uppercase()
+                } else {
+                    '_'
+                })
+                .collect::<String>()
+        );
+        if let Some(value) = env::var_os(format!("{prefix}BASE_URL")) {
+            provider.base_url = value.to_string_lossy().into_owned();
+        }
+        if let Some(value) = env::var_os(format!("{prefix}API_KEY")) {
+            provider.api_key = value.to_string_lossy().into_owned();
+        }
+        if let Some(value) = env::var_os(format!("{prefix}VERSION")) {
+            provider.version = value.to_string_lossy().into_owned();
+        }
+        if let Some(value) = env::var_os(format!("{prefix}MAX_TOKENS")) {
+            provider.max_tokens = value
+                .to_string_lossy()
+                .parse::<u32>()
+                .with_context(|| format!("{prefix}MAX_TOKENS must be a positive integer"))?;
+        }
+        if let Some(value) = env::var_os(format!("{prefix}INCLUDE_USAGE")) {
+            provider.include_usage = value
+                .to_string_lossy()
+                .parse::<bool>()
+                .with_context(|| format!("{prefix}INCLUDE_USAGE must be true or false"))?;
+        }
     }
     if let Ok(v) = env::var("GREY_RUST_ANALYZER") {
         cfg.lsp.rust_analyzer = v;

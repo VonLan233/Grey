@@ -109,6 +109,9 @@ impl SessionStore {
     }
 
     pub fn list(&self, limit: usize) -> Result<Vec<SessionSummary>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let connection = self.connection.lock().unwrap();
         let mut statement = connection.prepare(
             "SELECT id, title, workspace, created_at, updated_at, messages_json
@@ -118,7 +121,13 @@ impl SessionStore {
             let messages_json: String = row.get(5)?;
             let message_count = serde_json::from_str::<Vec<ChatMessage>>(&messages_json)
                 .map(|messages| messages.len())
-                .unwrap_or(0);
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        messages_json.len(),
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
             Ok(SessionSummary {
                 id: row.get(0)?,
                 title: row.get(1)?,
@@ -148,10 +157,11 @@ impl SessionStore {
     }
 
     pub fn save_usage(&self, session_id: &str, usage_json: &str) -> Result<()> {
-        self.connection.lock().unwrap().execute(
+        let changed = self.connection.lock().unwrap().execute(
             "UPDATE sessions SET usage_json = ?1 WHERE id = ?2",
             params![usage_json, session_id],
         )?;
+        anyhow::ensure!(changed == 1, "session not found: {session_id}");
         Ok(())
     }
 

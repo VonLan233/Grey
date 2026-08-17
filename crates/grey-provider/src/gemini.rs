@@ -29,26 +29,31 @@ impl GeminiProvider {
         })
     }
 
-    fn build_url(&self, model: &str) -> String {
-        let mut url = format!("{}/models/{}:streamGenerateContent", self.base_url, model);
-        if let Some(key) = &self.api_key {
-            if !key.is_empty() {
-                url.push_str("?key=");
-                url.push_str(key);
-            }
-        }
-        url
+    fn build_url(&self, model: &str) -> Result<String> {
+        let mut url = reqwest::Url::parse(&format!("{}/models", self.base_url))
+            .context("invalid Gemini base URL or model")?;
+        let model_path = format!("{model}:streamGenerateContent");
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Gemini base URL cannot accept path segments"))?
+            .push(&model_path);
+        url.query_pairs_mut().append_pair("alt", "sse");
+        Ok(url.to_string())
     }
 
     fn build_request(&self, request: &ChatRequest) -> Result<reqwest::Request> {
-        let url = self.build_url(&request.model);
+        let url = self.build_url(&request.model)?;
         let body = request_body(request)?;
-        self.client
+        let mut builder = self
+            .client
             .post(url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .json(&body)
-            .build()
-            .context("building Gemini request")
+            .json(&body);
+        if let Some(key) = &self.api_key {
+            if !key.is_empty() {
+                builder = builder.header("x-goog-api-key", key);
+            }
+        }
+        builder.build().context("building Gemini request")
     }
 }
 
@@ -123,6 +128,7 @@ impl Provider for GeminiProvider {
 #[derive(Default)]
 struct GeminiStreamState {
     done: bool,
+    next_call_id: u64,
 }
 
 impl GeminiStreamState {
@@ -159,8 +165,9 @@ impl GeminiStreamState {
                             if let Some(fc) = part.get("functionCall") {
                                 if let Some(name) = fc.get("name").and_then(|n| n.as_str()) {
                                     let args = fc.get("args").cloned().unwrap_or_else(|| json!({}));
+                                    self.next_call_id += 1;
                                     events.push(ProviderEvent::ToolCall(ToolCall {
-                                        id: format!("gemini-call-{}", name),
+                                        id: format!("gemini-call-{name}--{}", self.next_call_id),
                                         name: name.to_string(),
                                         arguments: args,
                                     }));
@@ -225,9 +232,14 @@ fn request_body(request: &ChatRequest) -> Result<Value> {
                     .as_deref()
                     .filter(|id| !id.is_empty())
                     .unwrap_or("unknown");
+                let function_name = call_id
+                    .strip_prefix("gemini-call-")
+                    .and_then(|id| id.split_once("--"))
+                    .map(|(name, _)| name)
+                    .unwrap_or(call_id);
                 contents.push(json!({
                     "role": "function",
-                    "parts": [{"functionResponse": {"name": call_id, "response": {"content": message.content}}}]
+                    "parts": [{"functionResponse": {"name": function_name, "response": {"content": message.content}}}]
                 }));
             }
         }
@@ -254,7 +266,9 @@ fn request_body(request: &ChatRequest) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grey_core::{collect, ChatMessage, ChatRequest, Role, ToolDefinition, ToolRisk};
+    use grey_core::{
+        collect, ChatMessage, ChatRequest, Role, ToolCall, ToolDefinition, ToolRisk,
+    };
 
     #[test]
     fn builds_request_body_with_system_and_user() {
@@ -283,6 +297,68 @@ mod tests {
         ]);
         let body = request_body(&req).unwrap();
         assert_eq!(body["tools"]["functionDeclarations"][0]["name"], "grep");
+    }
+
+    #[test]
+    fn build_url_includes_alt_sse_and_model_path() {
+        let provider = GeminiProvider::new(
+            "https://generativelanguage.googleapis.com/v1beta/".into(),
+            None,
+        )
+        .unwrap();
+        let url = provider.build_url("gemini-2.5-flash").unwrap();
+        assert_eq!(
+            url,
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
+        );
+    }
+
+    #[test]
+    fn build_request_adds_x_goog_api_key_when_present() {
+        let provider =
+            GeminiProvider::new("http://localhost:11434/v1".into(), Some("k-123".into())).unwrap();
+        let request =
+            ChatRequest::new("gemini-2.0-flash", vec![ChatMessage::new(Role::User, "hi")]);
+        let http_request = provider.build_request(&request).unwrap();
+
+        let api_key = http_request
+            .headers()
+            .get("x-goog-api-key")
+            .and_then(|value| value.to_str().ok())
+            .unwrap();
+        assert_eq!(api_key, "k-123");
+    }
+
+    #[test]
+    fn request_body_maps_gemini_function_response_name_from_call_id_prefix() {
+        let call = ToolCall {
+            id: "gemini-call-grep--1".into(),
+            name: "grep".into(),
+            arguments: serde_json::json!({"pattern":"todo"}),
+        };
+        let req = ChatRequest::new(
+            "gemini-2.5-flash",
+            vec![
+                ChatMessage::assistant("", vec![call.clone()]),
+                ChatMessage::tool_result(&call, "tool output"),
+            ],
+        );
+        let body = request_body(&req).unwrap();
+        let maybe_function = body["contents"].as_array().and_then(|contents| {
+            contents
+                .iter()
+                .find(|entry| entry["role"] == "function")
+                .cloned()
+        });
+        let function_response = maybe_function.unwrap_or_else(|| panic!("missing function role"));
+        assert_eq!(
+            function_response["parts"][0]["functionResponse"]["name"],
+            "grep"
+        );
+        assert_eq!(
+            function_response["parts"][0]["functionResponse"]["response"]["content"],
+            "tool output"
+        );
     }
 
     #[test]

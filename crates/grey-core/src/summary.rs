@@ -22,7 +22,7 @@ const SUMMARY_INSTRUCTION: &str = "Summarize the following conversation. Preserv
 pub struct SummaryEngine {
     provider: Arc<dyn Provider>,
     model: String,
-    max_messages: usize,
+    _max_messages: usize,
     cache: Mutex<HashMap<u64, ChatMessage>>,
 }
 
@@ -31,7 +31,7 @@ impl SummaryEngine {
         Self {
             provider,
             model: model.into(),
-            max_messages,
+            _max_messages: max_messages,
             cache: Mutex::new(HashMap::new()),
         }
     }
@@ -83,7 +83,7 @@ impl SummaryEngine {
     }
 
     fn format_conversation(&self, messages: &[ChatMessage]) -> String {
-        let limit = messages.len().min(self.max_messages);
+        let limit = messages.len().min(self._max_messages.max(1));
         let start = messages.len().saturating_sub(limit);
         let mut out = String::new();
         for msg in &messages[start..] {
@@ -100,11 +100,16 @@ impl SummaryEngine {
 
     fn cache_key_for(&self, messages: &[ChatMessage]) -> u64 {
         use std::hash::{Hash, Hasher};
-        let limit = messages.len().min(self.max_messages);
-        let start = messages.len().saturating_sub(limit);
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        for msg in &messages[start..] {
+        for msg in messages {
+            role_label(&msg.role).hash(&mut hasher);
             msg.content.hash(&mut hasher);
+            for call in &msg.tool_calls {
+                call.id.hash(&mut hasher);
+                call.name.hash(&mut hasher);
+                call.arguments.to_string().hash(&mut hasher);
+            }
+            msg.tool_call_id.hash(&mut hasher);
             hasher.write_u8(0);
         }
         hasher.finish()

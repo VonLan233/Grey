@@ -10,8 +10,9 @@ Grey 已完成 P0 技术验证，并具备 P1 的首个可用纵向闭环：同�
 同时服务单发 CLI 与 TUI，模型可以流式回答、调用工作区工具、接收工具结果并继续推理，
 会话可保存到 SQLite 后恢复。
 
-当前版本是 **v0.1/P1 MVP**，不是路线图中的 v1.0。多 Agent、MCP、完整 LSP
-语义工具、Token 缓存、WASM 插件、图片、桌面提醒与发布打包仍按 P2–P7 推进。
+当前版本是 **v0.2/P2 MVP**，不是路线图中的 v1.0。P2 已完成多 Provider 路由、故障切换、
+上下文预算、请求缓存和 usage 持久化；多 Agent、MCP、完整 LSP 语义工具、WASM 插件、
+图片、桌面提醒与发布打包仍按 P3–P7 推进。
 
 ## 已实现
 
@@ -25,12 +26,18 @@ Grey 已完成 P0 技术验证，并具备 P1 的首个可用纵向闭环：同�
 - 可脚本化 `grey "prompt"` 与 JSON 输出
 - ratatui 对话界面、流式状态、滚动和终端清理
 - rust-analyzer 诊断与定义跳转 Spike
+- 动态 `[[providers]]` 注册表、planning/coding/fast/default 路由和 CLI 覆盖
+- Provider/model fallback：只在尚未产生可见输出时切换，并带失败冷却与恢复
+- system/history/tool/input 分区预算、工具输出 token 截断、滚动摘要和裁剪审计事件
+- SQLite 请求缓存（TTL/LRU/provider 隔离）与 `--no-cache` 控制
+- 每会话 token/cost usage 记录，跨 CLI 调用累积并由 `usage show/summary` 查询
 
 完整路线图见[阶段性开发文档](docs/阶段性开发文档.md)，架构背景见[项目计划书](docs/项目计划书.md)。
 
 ## 快速开始
 
-需要 Rust 1.97.1。LSP Spike 还需要单独安装 `rust-analyzer`；普通对话不需要它。
+需要 Rust 1.97.1（仓库的 `rust-toolchain.toml` 已固定版本）。LSP Spike 还需要单独安装
+`rust-analyzer`；普通对话不需要它。
 
 一条命令运行离线 Demo（不访问网络、不保存会话）：
 
@@ -72,7 +79,51 @@ grey config show
 内置默认值 < TOML < GREY_* 环境变量 < CLI 参数
 ```
 
-示例：
+动态 Provider 示例：
+
+```toml
+default_provider = "local"
+default_model = "qwen2.5:7b"
+
+[[providers]]
+id = "local"
+protocol = "openai"
+base_url = "http://localhost:11434/v1"
+models = [{ id = "qwen2.5:7b", name = "Qwen 2.5 7B" }]
+
+[[providers]]
+id = "offline"
+protocol = "mock"
+
+[[routes]]
+match = "coding"
+provider = "local"
+model = "qwen2.5:7b"
+
+[fallback]
+providers = ["local", "offline"]
+
+[context]
+max_tokens = 128000
+system_budget = 4096
+history_budget = 65536
+tool_output_budget = 16384
+input_budget = 32768
+summary_threshold = 20
+summary_max_messages = 5
+
+[cache]
+enabled = true
+max_entries = 1000
+ttl_hours = 24
+
+[usage]
+track = true
+cost_per_1m_input = { "local/qwen2.5:7b" = 0.15 }
+cost_per_1m_output = { "local/qwen2.5:7b" = 0.60 }
+```
+
+旧版配置仍兼容，但会输出迁移提示：
 
 ```toml
 provider = "openai"
@@ -100,9 +151,18 @@ rust_analyzer = "rust-analyzer"
 grey --provider openai --model qwen2.5:7b "修复测试失败"
 grey --provider anthropic "解释这个 workspace"
 GREY_OPENAI_BASE_URL=http://localhost:11434/v1 grey --provider openai "你好"
+grey --task coding --no-cache "修复测试失败"
+grey providers list
+grey providers show mock
+grey cache stats
+grey usage show <SESSION_ID>
+grey usage summary
 ```
 
-未知 Provider 会直接报错，不会静默降级为 Mock。
+每个 Provider 还可以使用 `GREY_PROVIDER_<ID>_<FIELD>` 覆盖，例如
+`GREY_PROVIDER_LOCAL_BASE_URL`、`GREY_PROVIDER_LOCAL_API_KEY`；旧的
+`GREY_OPENAI_*` / `GREY_ANTHROPIC_*` 变量继续有效。未知 Provider、重复 Provider ID
+和无效 fallback 引用会直接报错，不会静默降级为 Mock。
 
 ## 工具安全
 
@@ -157,7 +217,9 @@ cargo build --workspace --release --locked
 ```
 
 仓库分层与关键决策记录在
-[ADR-001](docs/adr/ADR-001-runtime-and-boundaries.md)，本次实现计划见
+[ADR-001](docs/adr/ADR-001-runtime-and-boundaries.md)
+[ADR-002](docs/adr/ADR-002-p2-multi-provider-routing.md)，
+本次实现计划见
 [P0+P1 Implementation Plan](docs/plans/p0-p1-harness.md)。
 
 ## 路线图（规划）

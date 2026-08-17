@@ -5,7 +5,8 @@ use std::fmt;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use grey_core::{FallbackConfig, ProviderModelRef};
+use anyhow::{Context, Result};
+use grey_core::{FallbackConfig, ProviderHealth, ProviderModelRef};
 
 const FAILURE_THRESHOLD: u32 = 3;
 const INITIAL_COOLDOWN: Duration = Duration::from_secs(60);
@@ -25,34 +26,32 @@ pub struct FallbackChain {
 
 impl FallbackChain {
     pub fn from_config(config: &FallbackConfig) -> Self {
-        let model_fallbacks = config
-            .models
-            .iter()
-            .filter_map(|(key, vals)| {
-                let pmr: ProviderModelRef = key.parse().ok()?;
-                let fallbacks: Vec<ProviderModelRef> =
-                    vals.iter().filter_map(|v| v.parse().ok()).collect();
-                if fallbacks.is_empty() {
-                    None
-                } else {
-                    Some((pmr, fallbacks))
-                }
-            })
-            .collect();
+        Self::try_from_config(config).expect("invalid fallback provider/model reference")
+    }
 
-        Self {
+    pub fn try_from_config(config: &FallbackConfig) -> Result<Self> {
+        let mut model_fallbacks = HashMap::new();
+        for (key, vals) in &config.models {
+            let pmr: ProviderModelRef = key
+                .parse()
+                .map_err(|error: String| anyhow::anyhow!(error))
+                .with_context(|| format!("invalid fallback model key `{key}`"))?;
+            let mut fallbacks = Vec::with_capacity(vals.len());
+            for value in vals {
+                fallbacks.push(value.parse().map_err(|error: String| {
+                    anyhow::anyhow!("invalid fallback target `{value}`: {error}")
+                })?);
+            }
+            if !fallbacks.is_empty() {
+                model_fallbacks.insert(pmr, fallbacks);
+            }
+        }
+
+        Ok(Self {
             provider_order: config.providers.clone(),
             model_fallbacks,
             health: Mutex::new(HashMap::new()),
-        }
-    }
-
-    pub fn empty() -> Self {
-        Self {
-            provider_order: Vec::new(),
-            model_fallbacks: HashMap::new(),
-            health: Mutex::new(HashMap::new()),
-        }
+        })
     }
 
     pub fn resolve(&self, primary: &ProviderModelRef) -> Vec<ProviderModelRef> {
@@ -63,7 +62,7 @@ impl FallbackChain {
 
         if let Some(model_fbs) = self.model_fallbacks.get(primary) {
             for fb in model_fbs {
-                if seen.insert(fb.clone()) {
+                if self.is_healthy(fb) && seen.insert(fb.clone()) {
                     result.push(fb.clone());
                 }
             }
@@ -75,12 +74,19 @@ impl FallbackChain {
                 continue;
             }
             let candidate = ProviderModelRef::new(pid.clone(), primary.model.clone());
-            if seen.insert(candidate.clone()) {
+            if self.is_healthy(&candidate) && seen.insert(candidate.clone()) {
                 result.push(candidate);
             }
         }
-
         result
+    }
+
+    pub fn empty() -> Self {
+        Self {
+            provider_order: Vec::new(),
+            model_fallbacks: HashMap::new(),
+            health: Mutex::new(HashMap::new()),
+        }
     }
 
     pub fn mark_failed(&self, pmr: &ProviderModelRef, _error: &str) {
@@ -120,6 +126,20 @@ impl FallbackChain {
 
     pub fn healthy_refs<'a>(&self, refs: &'a [ProviderModelRef]) -> Vec<&'a ProviderModelRef> {
         refs.iter().filter(|r| self.is_healthy(r)).collect()
+    }
+}
+
+impl ProviderHealth for FallbackChain {
+    fn is_healthy(&self, reference: &ProviderModelRef) -> bool {
+        self.is_healthy(reference)
+    }
+
+    fn mark_failed(&self, reference: &ProviderModelRef, error: &str) {
+        self.mark_failed(reference, error)
+    }
+
+    fn mark_success(&self, reference: &ProviderModelRef) {
+        self.mark_success(reference)
     }
 }
 

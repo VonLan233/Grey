@@ -6,20 +6,47 @@ fn grey() -> Command {
     Command::new(env!("CARGO_BIN_EXE_grey"))
 }
 
-fn temp_home() -> (tempfile::TempDir, PathBuf) {
+struct TestEnv {
+    home: tempfile::TempDir,
+    cache_db: PathBuf,
+    session_db: PathBuf,
+}
+
+impl TestEnv {
+    fn command(&self) -> Command {
+        let mut command = grey();
+        command
+            .env("HOME", self.home.path())
+            .env("GREY_CACHE_DB", &self.cache_db)
+            .env("GREY_SESSION_DB", &self.session_db)
+            .env_remove("GREY_CONFIG")
+            .env_remove("GREY_PROVIDER")
+            .env_remove("GREY_MODEL")
+            .env_remove("GREY_OPENAI_BASE_URL")
+            .env_remove("GREY_OPENAI_API_KEY")
+            .env_remove("GREY_OPENAI_MODEL")
+            .env_remove("GREY_ANTHROPIC_BASE_URL")
+            .env_remove("GREY_ANTHROPIC_API_KEY")
+            .env_remove("GREY_ANTHROPIC_MODEL");
+        command
+    }
+}
+
+fn temp_home() -> TestEnv {
     let dir = tempfile::tempdir().unwrap();
-    std::env::set_var("HOME", dir.path());
     let cache_db = dir.path().join("cache.db");
-    std::env::set_var("GREY_CACHE_DB", &cache_db);
     let session_db = dir.path().join("sessions.db");
-    std::env::set_var("GREY_SESSION_DB", &session_db);
-    (dir, session_db)
+    TestEnv {
+        home: dir,
+        cache_db,
+        session_db,
+    }
 }
 
 #[test]
 fn providers_list_shows_configured_providers() {
-    let (_home, _session_db) = temp_home();
-    let output = grey().args(["providers", "list"]).output().unwrap();
+    let env = temp_home();
+    let output = env.command().args(["providers", "list"]).output().unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -31,8 +58,9 @@ fn providers_list_shows_configured_providers() {
 
 #[test]
 fn providers_show_for_unknown_id_errors() {
-    let (_home, _session_db) = temp_home();
-    let output = grey()
+    let env = temp_home();
+    let output = env
+        .command()
         .args(["providers", "show", "nonexistent"])
         .output()
         .unwrap();
@@ -43,8 +71,8 @@ fn providers_show_for_unknown_id_errors() {
 
 #[test]
 fn cache_stats_works_on_empty_cache() {
-    let (_home, _session_db) = temp_home();
-    let output = grey().args(["cache", "stats"]).output().unwrap();
+    let env = temp_home();
+    let output = env.command().args(["cache", "stats"]).output().unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -56,8 +84,8 @@ fn cache_stats_works_on_empty_cache() {
 
 #[test]
 fn cache_clear_works() {
-    let (_home, _session_db) = temp_home();
-    let output = grey().args(["cache", "clear"]).output().unwrap();
+    let env = temp_home();
+    let output = env.command().args(["cache", "clear"]).output().unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -69,9 +97,10 @@ fn cache_clear_works() {
 
 #[test]
 fn usage_summary_works_with_no_sessions() {
-    let (_home, _session_db) = temp_home();
+    let env = temp_home();
     let db = tempfile::tempdir().unwrap();
-    let output = grey()
+    let output = env
+        .command()
         .env("GREY_SESSION_DB", db.path().join("sessions.db"))
         .args(["usage", "summary"])
         .output()
@@ -87,8 +116,9 @@ fn usage_summary_works_with_no_sessions() {
 
 #[test]
 fn no_cache_flag_runs_without_error() {
-    let (_home, _session_db) = temp_home();
-    let output = grey()
+    let env = temp_home();
+    let output = env
+        .command()
         .args(["--no-save", "--no-cache", "--format", "json", "hello"])
         .output()
         .unwrap();
@@ -104,8 +134,9 @@ fn no_cache_flag_runs_without_error() {
 
 #[test]
 fn no_fallback_flag_runs_without_error() {
-    let (_home, _session_db) = temp_home();
-    let output = grey()
+    let env = temp_home();
+    let output = env
+        .command()
         .args(["--no-save", "--no-fallback", "--format", "json", "hello"])
         .output()
         .unwrap();
@@ -120,8 +151,9 @@ fn no_fallback_flag_runs_without_error() {
 
 #[test]
 fn task_flag_routes_correctly() {
-    let (_home, _session_db) = temp_home();
-    let output = grey()
+    let env = temp_home();
+    let output = env
+        .command()
         .args(["--no-save", "--task", "coding", "--format", "json", "hello"])
         .output()
         .unwrap();
@@ -138,8 +170,9 @@ fn task_flag_routes_correctly() {
 
 #[test]
 fn json_output_includes_provider_and_model_fields() {
-    let (_home, _session_db) = temp_home();
-    let output = grey()
+    let env = temp_home();
+    let output = env
+        .command()
         .args(["--no-save", "--format", "json", "hello"])
         .output()
         .unwrap();
@@ -152,18 +185,21 @@ fn json_output_includes_provider_and_model_fields() {
 
 #[test]
 fn cache_hit_on_second_identical_request() {
-    let (_home, _session_db) = temp_home();
+    let env = temp_home();
     let cache_db = tempfile::tempdir().unwrap();
     let cache_path = cache_db.path().join("cache.db");
-    std::env::set_var("GREY_CACHE_DB", &cache_path);
 
-    let first = grey()
+    let first = env
+        .command()
+        .env("GREY_CACHE_DB", &cache_path)
         .args(["--no-save", "--format", "json", "hello"])
         .output()
         .unwrap();
     assert!(first.status.success());
 
-    let second = grey()
+    let second = env
+        .command()
+        .env("GREY_CACHE_DB", &cache_path)
         .args(["--no-save", "--format", "json", "hello"])
         .output()
         .unwrap();
@@ -172,25 +208,33 @@ fn cache_hit_on_second_identical_request() {
     let second_json: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
     assert_eq!(second_json["cached"], true);
 
-    let stats = grey().args(["cache", "stats"]).output().unwrap();
+    let stats = env
+        .command()
+        .env("GREY_CACHE_DB", &cache_path)
+        .args(["cache", "stats"])
+        .output()
+        .unwrap();
     let stats_out = String::from_utf8_lossy(&stats.stdout);
     assert!(stats_out.contains("entries: 1"));
 }
 
 #[test]
 fn no_cache_flag_bypasses_cache() {
-    let (_home, _session_db) = temp_home();
+    let env = temp_home();
     let cache_db = tempfile::tempdir().unwrap();
     let cache_path = cache_db.path().join("cache.db");
-    std::env::set_var("GREY_CACHE_DB", &cache_path);
 
-    let first = grey()
+    let first = env
+        .command()
+        .env("GREY_CACHE_DB", &cache_path)
         .args(["--no-save", "--format", "json", "hello"])
         .output()
         .unwrap();
     assert!(first.status.success());
 
-    let second = grey()
+    let second = env
+        .command()
+        .env("GREY_CACHE_DB", &cache_path)
         .args(["--no-save", "--no-cache", "--format", "json", "hello"])
         .output()
         .unwrap();
@@ -198,4 +242,34 @@ fn no_cache_flag_bypasses_cache() {
 
     let second_json: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
     assert_eq!(second_json["cached"], false);
+}
+
+#[test]
+fn saved_session_contains_usage_json() {
+    let env = temp_home();
+    let output = env
+        .command()
+        .args(["--format", "json", "persist usage"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let session_id = value["session_id"].as_str().unwrap();
+    let usage = env
+        .command()
+        .args(["usage", "show", session_id])
+        .output()
+        .unwrap();
+    assert!(
+        usage.status.success(),
+        "{}",
+        String::from_utf8_lossy(&usage.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&usage.stdout);
+    assert!(stdout.contains("Tokens:") && stdout.contains("Turns: 1"));
 }

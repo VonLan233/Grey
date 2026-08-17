@@ -8,8 +8,8 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use grey_core::{
-    config, Agent, AgentEvent, AgentOptions, AgentOutcome, ChatMessage, ChatRequest,
-    ContextManager, GreyConfig, Provider, Role, Session, SessionStore, Usage,
+    config, Agent, AgentEvent, AgentOptions, AgentOutcome, CharApproxCounter, ChatMessage,
+    ChatRequest, ContextManager, GreyConfig, Provider, Role, Session, SessionStore, SummaryEngine,
 };
 use grey_provider::router::ProviderRouter;
 use grey_tools::{AlwaysApprove, Approver, BuiltinTools, DenySideEffects, StdioApprover};
@@ -217,8 +217,18 @@ enum UsageAction {
 struct HeadlessOutput {
     response: String,
     session_id: Option<String>,
-    usage: Usage,
+    usage: HeadlessUsage,
     steps: usize,
+    cached: bool,
+    provider: String,
+    model: String,
+}
+
+#[derive(Serialize)]
+struct HeadlessUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    cost_usd: f64,
     cached: bool,
     provider: String,
     model: String,
@@ -273,6 +283,7 @@ async fn run_headless(
     prompt: &str,
 ) -> Result<()> {
     let (agent, store, existing) = build_agent_and_session(cli, config, workspace, false)?;
+    let usage_tracker = agent.usage_tracker();
     let outcome = if cli.format == OutputFormat::Text {
         run_with_text_events(&agent, existing.as_ref(), prompt).await?
     } else {
@@ -285,7 +296,18 @@ async fn run_headless(
         prompt,
         workspace,
         cli.no_save,
+        usage_tracker.as_deref(),
     )?;
+    let tracked_cost = usage_tracker
+        .as_ref()
+        .and_then(|tracker| {
+            session_id
+                .as_deref()
+                .and_then(|id| tracker.session_usage(id))
+                .or_else(|| tracker.session_usage("default"))
+        })
+        .map(|usage| usage.total_cost_usd)
+        .unwrap_or(0.0);
 
     match cli.format {
         OutputFormat::Text => {
@@ -301,7 +323,14 @@ async fn run_headless(
             serde_json::to_string(&HeadlessOutput {
                 response: outcome.response,
                 session_id,
-                usage: outcome.usage,
+                usage: HeadlessUsage {
+                    input_tokens: outcome.usage.input_tokens,
+                    output_tokens: outcome.usage.output_tokens,
+                    cost_usd: tracked_cost,
+                    cached: outcome.cached,
+                    provider: outcome.provider_id.clone(),
+                    model: outcome.model.clone(),
+                },
                 steps: outcome.steps,
                 cached: outcome.cached,
                 provider: outcome.provider_id.clone(),
@@ -324,17 +353,10 @@ fn build_agent_and_session(
     );
     let router = ProviderRouter::from_config(config)?;
     let resolved = if let Some(provider_id) = cli.provider.as_deref() {
-        let model = cli.model.as_deref().map(String::from).unwrap_or_else(|| {
-            if provider_id == "mock" {
-                config.model.clone()
-            } else if provider_id == "openai" {
-                config.openai.model.clone()
-            } else if provider_id == "anthropic" {
-                config.anthropic.model.clone()
-            } else {
-                config.model.clone()
-            }
-        });
+        let model = cli
+            .model
+            .clone()
+            .unwrap_or_else(|| default_model_for_provider(config, provider_id));
         router
             .resolve_explicit(provider_id, &model)
             .with_context(|| format!("unknown provider `{provider_id}`"))?
@@ -342,6 +364,17 @@ fn build_agent_and_session(
         let task = cli.task.map(|t| t.to_core()).unwrap_or_default();
         router.resolve(&task)?
     };
+    let fallback_providers = if cli.no_fallback {
+        Vec::new()
+    } else {
+        let health = router.fallback_handle();
+        router
+            .resolve_candidates(&resolved.fallback_chain)?
+            .into_iter()
+            .map(|candidate| candidate.with_health(health.clone()))
+            .collect()
+    };
+    let resolved_provider_id = resolved.provider_id.clone();
     let provider: Arc<dyn Provider> = resolved.provider;
     let model = resolved.model;
     let approver: Arc<dyn Approver> = if cli.auto_approve {
@@ -352,16 +385,31 @@ fn build_agent_and_session(
         Arc::new(StdioApprover)
     };
     let tools = Arc::new(BuiltinTools::new(workspace, approver)?);
-    let mut options = AgentOptions::new(model);
+    let mut options = AgentOptions::new(model.clone());
     options.max_steps = cli.max_steps;
-    let mut agent = Agent::new(provider, tools, ContextManager::default(), options);
+    let context = ContextManager::with_budget(
+        config.context.clone(),
+        Arc::new(CharApproxCounter),
+        Some(SummaryEngine::new(
+            provider.clone(),
+            model.clone(),
+            config.context.summary_max_messages,
+        )),
+        model.clone(),
+    );
+    let mut agent =
+        Agent::new(provider, tools, context, options).with_provider_id(resolved_provider_id);
 
-    if !cli.no_cache {
+    if !cli.no_cache && config.cache.enabled {
         let cache_path = cache_database_path();
         let cache = std::sync::Arc::new(
             grey_core::RequestCache::open(
                 &cache_path,
-                grey_core::cache::RequestCacheConfig::default(),
+                grey_core::cache::RequestCacheConfig {
+                    enabled: config.cache.enabled,
+                    max_entries: config.cache.max_entries,
+                    ttl_hours: config.cache.ttl_hours,
+                },
             )
             .context("opening request cache")?,
         );
@@ -369,10 +417,13 @@ fn build_agent_and_session(
     }
 
     let usage_tracker = std::sync::Arc::new(grey_core::UsageTracker::new(&config.usage));
-    agent = agent.with_usage(usage_tracker);
+    agent = agent.with_usage(usage_tracker.clone());
 
-    if !cli.no_fallback && !resolved.fallback_chain.is_empty() {
-        agent = agent.with_fallback_chain(resolved.fallback_chain);
+    if !cli.no_fallback {
+        agent = agent
+            .with_fallback_chain(resolved.fallback_chain)
+            .with_fallback_providers(fallback_providers)
+            .with_fallback_health(router.fallback_handle());
     }
 
     let needs_store = !cli.no_save || cli.session.is_some() || cli.continue_session;
@@ -406,6 +457,14 @@ fn build_agent_and_session(
             session.workspace,
             workspace.display()
         );
+        if let Some(store) = &store {
+            if let Some(usage_json) = store.load_usage(&session.id)? {
+                usage_tracker
+                    .load_json(&session.id, &usage_json)
+                    .map_err(|error| anyhow::anyhow!(error))?;
+            }
+        }
+        agent = agent.with_usage_session_id(session.id.clone());
     }
     Ok((agent, store, existing))
 }
@@ -485,6 +544,7 @@ fn persist_outcome(
     prompt: &str,
     workspace: &Path,
     no_save: bool,
+    usage_tracker: Option<&grey_core::UsageTracker>,
 ) -> Result<Option<String>> {
     if no_save {
         return Ok(existing.map(|session| session.id));
@@ -508,11 +568,30 @@ fn persist_outcome(
         ),
     };
     store.save(&mut session)?;
+    persist_usage(store, &session.id, usage_tracker)?;
     Ok(Some(session.id))
+}
+
+fn persist_usage(
+    store: &SessionStore,
+    session_id: &str,
+    usage_tracker: Option<&grey_core::UsageTracker>,
+) -> Result<()> {
+    let Some(tracker) = usage_tracker else {
+        return Ok(());
+    };
+    let usage_json = tracker
+        .persist_json(session_id)
+        .or_else(|| tracker.persist_json("default"));
+    if let Some(usage_json) = usage_json {
+        store.save_usage(session_id, &usage_json)?;
+    }
+    Ok(())
 }
 
 async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()> {
     let (agent, store, existing) = build_agent_and_session(cli, config, workspace, true)?;
+    let usage_tracker = agent.usage_tracker();
     let (events_tx, events_rx) = mpsc::unbounded_channel();
     let (prompts_tx, mut prompts_rx) = mpsc::unbounded_channel::<String>();
     let workspace = workspace.to_path_buf();
@@ -558,6 +637,12 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
                                     .send(AgentEvent::Failed(format!("saving session: {error:#}")));
                                 session = Some(current);
                                 continue;
+                            }
+                            if let Err(error) =
+                                persist_usage(store, &current.id, usage_tracker.as_deref())
+                            {
+                                let _ = events_tx
+                                    .send(AgentEvent::Failed(format!("saving usage: {error:#}")));
                             }
                         }
                     }
@@ -630,15 +715,45 @@ fn run_providers(action: ProviderAction) -> Result<()> {
     let router = ProviderRouter::from_config(&config)?;
     match action {
         ProviderAction::List => {
-            println!("{}", router.provider_list());
+            for provider in &config.providers {
+                let models = provider
+                    .models
+                    .iter()
+                    .map(|model| model.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!(
+                    "{}\tprotocol={}\tbase_url={}\tmodels=[{}]",
+                    provider.id, provider.protocol, provider.base_url, models
+                );
+            }
         }
         ProviderAction::Show { id } => {
             let ids = router.list_provider_ids();
             if !ids.contains(&id) {
                 bail!("provider not found: {id}");
             }
-            println!("provider: {id}");
-            println!("available providers: {}", ids.join(", "));
+            let provider = config
+                .provider(&id)
+                .with_context(|| format!("provider not found: {id}"))?;
+            println!("provider: {}", provider.id);
+            println!("protocol: {}", provider.protocol);
+            println!("base_url: {}", provider.base_url);
+            println!(
+                "api_key: {}",
+                if provider.api_key.is_empty() {
+                    "(none)"
+                } else {
+                    "***"
+                }
+            );
+            println!("models:");
+            for model in &provider.models {
+                println!(
+                    "  {}\t{}\tcontext={} output={}",
+                    model.id, model.name, model.context_limit, model.output_limit
+                );
+            }
         }
     }
     Ok(())
@@ -709,6 +824,22 @@ fn cache_database_path() -> PathBuf {
     PathBuf::from(".grey-cache.db")
 }
 
+fn default_model_for_provider(config: &GreyConfig, provider_id: &str) -> String {
+    if let Some(provider) = config.provider(provider_id) {
+        if let Some(model) = provider.models.first().map(|model| model.id.clone()) {
+            if !model.is_empty() {
+                return model;
+            }
+        }
+    }
+    match provider_id {
+        "mock" => config.model.clone(),
+        "openai" => config.openai.model.clone(),
+        "anthropic" => config.anthropic.model.clone(),
+        _ => config.default_model.clone(),
+    }
+}
+
 async fn run_spike_c(
     config: &GreyConfig,
     prompt: &str,
@@ -719,15 +850,7 @@ async fn run_spike_c(
     let resolved = match (provider_override, model_override) {
         (Some(pid), Some(mid)) => router.resolve_explicit(pid, mid)?,
         (Some(pid), None) => {
-            let model = if pid == "mock" {
-                config.model.clone()
-            } else if pid == "openai" {
-                config.openai.model.clone()
-            } else if pid == "anthropic" {
-                config.anthropic.model.clone()
-            } else {
-                config.model.clone()
-            };
+            let model = default_model_for_provider(config, pid);
             router.resolve_explicit(pid, &model)?
         }
         (None, _) => router.resolve(&grey_core::TaskKind::Default)?,

@@ -26,10 +26,12 @@ pub struct ContextAudit {
     pub retained_tokens: u64,
     pub summary_created: bool,
     pub tool_outputs_truncated: usize,
+    pub budget: TokenBudget,
 }
 
 pub struct ContextManager {
     config: ContextConfig,
+    budget: TokenBudget,
     counter: Arc<dyn TokenCounter>,
     summarizer: Option<SummaryEngine>,
     model: String,
@@ -42,6 +44,13 @@ impl ContextManager {
             ..Default::default()
         };
         Self {
+            budget: TokenBudget {
+                system: config.system_budget,
+                history: config.history_budget,
+                tools: config.tool_output_budget,
+                input: config.input_budget,
+                total: config.max_tokens,
+            },
             config,
             counter: Arc::new(crate::CharApproxCounter),
             summarizer: None,
@@ -56,6 +65,13 @@ impl ContextManager {
         model: impl Into<String>,
     ) -> Self {
         Self {
+            budget: TokenBudget {
+                system: config.system_budget,
+                history: config.history_budget,
+                tools: config.tool_output_budget,
+                input: config.input_budget,
+                total: config.max_tokens,
+            },
             config,
             counter,
             summarizer,
@@ -65,27 +81,27 @@ impl ContextManager {
 
     pub async fn prepare(&self, messages: &[ChatMessage]) -> (Vec<ChatMessage>, ContextAudit) {
         let original_chars: usize = messages.iter().map(message_size).sum();
-        let original_tokens: u64 = self.count_tokens(messages);
+        let mut working = messages.to_vec();
+        let partition_truncated = self.apply_partition_budgets(&mut working);
+        let partition_tokens = self.count_tokens(&working);
 
-        if original_tokens <= self.config.max_tokens {
+        if partition_tokens <= self.config.max_tokens {
             return (
-                messages.to_vec(),
+                working.clone(),
                 ContextAudit {
                     original_chars,
-                    retained_chars: original_chars,
-                    dropped_messages: 0,
-                    retained_tokens: original_tokens,
+                    retained_chars: working.iter().map(message_size).sum(),
+                    dropped_messages: messages.len().saturating_sub(working.len()),
+                    retained_tokens: partition_tokens,
                     summary_created: false,
-                    tool_outputs_truncated: 0,
+                    tool_outputs_truncated: partition_truncated,
+                    budget: self.budget,
                 },
             );
         }
 
         let system = messages.iter().find(|m| m.role == Role::System).cloned();
-
-        let mut working: Vec<ChatMessage> = messages.to_vec();
-
-        let truncated = self.truncate_tool_outputs(&mut working);
+        let truncated = partition_truncated + self.truncate_tool_outputs(&mut working);
 
         let after_trim_tokens = self.count_tokens(&working);
         if after_trim_tokens <= self.config.max_tokens {
@@ -100,6 +116,7 @@ impl ContextManager {
                     retained_tokens: after_trim_tokens,
                     summary_created: false,
                     tool_outputs_truncated: truncated,
+                    budget: self.budget,
                 },
             );
         }
@@ -119,13 +136,19 @@ impl ContextManager {
                     retained_tokens: after_summary_tokens,
                     summary_created,
                     tool_outputs_truncated: truncated,
+                    budget: self.budget,
                 },
             );
         }
 
-        self.drop_oldest(&mut working, &system);
-        Self::strip_leading_tool_messages(&mut working);
-        if let Some(sys) = &system {
+        let retained_system = working
+            .iter()
+            .find(|message| message.role == Role::System)
+            .cloned()
+            .or(system);
+        self.drop_oldest(&mut working, &retained_system);
+        Self::normalize_tool_messages(&mut working);
+        if let Some(sys) = &retained_system {
             if working.is_empty() || working[0].role != Role::System {
                 working.insert(0, sys.clone());
             }
@@ -144,6 +167,7 @@ impl ContextManager {
                 retained_tokens,
                 summary_created,
                 tool_outputs_truncated: truncated,
+                budget: self.budget,
             },
         )
     }
@@ -153,22 +177,53 @@ impl ContextManager {
     }
 
     fn truncate_tool_outputs(&self, messages: &mut [ChatMessage]) -> usize {
-        let budget = self.config.tool_output_budget as usize;
+        let budget = self.config.tool_output_budget.saturating_mul(4) as usize;
         let mut truncated = 0;
         for msg in messages.iter_mut() {
             if msg.role == Role::Tool && msg.content.chars().count() > budget {
+                if budget == 0 {
+                    msg.content.clear();
+                    truncated += 1;
+                    continue;
+                }
                 let chars: Vec<char> = msg.content.chars().collect();
-                let head: String = chars.iter().take(budget / 2).collect();
+                let marker = format!("\n...[truncated {} chars]...\n", chars.len() - budget);
+                let available = budget.saturating_sub(marker.chars().count());
+                let head_len = available.div_ceil(2);
+                let tail_len = available / 2;
+                let head: String = chars.iter().take(head_len).collect();
                 let tail: String = chars
                     .iter()
                     .rev()
-                    .take(budget / 2)
+                    .take(tail_len)
+                    .copied()
                     .collect::<Vec<_>>()
                     .into_iter()
                     .rev()
                     .collect();
-                let n = chars.len() - budget;
-                msg.content = format!("{head}\n...[truncated {n} chars]...\n{tail}");
+                msg.content = format!("{head}{marker}{tail}");
+                truncated += 1;
+            }
+        }
+        truncated
+    }
+
+    fn apply_partition_budgets(&self, messages: &mut [ChatMessage]) -> usize {
+        let mut truncated = 0;
+        let system_budget = self.budget.system.saturating_mul(4) as usize;
+        let input_budget = self.budget.input.saturating_mul(4) as usize;
+        for message in messages.iter_mut() {
+            if message.role == Role::System && truncate_content(&mut message.content, system_budget)
+            {
+                truncated += 1;
+            }
+        }
+        if let Some(message) = messages
+            .iter_mut()
+            .rev()
+            .find(|message| message.role == Role::User)
+        {
+            if truncate_content(&mut message.content, input_budget) {
                 truncated += 1;
             }
         }
@@ -257,6 +312,45 @@ impl ContextManager {
         }
         removed
     }
+
+    fn normalize_tool_messages(messages: &mut Vec<ChatMessage>) {
+        let call_ids: std::collections::HashSet<String> = messages
+            .iter()
+            .filter(|message| message.role == Role::Assistant)
+            .flat_map(|message| message.tool_calls.iter().map(|call| call.id.clone()))
+            .collect();
+        messages.retain(|message| {
+            message.role != Role::Tool
+                || message
+                    .tool_call_id
+                    .as_ref()
+                    .is_some_and(|id| call_ids.contains(id))
+        });
+        let result_ids: std::collections::HashSet<String> = messages
+            .iter()
+            .filter(|message| message.role == Role::Tool)
+            .filter_map(|message| message.tool_call_id.clone())
+            .collect();
+        for message in messages.iter_mut().filter(|m| m.role == Role::Assistant) {
+            message
+                .tool_calls
+                .retain(|call| result_ids.contains(&call.id));
+        }
+        Self::strip_leading_tool_messages(messages);
+    }
+}
+
+fn truncate_content(content: &mut String, budget_chars: usize) -> bool {
+    let chars: Vec<char> = content.chars().collect();
+    if chars.len() <= budget_chars {
+        return false;
+    }
+    if budget_chars == 0 {
+        content.clear();
+        return true;
+    }
+    *content = chars.into_iter().take(budget_chars).collect();
+    true
 }
 
 impl Default for ContextManager {

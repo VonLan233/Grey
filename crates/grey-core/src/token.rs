@@ -8,7 +8,17 @@ use crate::ChatMessage;
 pub trait TokenCounter: Send + Sync {
     fn count(&self, text: &str, model: &str) -> u64;
     fn count_messages(&self, messages: &[ChatMessage], model: &str) -> u64 {
-        messages.iter().map(|m| self.count(&m.content, model)).sum()
+        messages
+            .iter()
+            .map(|message| {
+                let tool_calls = message
+                    .tool_calls
+                    .iter()
+                    .map(|call| self.count(&format!("{}{}", call.name, call.arguments), model))
+                    .sum::<u64>();
+                self.count(&message.content, model) + 4 + tool_calls
+            })
+            .sum()
     }
 }
 

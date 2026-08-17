@@ -14,7 +14,7 @@ pub mod token;
 pub mod tool;
 pub mod usage;
 
-pub use agent::{Agent, AgentEvent, AgentOptions, AgentOutcome};
+pub use agent::{Agent, AgentEvent, AgentOptions, AgentOutcome, ProviderCandidate, ProviderHealth};
 pub use cache::{CacheStats, CachedResponse, RequestCache};
 pub use config::{
     AnthropicConfig, CacheConfig, ContextConfig, FallbackConfig, GreyConfig, LspConfig, ModelEntry,

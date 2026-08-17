@@ -4,8 +4,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
-use futures_util::stream::BoxStream;
-use grey_core::{GreyConfig, Provider, ProviderEvent, ProviderModelRef, RouteRule, TaskKind};
+use futures_util::{stream::BoxStream, StreamExt};
+use grey_core::{
+    GreyConfig, Provider, ProviderCandidate, ProviderEvent, ProviderModelRef, RouteRule, TaskKind,
+};
 
 use crate::fallback::FallbackChain;
 use crate::{anthropic, mock, openai};
@@ -13,7 +15,7 @@ use crate::{anthropic, mock, openai};
 pub struct ProviderRouter {
     providers: HashMap<String, Arc<dyn Provider>>,
     routes: Vec<RouteRule>,
-    fallback: FallbackChain,
+    fallback: Arc<FallbackChain>,
     default_provider: String,
     default_model: String,
 }
@@ -51,7 +53,7 @@ impl ProviderRouter {
         let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
         for entry in &cfg.providers {
             if providers.contains_key(&entry.id) {
-                continue;
+                bail!("duplicate provider id `{}`", entry.id);
             }
             let provider: Box<dyn Provider> = match entry.protocol.as_str() {
                 "mock" => Box::new(mock::MockProvider::new(entry.id.clone())),
@@ -97,7 +99,7 @@ impl ProviderRouter {
         Ok(Self {
             providers,
             routes: cfg.routes.clone(),
-            fallback: FallbackChain::from_config(&cfg.fallback),
+            fallback: Arc::new(FallbackChain::try_from_config(&cfg.fallback)?),
             default_provider: cfg.default_provider.clone(),
             default_model: cfg.default_model.clone(),
         })
@@ -139,8 +141,30 @@ impl ProviderRouter {
         ids.join(", ")
     }
 
+    pub fn resolve_candidates(&self, refs: &[ProviderModelRef]) -> Result<Vec<ProviderCandidate>> {
+        refs.iter()
+            .map(|reference| {
+                let provider = self.providers.get(&reference.provider).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "fallback provider `{}` is not configured",
+                        reference.provider
+                    )
+                })?;
+                Ok(ProviderCandidate::new_with_id(
+                    provider.clone(),
+                    reference.provider.clone(),
+                    reference.model.clone(),
+                ))
+            })
+            .collect()
+    }
+
     pub fn fallback(&self) -> &FallbackChain {
         &self.fallback
+    }
+
+    pub fn fallback_handle(&self) -> Arc<FallbackChain> {
+        self.fallback.clone()
     }
 
     pub async fn stream_chat<'a>(
@@ -148,7 +172,79 @@ impl ProviderRouter {
         request: &'a grey_core::ChatRequest,
         resolved: &'a ResolvedProvider,
     ) -> Result<BoxStream<'a, ProviderEvent>> {
-        resolved.provider.stream_chat(request).await
+        let refs = self
+            .fallback
+            .healthy_refs(&resolved.fallback_chain)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let refs = if refs.is_empty() {
+            vec![ProviderModelRef::new(
+                resolved.provider_id.clone(),
+                resolved.model.clone(),
+            )]
+        } else {
+            refs
+        };
+        let output = async_stream::stream! {
+            let mut last_error = None;
+            for reference in refs {
+                let Some(provider) = self.providers.get(&reference.provider).cloned() else {
+                    last_error = Some(format!("unknown fallback provider `{}`", reference.provider));
+                    continue;
+                };
+                let mut candidate_request = request.clone();
+                candidate_request.model.clone_from(&reference.model);
+                let mut stream = match provider.stream_chat(&candidate_request).await {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        let message = format!("{}: {error:#}", reference);
+                        self.fallback.mark_failed(&reference, &message);
+                        last_error = Some(message);
+                        continue;
+                    }
+                };
+                let mut visible_output = false;
+                let mut completed = false;
+                while let Some(event) = stream.next().await {
+                    match &event {
+                        ProviderEvent::Delta(_) | ProviderEvent::ToolCall(_) => {
+                            visible_output = true;
+                        }
+                        ProviderEvent::Done(_) => {
+                            completed = true;
+                            self.fallback.mark_success(&reference);
+                        }
+                        ProviderEvent::Error(error) => {
+                            self.fallback.mark_failed(&reference, error);
+                            if visible_output {
+                                yield event;
+                                return;
+                            }
+                            last_error = Some(error.clone());
+                            break;
+                        }
+                    }
+                    if completed {
+                        yield event;
+                        return;
+                    }
+                    if !matches!(event, ProviderEvent::Error(_)) {
+                        yield event;
+                    }
+                }
+                if visible_output {
+                    let error = format!("{reference} stream ended before completion");
+                    self.fallback.mark_failed(&reference, &error);
+                    yield ProviderEvent::Error(error);
+                    return;
+                }
+            }
+            yield ProviderEvent::Error(
+                last_error.unwrap_or_else(|| "all provider candidates failed".to_string())
+            );
+        };
+        Ok(Box::pin(output))
     }
 }
 
@@ -163,7 +259,12 @@ impl ProviderRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::stream;
     use grey_core::FallbackConfig;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     fn config_with_mock() -> GreyConfig {
         GreyConfig {
@@ -261,5 +362,96 @@ mod tests {
         let router = ProviderRouter::from_config(&cfg).unwrap();
         let resolved = router.resolve(&TaskKind::Default).unwrap();
         assert!(!resolved.fallback_chain.is_empty());
+    }
+
+    struct FailingThenSuccessProvider {
+        pub id: &'static str,
+        pub calls: Arc<AtomicUsize>,
+        pub fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl grey_core::Provider for FailingThenSuccessProvider {
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        async fn stream_chat<'a>(
+            &'a self,
+            _request: &'a grey_core::ChatRequest,
+        ) -> anyhow::Result<futures_util::stream::BoxStream<'a, grey_core::ProviderEvent>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let events = if self.fail {
+                vec![grey_core::ProviderEvent::Error(
+                    "simulated provider failure".into(),
+                )]
+            } else {
+                vec![
+                    grey_core::ProviderEvent::Delta("from fallback".into()),
+                    grey_core::ProviderEvent::Done(grey_core::Usage {
+                        input_tokens: 2,
+                        output_tokens: 3,
+                    }),
+                ]
+            };
+            Ok(Box::pin(stream::iter(events)))
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_chat_falls_back_when_primary_fails_before_visible_output() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "primary".into(),
+            Arc::new(FailingThenSuccessProvider {
+                id: "primary",
+                calls: primary_calls.clone(),
+                fail: true,
+            }) as Arc<dyn grey_core::Provider>,
+        );
+        providers.insert(
+            "fallback".into(),
+            Arc::new(FailingThenSuccessProvider {
+                id: "fallback",
+                calls: fallback_calls.clone(),
+                fail: false,
+            }) as Arc<dyn grey_core::Provider>,
+        );
+
+        let fallback_chain = Arc::new(
+            FallbackChain::try_from_config(&grey_core::FallbackConfig {
+                providers: vec!["primary".into(), "fallback".into()],
+                models: Default::default(),
+            })
+            .unwrap(),
+        );
+
+        let router = ProviderRouter {
+            providers,
+            routes: vec![],
+            fallback: fallback_chain,
+            default_provider: "primary".into(),
+            default_model: "m".into(),
+        };
+
+        let resolved = router.resolve(&TaskKind::Default).unwrap();
+        assert_eq!(resolved.provider_id, "primary");
+        assert_eq!(resolved.fallback_chain.len(), 2);
+
+        let request = grey_core::ChatRequest::new(
+            "m",
+            vec![grey_core::ChatMessage::new(grey_core::Role::User, "hello")],
+        );
+        let stream = router.stream_chat(&request, &resolved).await.unwrap();
+        let (text, calls, usage) = grey_core::collect(stream).await.unwrap();
+
+        assert_eq!(text, "from fallback");
+        assert_eq!(calls.len(), 0);
+        assert_eq!(usage.input_tokens, 2);
+        assert_eq!(usage.output_tokens, 3);
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
     }
 }

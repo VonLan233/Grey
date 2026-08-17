@@ -78,10 +78,19 @@ impl RequestCache {
     }
 
     pub fn get(&self, model: &str, messages: &[ChatMessage]) -> Option<CachedResponse> {
+        self.get_for_provider("", model, messages)
+    }
+
+    pub fn get_for_provider(
+        &self,
+        provider: &str,
+        model: &str,
+        messages: &[ChatMessage],
+    ) -> Option<CachedResponse> {
         if !self.config.enabled {
             return None;
         }
-        let key = cache_key(model, messages);
+        let key = cache_key(provider, model, messages);
         let now = unix_timestamp();
         let ttl_secs = self.config.ttl_hours * 3600;
 
@@ -112,6 +121,11 @@ impl RequestCache {
 
         if now - created >= ttl_secs as i64 {
             *self.misses.lock().unwrap() += 1;
+            let _ = self
+                .connection
+                .lock()
+                .unwrap()
+                .execute("DELETE FROM cache_entries WHERE key = ?1", [&key]);
             return None;
         }
 
@@ -132,10 +146,20 @@ impl RequestCache {
         messages: &[ChatMessage],
         response: &CachedResponse,
     ) -> Result<()> {
+        self.put_for_provider("", model, messages, response)
+    }
+
+    pub fn put_for_provider(
+        &self,
+        provider: &str,
+        model: &str,
+        messages: &[ChatMessage],
+        response: &CachedResponse,
+    ) -> Result<()> {
         if !self.config.enabled {
             return Ok(());
         }
-        let key = cache_key(model, messages);
+        let key = cache_key(provider, model, messages);
         let now = unix_timestamp();
         let json = serde_json::to_string(response)?;
 
@@ -203,8 +227,10 @@ impl RequestCache {
     }
 }
 
-fn cache_key(model: &str, messages: &[ChatMessage]) -> String {
+fn cache_key(provider: &str, model: &str, messages: &[ChatMessage]) -> String {
     let mut hasher = Sha256::new();
+    hasher.update(provider.as_bytes());
+    hasher.update(b"\0");
     hasher.update(model.as_bytes());
     hasher.update(b"\0");
     let json = serde_json::to_string(messages).unwrap_or_default();

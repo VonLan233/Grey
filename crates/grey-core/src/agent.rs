@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use futures_util::StreamExt;
 use serde::Serialize;
 use tokio::sync::mpsc;
@@ -70,6 +70,49 @@ pub struct AgentOutcome {
     pub model: String,
 }
 
+/// A concrete provider/model pair that can be attempted after the primary.
+///
+/// The core crate owns the failover algorithm, while the composition root
+/// resolves provider identifiers into these concrete handles.
+#[derive(Clone)]
+pub struct ProviderCandidate {
+    pub provider: Arc<dyn Provider>,
+    pub provider_id: String,
+    pub model: String,
+    health: Option<Arc<dyn ProviderHealth>>,
+}
+
+pub trait ProviderHealth: Send + Sync {
+    fn is_healthy(&self, reference: &ProviderModelRef) -> bool;
+    fn mark_failed(&self, reference: &ProviderModelRef, error: &str);
+    fn mark_success(&self, reference: &ProviderModelRef);
+}
+
+impl ProviderCandidate {
+    pub fn new(provider: Arc<dyn Provider>, model: impl Into<String>) -> Self {
+        let provider_id = provider.id().to_string();
+        Self::new_with_id(provider, provider_id, model)
+    }
+
+    pub fn new_with_id(
+        provider: Arc<dyn Provider>,
+        provider_id: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        Self {
+            provider_id: provider_id.into(),
+            provider,
+            model: model.into(),
+            health: None,
+        }
+    }
+
+    pub fn with_health(mut self, health: Arc<dyn ProviderHealth>) -> Self {
+        self.health = Some(health);
+        self
+    }
+}
+
 pub struct Agent {
     provider: Arc<dyn Provider>,
     provider_id: String,
@@ -79,6 +122,9 @@ pub struct Agent {
     cache: Option<Arc<RequestCache>>,
     usage: Option<Arc<UsageTracker>>,
     fallback_chain: Vec<ProviderModelRef>,
+    fallback_providers: Vec<ProviderCandidate>,
+    fallback_health: Option<Arc<dyn ProviderHealth>>,
+    usage_session_id: String,
 }
 
 impl Agent {
@@ -97,6 +143,9 @@ impl Agent {
             cache: None,
             usage: None,
             fallback_chain: Vec::new(),
+            fallback_providers: Vec::new(),
+            fallback_health: None,
+            usage_session_id: "default".to_string(),
         }
     }
 
@@ -119,9 +168,33 @@ impl Agent {
         self
     }
 
+    pub fn with_provider_id(mut self, provider_id: impl Into<String>) -> Self {
+        self.provider_id = provider_id.into();
+        self
+    }
+
     pub fn with_fallback_chain(mut self, chain: Vec<ProviderModelRef>) -> Self {
         self.fallback_chain = chain;
         self
+    }
+
+    pub fn with_fallback_providers(mut self, providers: Vec<ProviderCandidate>) -> Self {
+        self.fallback_providers = providers;
+        self
+    }
+
+    pub fn with_fallback_health(mut self, health: Arc<dyn ProviderHealth>) -> Self {
+        self.fallback_health = Some(health);
+        self
+    }
+
+    pub fn with_usage_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.usage_session_id = session_id.into();
+        self
+    }
+
+    pub fn usage_tracker(&self) -> Option<Arc<UsageTracker>> {
+        self.usage.clone()
     }
 
     pub fn provider_id(&self) -> &str {
@@ -148,6 +221,10 @@ impl Agent {
         prompt: impl Into<String>,
         events: Option<&mpsc::UnboundedSender<AgentEvent>>,
     ) -> Result<AgentOutcome> {
+        anyhow::ensure!(
+            self.options.max_steps > 0,
+            "agent max_steps must be greater than zero"
+        );
         messages.push(ChatMessage::new(Role::User, prompt));
         let definitions = self.tools.definitions();
         let mut total_usage = Usage::default();
@@ -155,14 +232,20 @@ impl Agent {
 
         for step in 1..=self.options.max_steps {
             let (prepared, audit) = self.context.prepare(&messages).await;
-            if audit.dropped_messages > 0 {
+            if audit.dropped_messages > 0
+                || audit.tool_outputs_truncated > 0
+                || audit.summary_created
+            {
                 send_event(events, AgentEvent::ContextTrimmed(audit));
             }
             let request = ChatRequest::new(self.options.model.clone(), prepared)
                 .with_tools(definitions.clone());
 
             if let Some(cache) = &self.cache {
-                if let Some(cached_resp) = cache.get(&self.options.model, &request.messages) {
+                if let Some(cached_resp) = cache
+                    .get_for_provider(&self.provider_id, &request.model, &request.messages)
+                    .or_else(|| cache.get(&request.model, &request.messages))
+                {
                     cached = true;
                     send_event(
                         events,
@@ -174,8 +257,25 @@ impl Agent {
                         text: cached_resp.text,
                         calls: cached_resp.tool_calls,
                         usage: cached_resp.usage,
+                        provider_id: self.provider_id.clone(),
+                        model: request.model.clone(),
                     };
                     total_usage.add_assign(&turn.usage);
+                    if let Some(usage_tracker) = &self.usage {
+                        let timestamp = unix_timestamp();
+                        usage_tracker.record(
+                            &self.usage_session_id,
+                            crate::TurnUsage {
+                                provider: turn.provider_id.clone(),
+                                model: turn.model.clone(),
+                                input_tokens: turn.usage.input_tokens,
+                                output_tokens: turn.usage.output_tokens,
+                                cost_usd: 0.0,
+                                cached: true,
+                                timestamp,
+                            },
+                        );
+                    }
                     messages.push(ChatMessage::assistant(
                         turn.text.clone(),
                         turn.calls.clone(),
@@ -189,7 +289,7 @@ impl Agent {
                             steps: step,
                             cached,
                             provider_id: self.provider_id.clone(),
-                            model: self.options.model.clone(),
+                            model: request.model.clone(),
                         });
                     }
                     if step == self.options.max_steps {
@@ -217,27 +317,30 @@ impl Agent {
                     .unwrap_or_default()
                     .as_secs() as i64;
                 let turn_usage = crate::TurnUsage {
-                    provider: self.provider_id.clone(),
-                    model: self.options.model.clone(),
+                    provider: turn.provider_id.clone(),
+                    model: turn.model.clone(),
                     input_tokens: turn.usage.input_tokens,
                     output_tokens: turn.usage.output_tokens,
                     cost_usd: 0.0,
-                    cached,
+                    cached: false,
                     timestamp,
                 };
-                usage_tracker.record(&self.session_id_for_usage(), turn_usage);
+                usage_tracker.record(&self.usage_session_id, turn_usage);
             }
 
-            if !cached {
-                if let Some(cache) = &self.cache {
-                    let cached_resp = CachedResponse {
-                        text: turn.text.clone(),
-                        tool_calls: turn.calls.clone(),
-                        usage: turn.usage.clone(),
-                        cached_at: 0,
-                    };
-                    let _ = cache.put(&self.options.model, &request.messages, &cached_resp);
-                }
+            if let Some(cache) = &self.cache {
+                let cached_resp = CachedResponse {
+                    text: turn.text.clone(),
+                    tool_calls: turn.calls.clone(),
+                    usage: turn.usage.clone(),
+                    cached_at: 0,
+                };
+                let _ = cache.put_for_provider(
+                    &turn.provider_id,
+                    &turn.model,
+                    &request.messages,
+                    &cached_resp,
+                );
             }
 
             messages.push(ChatMessage::assistant(
@@ -252,8 +355,8 @@ impl Agent {
                     usage: total_usage,
                     steps: step,
                     cached,
-                    provider_id: self.provider_id.clone(),
-                    model: self.options.model.clone(),
+                    provider_id: turn.provider_id,
+                    model: turn.model,
                 });
             }
             if step == self.options.max_steps {
@@ -274,23 +377,99 @@ impl Agent {
         unreachable!("the bounded loop always returns or errors")
     }
 
-    fn session_id_for_usage(&self) -> String {
-        "default".to_string()
-    }
-
     async fn stream_turn(
         &self,
         request: &ChatRequest,
         events: Option<&mpsc::UnboundedSender<AgentEvent>>,
     ) -> Result<CompletedTurn> {
+        let mut candidates = vec![ProviderCandidate {
+            provider: self.provider.clone(),
+            provider_id: self.provider_id.clone(),
+            model: request.model.clone(),
+            health: self.fallback_health.clone(),
+        }];
+        candidates.extend(
+            self.fallback_providers
+                .iter()
+                .filter(|candidate| {
+                    candidate.provider_id != self.provider_id || candidate.model != request.model
+                })
+                .cloned(),
+        );
+
+        let mut last_error = None;
+        for (index, candidate) in candidates.iter().enumerate() {
+            let reference = ProviderModelRef::new(&candidate.provider_id, &candidate.model);
+            if let Some(health) = &candidate.health {
+                if !health.is_healthy(&reference) {
+                    continue;
+                }
+            }
+            let candidate_request = if candidate.model == request.model {
+                request.clone()
+            } else {
+                let mut request = request.clone();
+                request.model.clone_from(&candidate.model);
+                request
+            };
+            match self
+                .stream_candidate(candidate, &candidate_request, events)
+                .await
+            {
+                Ok(mut turn) => {
+                    if let Some(health) = &candidate.health {
+                        health.mark_success(&reference);
+                    }
+                    turn.provider_id.clone_from(&candidate.provider_id);
+                    turn.model.clone_from(&candidate.model);
+                    return Ok(turn);
+                }
+                Err(failure) if !failure.visible_output && index + 1 < candidates.len() => {
+                    if let Some(health) = &candidate.health {
+                        health.mark_failed(&reference, &failure.error);
+                    }
+                    last_error = Some(failure.error.clone());
+                    send_event(
+                        events,
+                        AgentEvent::ProviderSwitched {
+                            from: candidate.provider_id.clone(),
+                            to: candidates[index + 1].provider_id.clone(),
+                            reason: failure.error,
+                        },
+                    );
+                }
+                Err(failure) => {
+                    if let Some(health) = &candidate.health {
+                        health.mark_failed(&reference, &failure.error);
+                    }
+                    return Err(anyhow::anyhow!(failure.error));
+                }
+            }
+        }
+        Err(anyhow::anyhow!(last_error.unwrap_or_else(|| {
+            "all provider candidates failed".to_string()
+        })))
+    }
+
+    async fn stream_candidate(
+        &self,
+        candidate: &ProviderCandidate,
+        request: &ChatRequest,
+        events: Option<&mpsc::UnboundedSender<AgentEvent>>,
+    ) -> std::result::Result<CompletedTurn, AttemptFailure> {
         'attempts: for attempt in 0..=self.options.retries {
-            let mut stream = match self.provider.stream_chat(request).await {
+            let mut stream = match candidate.provider.stream_chat(request).await {
                 Ok(stream) => stream,
                 Err(error) if attempt < self.options.retries => {
                     self.retry(attempt, &error.to_string(), events).await;
                     continue;
                 }
-                Err(error) => return Err(error).context("starting provider stream"),
+                Err(error) => {
+                    return Err(AttemptFailure {
+                        error: format!("starting provider stream: {error:#}"),
+                        visible_output: false,
+                    })
+                }
             };
             let mut text = String::new();
             let mut calls = Vec::new();
@@ -315,7 +494,12 @@ impl Agent {
                         self.retry(attempt, &error, events).await;
                         continue 'attempts;
                     }
-                    ProviderEvent::Error(error) => bail!("provider stream failed: {error}"),
+                    ProviderEvent::Error(error) => {
+                        return Err(AttemptFailure {
+                            error: format!("provider stream failed: {error}"),
+                            visible_output,
+                        })
+                    }
                 }
             }
 
@@ -325,17 +509,22 @@ impl Agent {
                         .await;
                     continue;
                 }
-                bail!("provider stream ended before completion");
+                return Err(AttemptFailure {
+                    error: "provider stream ended before completion".to_string(),
+                    visible_output,
+                });
             }
 
             return Ok(CompletedTurn {
                 text,
                 calls,
                 usage: usage.expect("checked above"),
+                provider_id: candidate.provider_id.clone(),
+                model: candidate.model.clone(),
             });
         }
 
-        unreachable!("the retry loop always returns on its final attempt")
+        unreachable!("the retry loop always returns or errors")
     }
 
     async fn retry(
@@ -355,10 +544,24 @@ impl Agent {
     }
 }
 
+fn unix_timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
 struct CompletedTurn {
     text: String,
     calls: Vec<ToolCall>,
     usage: Usage,
+    provider_id: String,
+    model: String,
+}
+
+struct AttemptFailure {
+    error: String,
+    visible_output: bool,
 }
 
 fn send_event(events: Option<&mpsc::UnboundedSender<AgentEvent>>, event: AgentEvent) {
@@ -419,6 +622,25 @@ mod tests {
 
         async fn execute(&self, call: &ToolCall) -> ToolResult {
             ToolResult::success(call, "contents")
+        }
+    }
+
+    struct FixedProvider {
+        id: &'static str,
+        events: Vec<ProviderEvent>,
+    }
+
+    #[async_trait]
+    impl Provider for FixedProvider {
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        async fn stream_chat<'a>(
+            &'a self,
+            _request: &'a ChatRequest,
+        ) -> Result<BoxStream<'a, ProviderEvent>> {
+            Ok(Box::pin(stream::iter(self.events.clone())))
         }
     }
 
@@ -656,7 +878,8 @@ mod tests {
         let outcome = a.run_new("system", "hello", None).await.unwrap();
         assert_eq!(outcome.response, "fresh");
 
-        let cached = cache.get(
+        let cached = cache.get_for_provider(
+            "scripted",
             "model",
             &[
                 ChatMessage::new(Role::System, "system"),
@@ -665,5 +888,48 @@ mod tests {
         );
         assert!(cached.is_some());
         assert_eq!(cached.unwrap().text, "fresh");
+    }
+
+    #[tokio::test]
+    async fn switches_to_fallback_provider_before_visible_output() {
+        let primary = Arc::new(FixedProvider {
+            id: "primary",
+            events: vec![ProviderEvent::Error("primary unavailable".into())],
+        });
+        let fallback = Arc::new(FixedProvider {
+            id: "fallback",
+            events: vec![
+                ProviderEvent::Delta("fallback response".into()),
+                ProviderEvent::Done(Usage {
+                    input_tokens: 2,
+                    output_tokens: 3,
+                }),
+            ],
+        });
+        let mut options = AgentOptions::new("primary-model");
+        options.retries = 0;
+        let agent = Agent::new(
+            primary,
+            Arc::new(ScriptedTools),
+            ContextManager::default(),
+            options,
+        )
+        .with_fallback_providers(vec![ProviderCandidate::new(fallback, "fallback-model")]);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+
+        let outcome = agent
+            .run_new("system", "hello", Some(&events_tx))
+            .await
+            .unwrap();
+        assert_eq!(outcome.response, "fallback response");
+        assert_eq!(outcome.provider_id, "fallback");
+        assert_eq!(outcome.model, "fallback-model");
+        let mut switched = false;
+        while let Ok(event) = events_rx.try_recv() {
+            if let AgentEvent::ProviderSwitched { from, to, .. } = event {
+                switched = from == "primary" && to == "fallback";
+            }
+        }
+        assert!(switched);
     }
 }

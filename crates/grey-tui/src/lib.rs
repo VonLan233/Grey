@@ -813,6 +813,7 @@ mod tests {
             retained_tokens: 1000,
             summary_created: false,
             tool_outputs_truncated: 0,
+            budget: grey_core::context::TokenBudget::default(),
         }));
         state.reduce_agent_event(AgentEvent::Completed {
             usage: grey_core::Usage {
