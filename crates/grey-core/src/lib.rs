@@ -17,8 +17,9 @@ pub mod usage;
 pub use agent::{Agent, AgentEvent, AgentOptions, AgentOutcome, ProviderCandidate, ProviderHealth};
 pub use cache::{CacheStats, CachedResponse, RequestCache};
 pub use config::{
-    AnthropicConfig, CacheConfig, ContextConfig, FallbackConfig, GreyConfig, LspConfig, ModelEntry,
-    OpenAiConfig, ProviderEntry, RouteRule, TaskKind, UsageConfig,
+    AnthropicConfig, CacheConfig, ContextConfig, FallbackConfig, GreyConfig, HooksConfig,
+    LspConfig, McpToolConfig, ModelEntry, OpenAiConfig, ProviderEntry, RouteRule, TaskKind,
+    UsageConfig,
 };
 pub use context::{ContextAudit, ContextManager};
 pub use provider::{

@@ -1,8 +1,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use grey_core::{ToolCall, ToolExecutor};
-use grey_tools::{AlwaysApprove, BuiltinTools, DenySideEffects, BUILTIN_TOOL_NAMES};
+use grey_core::{McpToolConfig, ToolCall, ToolExecutor};
+use grey_tools::{
+    AlwaysApprove, BuiltinTools, CombinedTools, DenySideEffects, HookedTools, McpTools,
+    BUILTIN_TOOL_NAMES,
+};
 
 fn call(name: &str, arguments: serde_json::Value) -> ToolCall {
     ToolCall {
@@ -171,4 +174,48 @@ async fn rejects_symlink_escape() {
         .await;
     assert!(!result.success);
     assert!(result.output.contains("workspace"));
+}
+
+#[tokio::test]
+async fn combined_tools_resolves_builtins_and_mcp() {
+    let workspace = tempfile::tempdir().unwrap();
+    let builtin = BuiltinTools::new(workspace.path(), Arc::new(DenySideEffects)).unwrap();
+    let mcp = McpTools::new(vec![McpToolConfig {
+        name: "mock".into(),
+        command: "sh".into(),
+        args: vec![
+            "-lc".into(),
+            "printf '{\"success\":true,\"output\":\"from mcp\"}'".into(),
+        ],
+        ..Default::default()
+    }]);
+    let tools: std::sync::Arc<dyn grey_core::ToolExecutor> =
+        Arc::new(CombinedTools::new(vec![Arc::new(builtin), Arc::new(mcp)]));
+
+    let names = tools.definitions();
+    assert!(names
+        .iter()
+        .any(|definition| definition.name == "read_file"));
+    assert!(names.iter().any(|definition| definition.name == "mock"));
+
+    let result = tools
+        .execute(&crate::call("mock", serde_json::json!({})))
+        .await;
+    assert!(result.success);
+    assert_eq!(result.output, "from mcp");
+}
+
+#[tokio::test]
+async fn pre_tool_hook_blocks_and_post_tool_hook_runs_on_success() {
+    let workspace = tempfile::tempdir().unwrap();
+    let builtin = BuiltinTools::new(workspace.path(), Arc::new(DenySideEffects)).unwrap();
+    let tools = HookedTools::new(Arc::new(builtin), vec!["false".into()], vec!["true".into()]);
+    let result = tools
+        .execute(&crate::call(
+            "read_file",
+            serde_json::json!({"path": "absent.txt"}),
+        ))
+        .await;
+    assert!(!result.success, "{}", result.output);
+    assert!(result.output.contains("denied"));
 }

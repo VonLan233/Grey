@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -42,6 +43,30 @@ pub struct ModelEntry {
     pub context_limit: u64,
     #[serde(default)]
     pub output_limit: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HooksConfig {
+    #[serde(default)]
+    pub pre_prompt: Vec<String>,
+    #[serde(default)]
+    pub pre_tool_call: Vec<String>,
+    #[serde(default)]
+    pub post_tool_call: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct McpToolConfig {
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub input_schema: Option<Value>,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -241,6 +266,10 @@ pub struct GreyConfig {
     pub cache: CacheConfig,
     /// P2: usage tracking configuration.
     pub usage: UsageConfig,
+    /// Hook configuration.
+    pub hooks: HooksConfig,
+    /// External command MCP tools.
+    pub mcp_tools: Vec<McpToolConfig>,
 
     // Legacy fields (kept for backward compat; migrated into `providers`).
     pub provider: String,
@@ -265,6 +294,8 @@ impl Default for GreyConfig {
             context: ContextConfig::default(),
             cache: CacheConfig::default(),
             usage: UsageConfig::default(),
+            hooks: HooksConfig::default(),
+            mcp_tools: Vec::new(),
             provider: "mock".into(),
             model: "grey-default".into(),
             openai: OpenAiConfig {
@@ -410,6 +441,12 @@ fn merge_file(base: GreyConfig, over: GreyConfig, raw: &toml::Value) -> GreyConf
     if !table.contains_key("usage") {
         merged.usage = defaults.usage;
     }
+    if !table.contains_key("hooks") {
+        merged.hooks = defaults.hooks;
+    }
+    if !table.contains_key("mcp_tools") {
+        merged.mcp_tools = defaults.mcp_tools;
+    }
     merged
 }
 
@@ -435,6 +472,15 @@ fn merge(mut base: GreyConfig, over: GreyConfig) -> GreyConfig {
     base.context = over.context;
     base.cache = over.cache;
     base.usage = over.usage;
+    if !over.hooks.pre_prompt.is_empty()
+        || !over.hooks.pre_tool_call.is_empty()
+        || !over.hooks.post_tool_call.is_empty()
+    {
+        base.hooks = over.hooks;
+    }
+    if !over.mcp_tools.is_empty() {
+        base.mcp_tools = over.mcp_tools;
+    }
     // Legacy fields
     if !over.provider.is_empty() {
         base.provider = over.provider;
@@ -621,6 +667,21 @@ fn apply_env(cfg: &mut GreyConfig) -> Result<()> {
     cfg.anthropic.api_key = expand_env_refs(&cfg.anthropic.api_key)?;
     for p in cfg.providers.iter_mut() {
         p.api_key = expand_env_refs(&p.api_key)?;
+    }
+    for hook in cfg.hooks.pre_prompt.iter_mut() {
+        *hook = expand_env_refs(hook)?;
+    }
+    for hook in cfg.hooks.pre_tool_call.iter_mut() {
+        *hook = expand_env_refs(hook)?;
+    }
+    for hook in cfg.hooks.post_tool_call.iter_mut() {
+        *hook = expand_env_refs(hook)?;
+    }
+    for tool in cfg.mcp_tools.iter_mut() {
+        tool.command = expand_env_refs(&tool.command)?;
+        for arg in tool.args.iter_mut() {
+            *arg = expand_env_refs(arg)?;
+        }
     }
     Ok(())
 }
@@ -883,5 +944,44 @@ ttl_hours = 12
         let cfg = GreyConfig::default();
         assert!(cfg.provider("mock").is_some());
         assert!(cfg.provider("nonexistent").is_none());
+    }
+
+    #[test]
+    fn parses_hooks_and_mcp_tools() {
+        let toml_str = r#"
+hooks = { pre_prompt = ["echo before prompt"] }
+
+[[mcp_tools]]
+name = "echoer"
+command = "sh"
+args = ["-lc", "printf '{\"success\":true,\"output\":\"tool-ok\"}'"]
+description = "echo test tool"
+"#;
+        let cfg: GreyConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.hooks.pre_prompt, vec!["echo before prompt".to_string()]);
+        assert_eq!(cfg.mcp_tools.len(), 1);
+        assert_eq!(cfg.mcp_tools[0].name, "echoer");
+    }
+
+    #[test]
+    fn mcp_tool_env_refs_are_expanded() {
+        let mut cfg = GreyConfig::default();
+        cfg.mcp_tools.push(McpToolConfig {
+            name: "tool".into(),
+            command: "${GREY_TEST_MCP_CMD}".into(),
+            args: vec!["${GREY_TEST_MCP_ARG}".into()],
+            ..Default::default()
+        });
+        unsafe {
+            env::set_var("GREY_TEST_MCP_CMD", "sh");
+            env::set_var("GREY_TEST_MCP_ARG", "-lc");
+        }
+        apply_env(&mut cfg).unwrap();
+        unsafe {
+            env::remove_var("GREY_TEST_MCP_CMD");
+            env::remove_var("GREY_TEST_MCP_ARG");
+        }
+        assert_eq!(cfg.mcp_tools[0].command, "sh");
+        assert_eq!(cfg.mcp_tools[0].args, vec!["-lc".to_string()]);
     }
 }

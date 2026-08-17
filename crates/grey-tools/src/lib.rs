@@ -2,22 +2,44 @@
 
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use globset::{Glob, GlobMatcher};
-use grey_core::{ToolCall, ToolDefinition, ToolExecutor, ToolResult, ToolRisk};
+use grey_core::{McpToolConfig, ToolCall, ToolDefinition, ToolExecutor, ToolResult, ToolRisk};
 use ignore::WalkBuilder;
 use regex::Regex;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::json;
+use serde_json::Value;
 use tempfile::NamedTempFile;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 pub const BUILTIN_TOOL_NAMES: [&str; 5] = ["read_file", "edit_file", "bash", "glob", "grep"];
+const DEFAULT_HOOK_TIMEOUT: u64 = 10_000;
+const DEFAULT_TOOL_TIMEOUT: u64 = 5_000;
+
+#[derive(Debug, Clone)]
+pub struct McpTool {
+    pub name: String,
+    pub command: String,
+    pub description: Option<String>,
+    pub args: Vec<String>,
+    pub input_schema: Option<Value>,
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct McpResponse {
+    success: Option<bool>,
+    output: Option<String>,
+    error: Option<String>,
+}
 
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_SEARCH_RESULTS: usize = 500;
@@ -67,6 +89,194 @@ impl Approver for StdioApprover {
         })
         .await
         .unwrap_or(false)
+    }
+}
+
+#[derive(Clone)]
+pub struct CombinedTools {
+    executors: Vec<Arc<dyn ToolExecutor>>,
+}
+
+impl CombinedTools {
+    pub fn new(executors: Vec<Arc<dyn ToolExecutor>>) -> Self {
+        Self { executors }
+    }
+
+    pub fn tool_names(&self) -> Vec<String> {
+        self.executors
+            .iter()
+            .flat_map(|executor| executor.definitions())
+            .map(|definition| definition.name)
+            .collect()
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for CombinedTools {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        self.executors
+            .iter()
+            .flat_map(|executor| executor.definitions().into_iter())
+            .collect()
+    }
+
+    async fn execute(&self, call: &ToolCall) -> ToolResult {
+        for executor in &self.executors {
+            if executor
+                .definitions()
+                .iter()
+                .any(|definition| definition.name == call.name)
+            {
+                return executor.execute(call).await;
+            }
+        }
+        ToolResult::failure(call, format!("unknown tool {}", call.name))
+    }
+}
+
+pub struct HookedTools {
+    inner: Arc<dyn ToolExecutor>,
+    pre_tool_hooks: Vec<String>,
+    post_tool_hooks: Vec<String>,
+}
+
+impl HookedTools {
+    pub fn new(
+        inner: Arc<dyn ToolExecutor>,
+        pre_tool_hooks: Vec<String>,
+        post_tool_hooks: Vec<String>,
+    ) -> Self {
+        Self {
+            inner,
+            pre_tool_hooks,
+            post_tool_hooks,
+        }
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for HookedTools {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        self.inner.definitions()
+    }
+
+    async fn execute(&self, call: &ToolCall) -> ToolResult {
+        if let Err(error) = run_hook_chain(&self.pre_tool_hooks, "pre_tool_call", call).await {
+            return ToolResult::failure(
+                call,
+                format!("pre_tool_call hook denied tool {}: {error}", call.name),
+            );
+        }
+
+        let mut result = self.inner.execute(call).await;
+        if let Err(error) = run_hook_chain(&self.post_tool_hooks, "post_tool_call", call).await {
+            result.success = false;
+            result.output = format!("{error}\n{}", result.output);
+        }
+        result
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct McpTools {
+    tools: Vec<McpTool>,
+}
+
+impl McpTools {
+    pub fn new(configured: Vec<McpToolConfig>) -> Self {
+        Self {
+            tools: configured
+                .into_iter()
+                .filter(|tool| !tool.name.is_empty() && !tool.command.is_empty())
+                .map(|tool| McpTool {
+                    name: tool.name,
+                    command: tool.command,
+                    description: tool.description,
+                    args: tool.args,
+                    input_schema: tool.input_schema,
+                    timeout_ms: tool.timeout_ms,
+                })
+                .collect(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tools.is_empty()
+    }
+}
+
+impl McpTools {
+    fn schema_for(tool: &McpTool) -> Value {
+        tool.input_schema.clone().unwrap_or_else(|| {
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": true,
+            })
+        })
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for McpTools {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        self.tools
+            .iter()
+            .map(|tool| ToolDefinition {
+                name: tool.name.clone(),
+                description: tool
+                    .description
+                    .clone()
+                    .unwrap_or_else(|| "MCP command tool".into()),
+                input_schema: Self::schema_for(tool),
+                risk: ToolRisk::ReadOnly,
+            })
+            .collect()
+    }
+
+    async fn execute(&self, call: &ToolCall) -> ToolResult {
+        let tool = self.tools.iter().find(|tool| tool.name == call.name);
+        let Some(tool) = tool else {
+            return ToolResult::failure(call, format!("unknown MCP tool {}", call.name));
+        };
+        let request = json!({
+            "id": call.id,
+            "name": call.name,
+            "arguments": call.arguments,
+        })
+        .to_string();
+
+        let output = match execute_command(
+            &tool.command,
+            &tool.args,
+            Some(&request),
+            tool.timeout_ms.unwrap_or(DEFAULT_TOOL_TIMEOUT),
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                return ToolResult::failure(
+                    call,
+                    format!("MCP tool {} command failed: {}", call.name, error),
+                )
+            }
+        };
+        let parsed = serde_json::from_str::<McpResponse>(&output).unwrap_or_else(|_| McpResponse {
+            success: None,
+            output: Some(output.clone()),
+            error: None,
+        });
+        if parsed.success.unwrap_or(true) {
+            ToolResult::success(call, parsed.output.unwrap_or(output))
+        } else {
+            ToolResult::failure(
+                call,
+                parsed
+                    .error
+                    .unwrap_or_else(|| parsed.output.unwrap_or(output)),
+            )
+        }
     }
 }
 
@@ -438,6 +648,88 @@ fn truncate_output(mut output: String) -> String {
     output.truncate(boundary);
     output.push_str("\n[output truncated by Grey]\n");
     output
+}
+
+async fn run_hook_chain(commands: &[String], event: &str, call: &ToolCall) -> Result<(), String> {
+    if commands.is_empty() {
+        return Ok(());
+    }
+    let payload = json!({
+        "event": event,
+        "tool": {
+            "id": call.id,
+            "name": call.name,
+            "arguments": call.arguments,
+        }
+    })
+    .to_string();
+    for command in commands {
+        if let Err(error) = run_shell_command(command, Some(&payload), DEFAULT_HOOK_TIMEOUT).await {
+            return Err(format!(
+                "{event} hook failed for tool {} with command `{command}`: {error}",
+                call.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn run_shell_command(command: &str, input: Option<&str>, timeout_ms: u64) -> Result<String> {
+    run_command_inner("sh", &["-lc", command], input, timeout_ms).await
+}
+
+async fn execute_command(
+    command: &str,
+    args: &[String],
+    input: Option<&str>,
+    timeout_ms: u64,
+) -> Result<String> {
+    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    run_command_inner(command, &args, input, timeout_ms).await
+}
+
+async fn run_command_inner(
+    command: &str,
+    args: &[&str],
+    input: Option<&str>,
+    timeout_ms: u64,
+) -> Result<String> {
+    let mut command = Command::new(command);
+    command
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .kill_on_drop(true);
+    let mut child = command.spawn().context("spawning command")?;
+    if let Some(input) = input {
+        let mut stdin = child.stdin.take().context("opening command stdin")?;
+        stdin
+            .write_all(input.as_bytes())
+            .await
+            .context("writing hook or tool input")?;
+    }
+
+    let output = tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait_with_output())
+        .await
+        .map_err(|_| anyhow::anyhow!("command timed out after {timeout_ms}ms"))?
+        .context("waiting for command")?;
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    if !output.stderr.is_empty() {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+    }
+    if output.status.success() {
+        Ok(text)
+    } else {
+        bail!("{}", text.trim());
+    }
 }
 
 #[derive(Deserialize)]

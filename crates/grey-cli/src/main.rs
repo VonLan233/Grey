@@ -1,5 +1,6 @@
 //! Grey composition root: headless agent, interactive TUI, spikes and config.
 
+use std::collections::HashSet;
 use std::env;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -10,17 +11,25 @@ use clap::{Parser, Subcommand, ValueEnum};
 use grey_core::{
     config, Agent, AgentEvent, AgentOptions, AgentOutcome, CharApproxCounter, ChatMessage,
     ChatRequest, ContextManager, GreyConfig, Provider, Role, Session, SessionStore, SummaryEngine,
+    ToolExecutor,
 };
 use grey_provider::router::ProviderRouter;
 use grey_tools::{AlwaysApprove, Approver, BuiltinTools, DenySideEffects, StdioApprover};
+use grey_tools::{CombinedTools, HookedTools, McpTools};
 use serde::Serialize;
+use serde_json::{json, Value};
+use std::process::Stdio;
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command as TokioCommand;
 use tokio::sync::mpsc;
+use tokio::time::Duration;
 
 const SYSTEM_PROMPT: &str = r#"You are Grey, a careful coding agent working inside one workspace.
 Inspect before changing anything. Use read_file, glob, and grep to gather evidence. Use edit_file
 only with an exact old_string that occurs once. After edits, run the relevant tests with bash.
 Keep changes scoped to the user's request, report tool failures honestly, and never claim success
 without verification evidence."#;
+const DEFAULT_HOOK_TIMEOUT_MS: u64 = 10_000;
 
 #[derive(Parser)]
 #[command(
@@ -282,18 +291,19 @@ async fn run_headless(
     workspace: &Path,
     prompt: &str,
 ) -> Result<()> {
+    let prompt = apply_pre_prompt_hooks(&config.hooks.pre_prompt, prompt).await?;
     let (agent, store, existing) = build_agent_and_session(cli, config, workspace, false)?;
     let usage_tracker = agent.usage_tracker();
     let outcome = if cli.format == OutputFormat::Text {
-        run_with_text_events(&agent, existing.as_ref(), prompt).await?
+        run_with_text_events(&agent, existing.as_ref(), &prompt).await?
     } else {
-        run_with_cancellation(&agent, existing.as_ref(), prompt, None).await?
+        run_with_cancellation(&agent, existing.as_ref(), &prompt, None).await?
     };
     let session_id = persist_outcome(
         store.as_ref(),
         existing,
         &outcome,
-        prompt,
+        &prompt,
         workspace,
         cli.no_save,
         usage_tracker.as_deref(),
@@ -384,7 +394,21 @@ fn build_agent_and_session(
     } else {
         Arc::new(StdioApprover)
     };
-    let tools = Arc::new(BuiltinTools::new(workspace, approver)?);
+    let builtin = Arc::new(BuiltinTools::new(workspace, approver)?);
+    let mut executors: Vec<Arc<dyn ToolExecutor>> = vec![builtin];
+    let mcp = McpTools::new(config.mcp_tools.clone());
+    if !mcp.is_empty() {
+        executors.push(Arc::new(mcp));
+    }
+    let duplicated = duplicate_tool_names(&executors);
+    if !duplicated.is_empty() {
+        bail!("duplicate tool name(s) detected across tool providers: {duplicated:?}");
+    }
+    let tools: Arc<dyn ToolExecutor> = Arc::new(HookedTools::new(
+        Arc::new(CombinedTools::new(executors)),
+        config.hooks.pre_tool_call.clone(),
+        config.hooks.post_tool_call.clone(),
+    ));
     let mut options = AgentOptions::new(model.clone());
     options.max_steps = cli.max_steps;
     let context = ContextManager::with_budget(
@@ -596,9 +620,17 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
     let (prompts_tx, mut prompts_rx) = mpsc::unbounded_channel::<String>();
     let workspace = workspace.to_path_buf();
     let no_save = cli.no_save;
+    let pre_prompt_hooks = config.hooks.pre_prompt.clone();
     let worker = tokio::spawn(async move {
         let mut session = existing;
         while let Some(prompt) = prompts_rx.recv().await {
+            let prompt = match apply_pre_prompt_hooks(&pre_prompt_hooks, &prompt).await {
+                Ok(prompt) => prompt,
+                Err(error) => {
+                    let _ = events_tx.send(AgentEvent::Failed(format!("{error:#}")));
+                    continue;
+                }
+            };
             let result = match &session {
                 Some(session) => {
                     agent
@@ -662,6 +694,77 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
     worker.abort();
     let _ = worker.await;
     ui_result
+}
+
+async fn apply_pre_prompt_hooks(commands: &[String], prompt: &str) -> Result<String> {
+    if commands.is_empty() {
+        return Ok(prompt.to_string());
+    }
+    let mut current = prompt.to_string();
+    for command in commands {
+        let payload = json!({
+            "event": "pre_prompt",
+            "prompt": current,
+        })
+        .to_string();
+        let output = run_shell_command(command, Some(&payload), DEFAULT_HOOK_TIMEOUT_MS).await?;
+        if let Some(next) = extract_prompt_from_hook_output(&output) {
+            current = next;
+        }
+    }
+    Ok(current)
+}
+
+fn extract_prompt_from_hook_output(output: &str) -> Option<String> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        if let Some(prompt) = value.get("prompt").and_then(Value::as_str) {
+            return Some(prompt.to_string());
+        }
+    }
+    Some(trimmed.to_string())
+}
+
+async fn run_shell_command(command: &str, input: Option<&str>, timeout_ms: u64) -> Result<String> {
+    let mut command_process = TokioCommand::new("sh");
+    command_process
+        .arg("-lc")
+        .arg(command)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .kill_on_drop(true);
+    let mut child = command_process.spawn().context("spawning command")?;
+    if let Some(input) = input {
+        let mut stdin = child.stdin.take().context("opening hook stdin")?;
+        stdin
+            .write_all(input.as_bytes())
+            .await
+            .context("writing hook input")?;
+    }
+    let output = tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait_with_output())
+        .await
+        .map_err(|_| anyhow::anyhow!("command timed out after {timeout_ms}ms"))?
+        .context("waiting for hook command")?;
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    if !output.stderr.is_empty() {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+    }
+    if output.status.success() {
+        Ok(text)
+    } else {
+        bail!("{}", text.trim());
+    }
 }
 
 fn run_config(action: ConfigAction) -> Result<()> {
@@ -912,4 +1015,15 @@ fn session_database_path() -> PathBuf {
         return PathBuf::from(home).join(".local/share/grey/sessions.db");
     }
     PathBuf::from(".grey-sessions.db")
+}
+
+fn duplicate_tool_names(tools: &[Arc<dyn ToolExecutor>]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut duplicates = Vec::new();
+    for definition in tools.iter().flat_map(|executor| executor.definitions()) {
+        if !seen.insert(definition.name.clone()) {
+            duplicates.push(definition.name);
+        }
+    }
+    duplicates
 }

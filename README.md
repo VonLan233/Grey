@@ -11,8 +11,9 @@ Grey 已完成 P0 技术验证，并具备 P1 的首个可用纵向闭环：同�
 会话可保存到 SQLite 后恢复。
 
 当前版本是 **v0.2/P2 MVP**，不是路线图中的 v1.0。P2 已完成多 Provider 路由、故障切换、
-上下文预算、请求缓存和 usage 持久化；多 Agent、MCP、完整 LSP 语义工具、WASM 插件、
-图片、桌面提醒与发布打包仍按 P3–P7 推进。
+上下文预算、请求缓存和 usage 持久化；MCP 与 Hook 也已接入（Prompt Hook、工具前后
+Hook、MCP Command Tool）。多 Agent、完整 LSP 语义工具、WASM 插件、图片、桌面提醒与发布
+打包仍按 P3–P7 推进。
 
 ## 已实现
 
@@ -31,6 +32,7 @@ Grey 已完成 P0 技术验证，并具备 P1 的首个可用纵向闭环：同�
 - system/history/tool/input 分区预算、工具输出 token 截断、滚动摘要和裁剪审计事件
 - SQLite 请求缓存（TTL/LRU/provider 隔离）与 `--no-cache` 控制
 - 每会话 token/cost usage 记录，跨 CLI 调用累积并由 `usage show/summary` 查询
+- MCP 命令工具与 Hook：`pre_prompt`、`pre_tool_call`、`post_tool_call`
 
 完整路线图见[阶段性开发文档](docs/阶段性开发文档.md)，架构背景见[项目计划书](docs/项目计划书.md)。
 
@@ -121,6 +123,14 @@ ttl_hours = 24
 track = true
 cost_per_1m_input = { "local/qwen2.5:7b" = 0.15 }
 cost_per_1m_output = { "local/qwen2.5:7b" = 0.60 }
+
+[hooks]
+pre_prompt = ["cat"]
+
+[[mcp_tools]]
+name = "ls"
+command = "ls"
+args = [".", "-la"]
 ```
 
 旧版配置仍兼容，但会输出迁移提示：
@@ -180,6 +190,9 @@ grey --read-only "找出 bug，但不要修改"
 所有文件工具只能访问 `--workspace` 指定的规范化目录，`..`、绝对路径和符号链接逃逸会被拒绝。
 `edit_file` 只修改现有文件，且 `old_string` 必须恰好匹配一次。
 
+Hook 约定：`pre_prompt` 在每次用户输入 Agent 前执行，可用于改写 prompt；`pre_tool_call` /
+`post_tool_call` 在每次工具调用前后执行，`pre_tool_call` 失败会阻断对应工具执行。
+
 ## 会话
 
 会话默认保存在 `~/.local/share/grey/sessions.db`，测试或便携环境可用
@@ -227,7 +240,7 @@ cargo build --workspace --release --locked
 ## 路线图（规划）
 
 1. P2：多 Provider 路由、故障切换、Token 预算/摘要/缓存
-2. P3：多 Agent 编排与 MCP
+2. P3：多 Agent 编排
 3. P4：完整 LSP 语义工具、文档与图片
 4. P5：可定制布局、主题与完成提醒
 5. P6：WASM 插件、Hook、Loop/Goal 和性能门禁

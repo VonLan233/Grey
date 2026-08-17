@@ -71,3 +71,25 @@ The design must keep `grey-core` independent from concrete provider vendors whil
   behavior through CLI cache stats.
 - P2 now has deterministic cross-session persistence for usage/cost visibility.
 
+## Addendum: MCP + Hook support (post-P2 extension)
+
+- MCP command tools are now supported through `[[mcp_tools]]` in configuration.
+  Each entry declares:
+  - `name`
+  - `command`
+  - `args`
+  - optional `description`, `input_schema`, and `timeout_ms`.
+- Hook hooks are supported via `hooks` in configuration:
+  - `hooks.pre_prompt`
+  - `hooks.pre_tool_call`
+  - `hooks.post_tool_call`
+- `pre_prompt` runs before each Agent invocation in CLI paths and can rewrite the
+  prompt payload.
+- `pre_tool_call` runs before each tool execution and can deny execution by
+  returning non-zero.
+- `post_tool_call` runs after tool completion; failures are surfaced on tool result
+  output.
+
+This remains an intentional extension on the same minimal surface: no new trait
+layer was added; hooks execute through shell command dispatch with bounded timeout
+and `grey-cli` owns the invocation point for prompt preprocessing.

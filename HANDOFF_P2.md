@@ -1,8 +1,8 @@
 # P2 交接文档
 
-> 日期：2026-08-17  
+> 日期：2026-08-18
 > 作者：Sisyphus (GLM 5.2)  
-> 状态：P2 主体功能闭环，验收清单同步完成
+> 状态：P2 主体 + MCP/Hook 补充完成
 
 ---
 
@@ -33,12 +33,13 @@ Grey 是一个轻量、高性能、可扩展的 Coding Agent Harness。当前处
 | 11 | Agent loop integration (router + cache + usage) | `crates/grey-core/src/agent.rs` | 7 | ✅ |
 | 12 | CLI integration (--task, providers, cache, usage subcommands) | `crates/grey-cli/src/main.rs` | 0 (集成测试在 Task 13) | ✅ |
 | 13 | Integration tests + release gate | `crates/grey-cli/tests/p2.rs` | 12 | ✅ |
+| 14 | MCP 工具与 hook 配置 | `crates/grey-core/src/config.rs`, `crates/grey-tools/src/lib.rs`, `crates/grey-cli/src/main.rs` | 新增若干 | ✅ |
 
 ### 测试总计
 
-- **单元测试**：144 个（约）通过（建议以本轮 `cargo test --workspace --all-features` 输出为准）
-- **集成测试**：12 个（`grey-cli --test p2` 全部通过）
-- **总测试数**：约 158 个
+- **单元测试**：已按 `cargo test --workspace --all-features` 结果为准
+- **集成测试**：`grey-cli --test p2`（12 个） + 新增 hook/MCP 覆盖测试（见执行记录）
+- **总测试数**：以实际工作区执行结果为准
 
 ### 验证命令
 
@@ -106,6 +107,7 @@ cargo run -q -p grey-cli -- --no-save "hello"
 
 - Router fallback 集成测试（主 Provider 失败后验证 fallback 接管）：已通过
 - Gemini URL/body 严格集成测试（`alt=sse`、`x-goog-api-key`、`functionResponse` 映射）：已通过
+- MCP 与 hook 支持补充：`hooks.pre_prompt`、`hooks.pre_tool_call`、`hooks.post_tool_call` 与 `[[mcp_tools]]` 已接入 `grey-cli` 执行链路，并已通过单元测试覆盖
 
 ### 5.2 已知技术债
 
