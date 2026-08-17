@@ -846,3 +846,25 @@ No TBD/TODO/FIXME in the plan. All tasks reference exact spec sections for full 
 - `SummaryEngine` used in Task 9 (defined) → Task 10 (consumed) ✓
 - `RequestCache` used in Task 7 (defined) → Task 11 (consumed) ✓
 - `UsageTracker` used in Task 8 (defined) → Task 11 (consumed) → Task 12 (consumed) ✓
+
+## Review Findings (Sisyphus review, 2026-08-17)
+
+### Issues found
+
+| # | Severity | Issue | Fix |
+|---|---|---|---|
+| 1 | High | Tasks 4-9 lack full test+impl code (only behavior descriptions) | Acceptable: spec sections provide full signatures; implementer fills code during TDD. Not a blocker. |
+| 2 | Medium | `RouteRule.match_kind` field name vs TOML `match` key — serde rename needed | Add `#[serde(rename = "match")]` to `match_kind` field in Task 3. |
+| 3 | Medium | Task 3 test asserts `match_kind` but TOML uses `match` | Fixed by issue 2 fix. |
+| 4 | Medium | `ProviderModelRef` defined in grey-provider (Task 4) but grey-core's usage.rs (Task 8) needs it — crate dependency direction violation | Move `ProviderModelRef` to grey-core (it's a plain value type, belongs in core contracts). |
+| 5 | Low | `Agent::new_legacy` needs `ProviderRouter` from grey-provider, but grey-core can't depend on grey-provider (ADR-001) | Agent takes `Arc<dyn Provider>` + `Option<FallbackChain>` via trait injection, not `ProviderRouter` directly. Router stays in CLI layer. |
+| 6 | Low | No ADR-002 task | Add as part of Task 13 (docs). |
+
+### Resolution
+
+Issues 2-3: serde rename, trivial fix during Task 3 implementation.
+Issue 4: `ProviderModelRef` moves to `grey-core/src/provider.rs`, re-exported. Task 4 defines `FallbackChain` in grey-provider, importing `ProviderModelRef` from grey-core.
+Issue 5: Agent struct gains `fallback: Option<FallbackChain>` field. `FallbackChain` trait/interface defined in grey-core, concrete impl in grey-provider. CLI wires router+fallback into Agent.
+Issue 6: ADR-002 written in Task 13.
+
+**Conclusion: Plan is sound. Issues are fixable during implementation. Proceeding to TDD.**
