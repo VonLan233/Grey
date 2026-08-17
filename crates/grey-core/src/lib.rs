@@ -9,6 +9,7 @@ pub mod config;
 pub mod context;
 pub mod provider;
 pub mod session;
+pub mod summary;
 pub mod token;
 pub mod tool;
 pub mod usage;
@@ -25,6 +26,7 @@ pub use provider::{
     Usage,
 };
 pub use session::{Session, SessionStore, SessionSummary};
+pub use summary::SummaryEngine;
 pub use token::{CharApproxCounter, TiktokenCounter, TokenCounter};
 pub use tool::{ToolDefinition, ToolExecutor, ToolResult, ToolRisk};
 pub use usage::{CostRate, SessionUsage, TurnUsage, UsageTracker};
