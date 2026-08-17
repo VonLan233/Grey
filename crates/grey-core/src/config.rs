@@ -972,15 +972,30 @@ description = "echo test tool"
             args: vec!["${GREY_TEST_MCP_ARG}".into()],
             ..Default::default()
         });
+        let previous_antic = env::var_os("GREY_ANTHROPIC_MAX_TOKENS");
+        let previous_test_cmd = env::var_os("GREY_TEST_MCP_CMD");
+        let previous_test_arg = env::var_os("GREY_TEST_MCP_ARG");
         unsafe {
+            env::remove_var("GREY_ANTHROPIC_MAX_TOKENS");
             env::set_var("GREY_TEST_MCP_CMD", "sh");
             env::set_var("GREY_TEST_MCP_ARG", "-lc");
         }
-        apply_env(&mut cfg).unwrap();
+        let result = apply_env(&mut cfg);
         unsafe {
-            env::remove_var("GREY_TEST_MCP_CMD");
-            env::remove_var("GREY_TEST_MCP_ARG");
+            match previous_antic {
+                Some(value) => env::set_var("GREY_ANTHROPIC_MAX_TOKENS", value),
+                None => env::remove_var("GREY_ANTHROPIC_MAX_TOKENS"),
+            }
+            match previous_test_cmd {
+                Some(value) => env::set_var("GREY_TEST_MCP_CMD", value),
+                None => env::remove_var("GREY_TEST_MCP_CMD"),
+            }
+            match previous_test_arg {
+                Some(value) => env::set_var("GREY_TEST_MCP_ARG", value),
+                None => env::remove_var("GREY_TEST_MCP_ARG"),
+            }
         }
+        assert!(result.is_ok(), "{}", result.unwrap_err());
         assert_eq!(cfg.mcp_tools[0].command, "sh");
         assert_eq!(cfg.mcp_tools[0].args, vec!["-lc".to_string()]);
     }

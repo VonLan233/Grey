@@ -273,3 +273,32 @@ fn saved_session_contains_usage_json() {
     let stdout = String::from_utf8_lossy(&usage.stdout);
     assert!(stdout.contains("Tokens:") && stdout.contains("Turns: 1"));
 }
+
+#[test]
+fn pre_prompt_hook_rewrites_prompt_before_agent_request() {
+    let env = temp_home();
+    let config_dir = env.home.path().join(".config/grey");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("grey.toml"),
+        r#"[hooks]
+pre_prompt = ["printf 'from hook pre prompt'"]
+"#,
+    )
+    .unwrap();
+    let output = env
+        .command()
+        .args(["--no-save", "--format", "json", "should be ignored"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(value["response"]
+        .as_str()
+        .unwrap()
+        .contains("from hook pre prompt"));
+}

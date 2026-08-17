@@ -1027,3 +1027,35 @@ fn duplicate_tool_names(tools: &[Arc<dyn ToolExecutor>]) -> Vec<String> {
     }
     duplicates
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn apply_pre_prompt_hooks_can_rewrite_from_plain_output() {
+        let commands = vec!["printf 'from plain hook'".into()];
+        let prompt = apply_pre_prompt_hooks(&commands, "original").await.unwrap();
+        assert_eq!(prompt, "from plain hook");
+    }
+
+    #[tokio::test]
+    async fn apply_pre_prompt_hooks_accepts_json_payload() {
+        let commands = vec!["printf '{\"prompt\":\"from json hook\"}'".into()];
+        let prompt = apply_pre_prompt_hooks(&commands, "original").await.unwrap();
+        assert_eq!(prompt, "from json hook");
+    }
+
+    #[tokio::test]
+    async fn extract_prompt_from_hook_output_handles_empty_as_none() {
+        assert_eq!(extract_prompt_from_hook_output(""), None);
+        assert_eq!(
+            extract_prompt_from_hook_output("{\"prompt\":\"x\"}"),
+            Some("x".to_string())
+        );
+        assert_eq!(
+            extract_prompt_from_hook_output("not-json"),
+            Some("not-json".to_string())
+        );
+    }
+}

@@ -219,3 +219,27 @@ async fn pre_tool_hook_blocks_and_post_tool_hook_runs_on_success() {
     assert!(!result.success, "{}", result.output);
     assert!(result.output.contains("denied"));
 }
+
+#[tokio::test]
+async fn post_tool_hook_error_marks_tool_failed_after_tool_success() {
+    let workspace = tempfile::tempdir().unwrap();
+    let file_path = workspace.path().join("code.rs");
+    std::fs::write(&file_path, "hello").unwrap();
+
+    let builtin = BuiltinTools::new(workspace.path(), Arc::new(AlwaysApprove)).unwrap();
+    let tools = HookedTools::new(
+        Arc::new(builtin),
+        vec![],
+        vec!["false".into(), "echo unreachable".into()],
+    );
+    let result = tools
+        .execute(&crate::call(
+            "read_file",
+            serde_json::json!({"path": "code.rs"}),
+        ))
+        .await;
+    assert!(!result.success, "{}", result.output);
+    assert!(result
+        .output
+        .contains("post_tool_call hook failed for tool read_file"));
+}
