@@ -4,6 +4,7 @@ pub mod anthropic;
 pub mod fallback;
 pub mod mock;
 pub mod openai;
+pub mod router;
 mod sse;
 
 #[cfg(test)]
