@@ -11,19 +11,10 @@ const FAILURE_THRESHOLD: u32 = 3;
 const INITIAL_COOLDOWN: Duration = Duration::from_secs(60);
 const MAX_COOLDOWN: Duration = Duration::from_secs(30 * 60);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct HealthState {
     consecutive_failures: u32,
     cooldown_until: Option<Instant>,
-}
-
-impl Default for HealthState {
-    fn default() -> Self {
-        Self {
-            consecutive_failures: 0,
-            cooldown_until: None,
-        }
-    }
 }
 
 pub struct FallbackChain {
@@ -98,7 +89,7 @@ impl FallbackChain {
         state.consecutive_failures += 1;
         if state.consecutive_failures >= FAILURE_THRESHOLD {
             let multiplier = 1u32
-                .checked_shl((state.consecutive_failures - FAILURE_THRESHOLD).min(10) as u32)
+                .checked_shl((state.consecutive_failures - FAILURE_THRESHOLD).min(10))
                 .unwrap_or(1 << 10);
             let cooldown = INITIAL_COOLDOWN
                 .checked_mul(multiplier)
@@ -174,8 +165,10 @@ mod tests {
 
     #[test]
     fn resolve_includes_provider_order_fallbacks() {
-        let mut config = FallbackConfig::default();
-        config.providers = vec!["a".into(), "b".into(), "c".into()];
+        let config = FallbackConfig {
+            providers: vec!["a".into(), "b".into(), "c".into()],
+            ..Default::default()
+        };
         let chain = FallbackChain::from_config(&config);
         let refs = chain.resolve(&pmr("a", "m1"));
         assert_eq!(refs.len(), 3);
@@ -186,11 +179,12 @@ mod tests {
 
     #[test]
     fn resolve_deduplicates() {
-        let mut config = FallbackConfig::default();
-        config.providers = vec!["a".into(), "b".into()];
-        config
-            .models
-            .insert("a/m1".to_string(), vec!["b/m1".to_string()]);
+        let mut models = std::collections::HashMap::new();
+        models.insert("a/m1".to_string(), vec!["b/m1".to_string()]);
+        let config = FallbackConfig {
+            providers: vec!["a".into(), "b".into()],
+            models,
+        };
         let chain = FallbackChain::from_config(&config);
         let refs = chain.resolve(&pmr("a", "m1"));
         assert_eq!(refs.len(), 2);

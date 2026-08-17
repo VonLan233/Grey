@@ -99,7 +99,7 @@ impl Agent {
         let mut total_usage = Usage::default();
 
         for step in 1..=self.options.max_steps {
-            let (prepared, audit) = self.context.prepare(&messages);
+            let (prepared, audit) = self.context.prepare(&messages).await;
             if audit.dropped_messages > 0 {
                 send_event(events, AgentEvent::ContextTrimmed(audit));
             }

@@ -166,15 +166,16 @@ mod tests {
     use grey_core::FallbackConfig;
 
     fn config_with_mock() -> GreyConfig {
-        let mut cfg = GreyConfig::default();
-        cfg.default_provider = "mock".into();
-        cfg.default_model = "test-model".into();
-        cfg.providers = vec![grey_core::ProviderEntry {
-            id: "mock".into(),
-            protocol: "mock".into(),
+        GreyConfig {
+            default_provider: "mock".into(),
+            default_model: "test-model".into(),
+            providers: vec![grey_core::ProviderEntry {
+                id: "mock".into(),
+                protocol: "mock".into(),
+                ..Default::default()
+            }],
             ..Default::default()
-        }];
-        cfg
+        }
     }
 
     #[test]
@@ -259,6 +260,6 @@ mod tests {
         };
         let router = ProviderRouter::from_config(&cfg).unwrap();
         let resolved = router.resolve(&TaskKind::Default).unwrap();
-        assert!(resolved.fallback_chain.len() >= 1);
+        assert!(!resolved.fallback_chain.is_empty());
     }
 }

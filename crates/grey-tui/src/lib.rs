@@ -800,6 +800,9 @@ mod tests {
             original_chars: 2000,
             retained_chars: 1000,
             dropped_messages: 3,
+            retained_tokens: 1000,
+            summary_created: false,
+            tool_outputs_truncated: 0,
         }));
         state.reduce_agent_event(AgentEvent::Completed {
             usage: grey_core::Usage {
