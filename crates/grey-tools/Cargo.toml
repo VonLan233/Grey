@@ -1,0 +1,21 @@
+[package]
+name = "grey-tools"
+description = "Workspace-scoped built-in tools for the Grey agent runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+globset.workspace = true
+grey-core = { path = "../grey-core" }
+ignore.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "grey-tui"
+description = "TUI layer: layout, rendering, streaming (Spike A)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+crossterm.workspace = true
+grey-core = { path = "../grey-core" }
+ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
+tokio.workspace = true
+unicode-width.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

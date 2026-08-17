@@ -1,0 +1,20 @@
+[package]
+name = "grey-provider"
+description = "Provider adapters: mock, OpenAI-compatible, and Anthropic backends"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-stream.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+grey-core = { path = "../grey-core" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
