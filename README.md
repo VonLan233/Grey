@@ -161,6 +161,8 @@ rust_analyzer = "rust-analyzer"
 grey --provider openai --model qwen2.5:7b "修复测试失败"
 grey --provider anthropic "解释这个 workspace"
 GREY_OPENAI_BASE_URL=http://localhost:11434/v1 grey --provider openai "你好"
+GREY_PROVIDER_OPENAI_API_KEY=sk-xxx GREY_PROVIDER_OPENAI_BASE_URL=https://api.openai.com/v1 grey --provider openai --model gpt-5.3-codex-spark "Hello"
+GREY_PROVIDER_OPENAI_API_KEY=sk-xxx GREY_PROVIDER_OPENAI_BASE_URL=https://api.openai.com/v1 grey --provider openai --model gpt-5.3-codex-spark --no-cache --no-save "请只回复 ok"
 grey --task coding --no-cache "修复测试失败"
 grey providers list
 grey providers show mock
@@ -170,8 +172,11 @@ grey usage summary
 ```
 
 每个 Provider 还可以使用 `GREY_PROVIDER_<ID>_<FIELD>` 覆盖，例如
-`GREY_PROVIDER_LOCAL_BASE_URL`、`GREY_PROVIDER_LOCAL_API_KEY`；旧的
-`GREY_OPENAI_*` / `GREY_ANTHROPIC_*` 变量继续有效。未知 Provider、重复 Provider ID
+`GREY_PROVIDER_LOCAL_BASE_URL`、`GREY_PROVIDER_LOCAL_API_KEY`。在动态 `[[providers]]` 配置下，
+`GREY_PROVIDER_OPENAI_API_KEY`/`GREY_PROVIDER_OPENAI_BASE_URL` 可用于覆盖 openai 配置；
+旧的 `GREY_OPENAI_*` / `GREY_ANTHROPIC_*` 变量也继续有效（用于 legacy 兼容）。
+进行 GPT 订阅实网验证时请使用 `sk-` 前缀的 OpenAI API key（非 ChatGPT 会话 token）。
+未知 Provider、重复 Provider ID
 和无效 fallback 引用会直接报错，不会静默降级为 Mock。
 
 ## 工具安全

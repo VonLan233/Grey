@@ -101,7 +101,10 @@ cargo run -q -p grey-cli -- --no-save "hello"
 
 ### 5.1 阻塞项
 
-当前无阻塞项。
+当前待完成项为对 GPT 订阅实网冒烟验证：
+
+- `grey-cli` 在 `gpt-5.3-codex-spark` 上的端到端调用，需要设置有效 `GREY_PROVIDER_OPENAI_API_KEY`（OpenAI API Key，
+  以 `sk-` 开头）后重试。
 
 严格验收补充项已完成：
 
@@ -114,7 +117,13 @@ cargo run -q -p grey-cli -- --no-save "hello"
 | # | 事项 | 说明 |
 |---|---|---|
 | 1 | Rust 工具链版本 | README 要求 1.97.1。当前环境下 `cargo` 可执行链路偶有回退到旧 rustc，需要在命令里显式使用 `~/.rustup/toolchains/1.97.1...`。建议加入本地统一脚本或文档提示。 |
-| 2 | 沙箱权限 | 部分 provider 流式测试（`anthropic/openai/gemini` 的监听 mock）在本沙箱报 `Operation not permitted`，属于执行环境权限限制。 |
+| 2 | 沙箱权限 | 部分 provider 测试（`anthropic/openai/gemini` 的监听 mock）在本沙箱报 `Operation not permitted`，属于执行环境权限限制。 |
+
+### 5.3 人工验收清单（需有效 API Key）
+
+- 命令：
+  `GREY_PROVIDER_OPENAI_API_KEY=sk-xxx GREY_PROVIDER_OPENAI_BASE_URL=https://api.openai.com/v1 cargo run -q -p grey-cli -- --provider openai --model gpt-5.3-codex-spark --no-save --no-cache --format json "只回复 ok"`
+- 预期：HTTP 200，返回 JSON 中包含 provider/model/cached 字段及正常文本响应。
 
 ---
 
