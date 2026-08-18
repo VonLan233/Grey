@@ -174,6 +174,17 @@ MCP/Hook 覆盖执行结果：
   `OpenAI provider returned 401 Unauthorized`（API key missing or invalid）。
   说明请求路径与模型映射已到位，阻塞点为密钥注入。
 
+### 2026-08-18 额外复核补充（DeepSeek smoke）
+
+- 直接复用 `./scripts/run-grey-smoke-p2.sh` 的 volcano 分支（`deepseek-v4-flash-ga-260731`）可走到火山方舟调用链路：
+  - 运行命令时若给定 `VOLCANO_API_KEY`，会生成临时 `[[providers]]`，包含：
+    - `id = "volcano"`
+    - `protocol = "openai"`
+    - `base_url = "https://ark.cn-beijing.volces.com/api/v3"`
+    - `model = "deepseek-v4-flash-ga-260731"`
+  - 当前会话下 `--provider volcano` 分支返回 `401 Unauthorized`，而非配置错误，说明路由与 endpoint 已生效、阻塞点在 key 本身。
+- 当前会话未检测到 `ARK_API_KEY`（终端里仅检测到 `YUNWU_API_KEY`），因此需要在同一 shell 会话内先 `export ARK_API_KEY=...` 再执行验证命令，或用 `VOLCANO_API_KEY=... ./scripts/run-grey-smoke-p2.sh` 复测。
+
 ---
 
 ## 六、关键数据结构速查
