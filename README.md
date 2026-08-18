@@ -182,6 +182,7 @@ grey usage summary
 每个 Provider 还可以使用 `GREY_PROVIDER_<ID>_<FIELD>` 覆盖，例如
 `GREY_PROVIDER_LOCAL_BASE_URL`、`GREY_PROVIDER_LOCAL_API_KEY`。在动态 `[[providers]]` 配置下，
 `GREY_PROVIDER_OPENAI_API_KEY`/`GREY_PROVIDER_OPENAI_BASE_URL` 可用于覆盖 openai 配置；
+若未显式设置，`run-grey-smoke-p2.sh` 也会回退到 `YUNWU_API_KEY`。
 `ARK_API_KEY` 也可直接用于 `volcano` provider；
 旧的 `GREY_OPENAI_*` / `GREY_ANTHROPIC_*` 变量也继续有效（用于 legacy 兼容）。
 进行 GPT 订阅实网验证时请使用 `sk-` 前缀的 OpenAI API key（非 ChatGPT 会话 token）。

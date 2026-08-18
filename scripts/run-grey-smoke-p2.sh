@@ -59,7 +59,7 @@ ok=true
 write_smoke_config
 
 if [[ -z "$OPENAI_API_KEY" && -z "$VOLCANO_API_KEY" ]]; then
-  echo "Skip smoke: no OpenAI (GREY_PROVIDER_OPENAI_API_KEY/OPENAI_API_KEY) nor ARK_API_KEY found."
+  echo "Skip smoke: no OpenAI (GREY_PROVIDER_OPENAI_API_KEY/OPENAI_API_KEY/YUNWU_API_KEY) nor ARK_API_KEY found."
   exit 1
 fi
 
@@ -68,7 +68,7 @@ if [[ -n "$OPENAI_API_KEY" ]]; then
     ok=false
   fi
 else
-  printf '\nSkip OpenAI smoke: no OpenAI API key set (GREY_PROVIDER_OPENAI_API_KEY or OPENAI_API_KEY).\n'
+  printf '\nSkip OpenAI smoke: no OpenAI API key set (GREY_PROVIDER_OPENAI_API_KEY, OPENAI_API_KEY, or YUNWU_API_KEY).\n'
 fi
 
 if [[ -n "$VOLCANO_API_KEY" ]]; then
