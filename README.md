@@ -97,6 +97,12 @@ models = [{ id = "qwen2.5:7b", name = "Qwen 2.5 7B" }]
 id = "offline"
 protocol = "mock"
 
+[[providers]]
+id = "volcano"
+protocol = "openai"
+base_url = "https://ark.cn-beijing.volces.com/api/v3"
+models = [{ id = "deepseek-v4-flash-ga-260731", name = "DeepSeek V4 Flash" }]
+
 [[routes]]
 match = "coding"
 provider = "local"
@@ -163,6 +169,7 @@ grey --provider anthropic "解释这个 workspace"
 GREY_OPENAI_BASE_URL=http://localhost:11434/v1 grey --provider openai "你好"
 GREY_PROVIDER_OPENAI_API_KEY=sk-xxx GREY_PROVIDER_OPENAI_BASE_URL=https://api.openai.com/v1 grey --provider openai --model gpt-5.3-codex-spark "Hello"
 GREY_PROVIDER_OPENAI_API_KEY=sk-xxx GREY_PROVIDER_OPENAI_BASE_URL=https://api.openai.com/v1 grey --provider openai --model gpt-5.3-codex-spark --no-cache --no-save "请只回复 ok"
+GREY_PROVIDER_VOLCANO_API_KEY=<VOLCANO_API_KEY> GREY_PROVIDER_VOLCANO_BASE_URL=https://ark.cn-beijing.volces.com/api/v3 grey --provider volcano --model deepseek-v4-flash-ga-260731 --no-cache --no-save "请只回复 ok"
 grey --task coding --no-cache "修复测试失败"
 grey providers list
 grey providers show mock

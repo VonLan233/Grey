@@ -42,7 +42,7 @@ struct Cli {
     #[arg(value_name = "PROMPT")]
     prompt: Option<String>,
 
-    /// Provider override: mock, openai, or anthropic.
+    /// Provider override: any configured provider id.
     #[arg(long, global = true)]
     provider: Option<String>,
 
