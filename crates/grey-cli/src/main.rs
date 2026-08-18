@@ -414,7 +414,12 @@ async fn run_orchestrate(cli: &Cli, task: String, raw_specs: Vec<String>) -> Res
 
     println!("task: {}", task);
     for result in &subagent_results {
-        let status = if result.success { "success" } else { "failure" };
+        let status = match result.status.as_str() {
+            "ok" => "success",
+            "warn" => "warning",
+            "fail" => "failure",
+            _ => "warning",
+        };
         println!(
             "\n[{name}] status={status} provider={provider} model={model} steps={steps} cached={cached}",
             name = result.name,
@@ -593,6 +598,7 @@ async fn run_orchestrate_subagent(
         }
     };
     let contract = parse_orchestrate_contract(&outcome.response);
+    let success = contract.status == "ok";
     OrchestrateAgentResult {
         name: agent.name,
         task: agent.task,
@@ -601,7 +607,7 @@ async fn run_orchestrate_subagent(
         model: outcome.model,
         steps: outcome.steps,
         cached: outcome.cached,
-        success: true,
+        success,
         status: contract.status,
         summary: contract.summary,
         recommendations: contract.recommendations,

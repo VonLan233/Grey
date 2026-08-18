@@ -367,6 +367,53 @@ fn orchestrate_custom_agent_spec_is_parsed() {
 }
 
 #[test]
+fn orchestrate_subagents_do_not_leak_other_agents_context() {
+    let env = temp_home();
+    let marker_a = "planner only";
+    let marker_b = "coder only";
+    let output = env
+        .command()
+        .args([
+            "orchestrate",
+            "统一任务：重构日志模块",
+            "--agent",
+            &format!("planner:{marker_a}"),
+            "--agent",
+            &format!("coder:{marker_b}"),
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let subagents = value["subagents"].as_array().unwrap();
+    assert_eq!(subagents.len(), 2);
+
+    let planner = subagents
+        .iter()
+        .find(|agent| agent["name"] == "planner")
+        .expect("planner missing");
+    let coder = subagents
+        .iter()
+        .find(|agent| agent["name"] == "coder")
+        .expect("coder missing");
+
+    let planner_resp = planner["response"].as_str().unwrap();
+    let coder_resp = coder["response"].as_str().unwrap();
+
+    assert!(planner_resp.contains(marker_a));
+    assert!(!planner_resp.contains(marker_b));
+
+    assert!(coder_resp.contains(marker_b));
+    assert!(!coder_resp.contains(marker_a));
+}
+
+#[test]
 fn orchestrate_rejects_invalid_agent_spec() {
     let env = temp_home();
     let output = env
