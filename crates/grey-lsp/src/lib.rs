@@ -14,12 +14,15 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use lsp_types::{
     notification::{DidOpenTextDocument, Exit, Initialized, Notification, PublishDiagnostics},
-    request::{DocumentDiagnosticRequest, GotoDefinition, Initialize, Request, Shutdown},
+    request::{
+        DocumentDiagnosticRequest, GotoDefinition, Initialize, References, Request, Shutdown,
+    },
     ClientCapabilities, ClientInfo, Diagnostic, DiagnosticClientCapabilities,
     DidOpenTextDocumentParams, DocumentDiagnosticParams, DocumentDiagnosticReport,
     DocumentDiagnosticReportResult, GotoDefinitionParams, GotoDefinitionResponse, InitializeParams,
-    InitializedParams, Position, PublishDiagnosticsParams, Range, TextDocumentClientCapabilities,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Uri, WorkspaceFolder,
+    InitializedParams, Position, PublishDiagnosticsParams, Range, ReferenceContext,
+    ReferenceParams, TextDocumentClientCapabilities, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, Uri, WorkspaceFolder,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -424,6 +427,27 @@ pub async fn collect_file_definitions(
     Ok(result.definitions)
 }
 
+pub async fn collect_file_references(
+    file: &Path,
+    lsp_path: Option<&Path>,
+    line: Option<u32>,
+    character: Option<u32>,
+    include_declaration: bool,
+) -> Result<Vec<DefinitionLocation>> {
+    if line.is_some() != character.is_some() {
+        bail!("line and character must both be provided");
+    }
+    let position = match (line, character) {
+        (Some(line), Some(character)) => Some(Position {
+            line: line.saturating_sub(1),
+            character: character.saturating_sub(1),
+        }),
+        _ => None,
+    };
+    let result = collect_file_reference_data(file, lsp_path, position, include_declaration).await?;
+    Ok(result)
+}
+
 struct LspCollectResult {
     diagnostics: Vec<Diagnostic>,
     definitions: Vec<DefinitionLocation>,
@@ -460,6 +484,56 @@ async fn collect_file_data(
         file_uri,
         text,
         definition_position,
+    )
+    .await;
+    let shutdown_result = client.shutdown().await;
+
+    match (session_result, shutdown_result) {
+        (Ok(result), Ok(())) => {
+            println!("[spike-b] done");
+            Ok(result)
+        }
+        (Err(session_error), Ok(())) => Err(session_error),
+        (Ok(_), Err(shutdown_error)) => Err(shutdown_error),
+        (Err(session_error), Err(shutdown_error)) => bail!(
+            "{session_error:#}; additionally failed to shut down LSP server: {shutdown_error:#}"
+        ),
+    }
+}
+
+async fn collect_file_reference_data(
+    file: &Path,
+    lsp_path: Option<&Path>,
+    definition_position: Option<Position>,
+    include_declaration: bool,
+) -> Result<Vec<DefinitionLocation>> {
+    let lsp = lsp_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("rust-analyzer"));
+    let file_abs = std::fs::canonicalize(file)
+        .with_context(|| format!("canonicalizing {}", file.display()))?;
+    let workspace_root = discover_workspace_root(&file_abs)?;
+    let root = path_to_uri(&workspace_root)?;
+    let file_uri = path_to_uri(&file_abs)?;
+    let text = std::fs::read_to_string(&file_abs)
+        .with_context(|| format!("reading {}", file_abs.display()))?;
+    let definition_position = definition_position.or_else(|| definition_probe_position(&text));
+    println!(
+        "[spike-b] lsp={} file={} workspace={}",
+        lsp.display(),
+        file_abs.display(),
+        workspace_root.display()
+    );
+
+    let mut client = LspClient::spawn(&lsp).await?;
+    let session_result = run_lsp_reference_session(
+        &mut client,
+        root,
+        &workspace_root,
+        file_uri,
+        text,
+        definition_position,
+        include_declaration,
     )
     .await;
     let shutdown_result = client.shutdown().await;
@@ -555,6 +629,74 @@ async fn run_lsp_session(
     })
 }
 
+#[allow(deprecated)] // root_uri + workspace_folders both sent for maximal server compat
+async fn run_lsp_reference_session(
+    client: &mut LspClient,
+    root: Uri,
+    workspace_root: &Path,
+    file_uri: Uri,
+    text: String,
+    definition_position: Option<Position>,
+    include_declaration: bool,
+) -> Result<Vec<DefinitionLocation>> {
+    let init = request_with_timeout::<Initialize>(
+        client,
+        InitializeParams {
+            process_id: Some(std::process::id()),
+            root_uri: Some(root.clone()),
+            workspace_folders: Some(vec![WorkspaceFolder {
+                uri: root,
+                name: workspace_root
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| workspace_root.display().to_string()),
+            }]),
+            capabilities: ClientCapabilities {
+                text_document: Some(TextDocumentClientCapabilities {
+                    diagnostic: Some(DiagnosticClientCapabilities {
+                        dynamic_registration: None,
+                        related_document_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            client_info: Some(ClientInfo {
+                name: "grey-spike".into(),
+                version: None,
+            }),
+            ..Default::default()
+        },
+        REQUEST_TIMEOUT,
+    )
+    .await?;
+    println!(
+        "[spike-b] initialized: server={:?}",
+        init.server_info
+            .map(|i| format!("{} {}", i.name, i.version.unwrap_or_default()))
+    );
+
+    client.notify::<Initialized>(InitializedParams {}).await?;
+    client
+        .notify::<DidOpenTextDocument>(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: file_uri.clone(),
+                language_id: "rust".into(),
+                version: 1,
+                text,
+            },
+        })
+        .await?;
+
+    let _ = tokio::time::timeout(
+        Duration::from_secs(15),
+        wait_for_diagnostics(client, &file_uri),
+    )
+    .await;
+
+    probe_references(client, &file_uri, definition_position, include_declaration).await
+}
+
 async fn wait_for_diagnostics(client: &mut LspClient, uri: &Uri) -> Result<Vec<Diagnostic>> {
     loop {
         let msg = client.read_raw().await?;
@@ -644,6 +786,43 @@ async fn probe_definition(
         Ok(Ok(None)) => Ok(Vec::new()),
         Ok(Err(error)) => Err(anyhow!("definition unavailable: {error}")),
         Err(_) => Err(anyhow!("definition unavailable: request timed out")),
+    }
+}
+
+async fn probe_references(
+    client: &mut LspClient,
+    uri: &Uri,
+    position: Option<Position>,
+    include_declaration: bool,
+) -> Result<Vec<DefinitionLocation>> {
+    let Some(position) = position else {
+        return Ok(Vec::new());
+    };
+    let params = ReferenceParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            position,
+        },
+        work_done_progress_params: Default::default(),
+        partial_result_params: Default::default(),
+        context: ReferenceContext {
+            include_declaration,
+        },
+    };
+
+    match tokio::time::timeout(
+        Duration::from_secs(10),
+        client.request::<References>(params),
+    )
+    .await
+    {
+        Ok(Ok(Some(locations))) => Ok(locations
+            .into_iter()
+            .map(DefinitionLocation::from_location)
+            .collect()),
+        Ok(Ok(None)) => Ok(Vec::new()),
+        Ok(Err(error)) => Err(anyhow!("references unavailable: {error}")),
+        Err(_) => Err(anyhow!("references unavailable: request timed out")),
     }
 }
 

@@ -55,6 +55,7 @@ impl LspTools {
         match call.name.as_str() {
             "lsp_diagnostics" => self.lsp_diagnostics(call).await,
             "lsp_definition" => self.lsp_definition(call).await,
+            "lsp_references" => self.lsp_references(call).await,
             _ => bail!("unknown tool {:?}", call.name),
         }
     }
@@ -128,6 +129,42 @@ impl LspTools {
         Ok(ToolResult::success(call, output))
     }
 
+    async fn lsp_references(&self, call: &ToolCall) -> Result<ToolResult> {
+        let args: LspReferencesArgs = parse_args(call)?;
+        let path = self.resolve_existing(&args.path)?;
+        let file_path = path.to_string_lossy().into_owned();
+        let references = grey_lsp::collect_file_references(
+            &path,
+            Some(Path::new(&self.lsp_binary)),
+            args.line,
+            args.character,
+            args.include_declaration.unwrap_or(true),
+        )
+        .await
+        .with_context(|| format!("running LSP references for {file_path}"))?;
+        let mut output = String::new();
+        output.push_str(&format!(
+            "lsp references for {} ({}):\n",
+            file_path,
+            references.len()
+        ));
+        let max_items = args.max_items.unwrap_or(50);
+        for reference in references.into_iter().take(max_items) {
+            output.push_str(&format!(
+                "{}:{}:{} -> {}:{}\n",
+                reference.uri,
+                reference.start_line,
+                reference.start_character,
+                reference.end_line,
+                reference.end_character
+            ));
+        }
+        if output.ends_with('\n') {
+            output.pop();
+        }
+        Ok(ToolResult::success(call, output))
+    }
+
     fn resolve_existing(&self, relative: &str) -> Result<PathBuf> {
         ensure_relative_path(relative)?;
         let candidate = self.workspace.join(relative);
@@ -171,6 +208,25 @@ impl ToolExecutor for LspTools {
                         "path": {"type": "string"},
                         "line": {"type": "integer", "minimum": 1},
                         "character": {"type": "integer", "minimum": 1},
+                        "max_items": {"type": "integer", "minimum": 1, "maximum": 500}
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }),
+                risk: ToolRisk::ReadOnly,
+            },
+            ToolDefinition {
+                name: "lsp_references".into(),
+                description:
+                    "Run LSP reference lookup for a workspace file and return project-wide usages."
+                        .into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "line": {"type": "integer", "minimum": 1},
+                        "character": {"type": "integer", "minimum": 1},
+                        "include_declaration": {"type": "boolean"},
                         "max_items": {"type": "integer", "minimum": 1, "maximum": 500}
                     },
                     "required": ["path"],
@@ -938,5 +994,15 @@ struct LspDefinitionArgs {
     path: String,
     line: Option<u32>,
     character: Option<u32>,
+    max_items: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LspReferencesArgs {
+    path: String,
+    line: Option<u32>,
+    character: Option<u32>,
+    include_declaration: Option<bool>,
     max_items: Option<usize>,
 }

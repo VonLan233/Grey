@@ -8,6 +8,7 @@
 - 在 `grey-tools` 增加 `lsp_diagnostics` 工具，基于 `grey-lsp` 的 `collect_file_diagnostics`。
 - 在 `grey-lsp` 增加 `collect_file_definitions`。
 - 在 `grey-tools` 增加 `lsp_definition` 工具，支持按位置信息返回定义定位。
+- 在 `grey-lsp` 增加 `collect_file_references`，并在 `grey-tools` 增加 `lsp_references` 工具用于返回项目内符号引用位置。
 - 工具定义与执行已接入 `grey-cli` 的统一工具链（`build_agent_and_session`）：
   - 在 `--read_only`/主会话下可直接被 agent 调用；
   - 使用 `config.lsp.rust_analyzer` 作为后端命令；
@@ -18,7 +19,7 @@
 
 ## 二、待完成项（P4 下一步）
 
-- 定义/引用/符号/悬停/重命名 的工具化与语义注入。
+- 符号/悬停/重命名 的工具化与语义注入。
 - 诊断到会话的实时注入策略（`Agent` 上下文中的结构化语义视图）。
 - LSP 工具输出的缓存/去噪与 token 预算融合。
 

@@ -297,3 +297,30 @@ async fn lsp_definition_fails_with_invalid_server_path() {
     assert!(!result.success);
     assert!(result.output.contains("running LSP definition"));
 }
+
+#[tokio::test]
+async fn lsp_references_is_defined_and_readonly() {
+    let workspace = tempfile::tempdir().unwrap();
+    let lsp = LspTools::new(workspace.path(), "rust-analyzer".into()).unwrap();
+    let names: Vec<_> = lsp
+        .definitions()
+        .into_iter()
+        .map(|definition| definition.name)
+        .collect();
+    assert!(names.contains(&"lsp_references".to_string()));
+}
+
+#[tokio::test]
+async fn lsp_references_fails_with_invalid_server_path() {
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("main.rs"), "fn main() {}\n").unwrap();
+    let lsp = LspTools::new(workspace.path(), "non-existent-lsp-server".into()).unwrap();
+    let result = lsp
+        .execute(&crate::call(
+            "lsp_references",
+            serde_json::json!({"path":"main.rs"}),
+        ))
+        .await;
+    assert!(!result.success);
+    assert!(result.output.contains("running LSP references"));
+}
