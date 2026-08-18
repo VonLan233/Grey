@@ -164,9 +164,9 @@ MCP/Hook 覆盖执行结果：
 
 人工 smoke 运行：
 
-- 使用 `/tmp/run-grey-smoke-openai.sh` 且 `GREY_PROVIDER_OPENAI_API_KEY=$YUNWU_API_KEY` 执行（invalid key）失败，返回：
-  `OpenAI provider returned 401 Unauthorized`（提示 key 无效）。  
-  说明实网调用链路与 `gpt-5.3-codex-spark` 目标路径可达，当前阻塞点为有效 `sk-` key 缺失。
+- 使用 `/tmp/run-grey-smoke-openai.sh` 且 `GREY_PROVIDER_OPENAI_API_KEY=$YUNWU_API_KEY` 执行时，返回 TLS 连接失败：
+  `client error (Connect): tls handshake eof`。  
+  说明实网路径当前受环境网络/TLS 拦截，未能进入鉴权阶段，无法在本会话直接完成 GPT 订阅实测。
 
 火山方舟 DeepSeek smoke 补充（`deepseek-v4-flash-ga-260731`）：
 
@@ -175,7 +175,7 @@ MCP/Hook 覆盖执行结果：
   - `GREY_PROVIDER_VOLCANO_BASE_URL=https://ark.cn-beijing.volces.com/api/v3`
 - 执行命令：
   `cargo run -q -p grey-cli -- --provider volcano --model deepseek-v4-flash-ga-260731 --no-save --no-cache --format json "请只回复 ok"`
-- 当前会话未注入 `ARK_API_KEY`，返回：
+- 当前会话未确认有效 `ARK_API_KEY` 且未注入可用值时，返回：
   `OpenAI provider returned 401 Unauthorized`（API key missing or invalid）。
   说明请求路径与模型映射已到位，阻塞点为密钥注入。
 
