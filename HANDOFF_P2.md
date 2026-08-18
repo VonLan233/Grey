@@ -132,8 +132,8 @@ cargo run -q -p grey-cli -- --provider openai --model gpt-5.3-codex-spark --no-s
 ### 5.3 人工验收清单（需有效 API Key）
 
 - 命令：
-  `GREY_PROVIDER_OPENAI_API_KEY=sk-xxx GREY_PROVIDER_OPENAI_BASE_URL=https://api.openai.com/v1 cargo run -q -p grey-cli -- --provider openai --model gpt-5.3-codex-spark --no-save --no-cache --format json "只回复 ok"`
-- 预期：HTTP 200，返回 JSON 中包含 provider/model/cached 字段及正常文本响应。
+  `./scripts/run-grey-smoke-p2.sh`
+- 预期：HTTP 200，返回 JSON 中包含 provider/model/cached 字段及正常文本响应；脚本可在仅有 OpenAI 或仅有 ARK_API_KEY 的情况下分别运行对应分支。
 
 ### 2026-08-18 复验补充
 
@@ -164,18 +164,13 @@ MCP/Hook 覆盖执行结果：
 
 人工 smoke 运行：
 
-- 使用 `/tmp/run-grey-smoke-openai.sh` 且 `GREY_PROVIDER_OPENAI_API_KEY=$YUNWU_API_KEY` 执行时，返回 TLS 连接失败：
+- 使用 `./scripts/run-grey-smoke-p2.sh` 且设置 `GREY_PROVIDER_OPENAI_API_KEY=$YUNWU_API_KEY` 执行时，返回 TLS 连接失败：
   `client error (Connect): tls handshake eof`。  
   说明实网路径当前受环境网络/TLS 拦截，未能进入鉴权阶段，无法在本会话直接完成 GPT 订阅实测。
 
 火山方舟 DeepSeek smoke 补充（`deepseek-v4-flash-ga-260731`）：
 
-- 使用 `/tmp/grey-volcano.toml` 显式配置 `volcano` provider，并传入：
-  - `ARK_API_KEY=$ARK_API_KEY`
-  - `GREY_PROVIDER_VOLCANO_BASE_URL=https://ark.cn-beijing.volces.com/api/v3`
-- 执行命令：
-  `cargo run -q -p grey-cli -- --provider volcano --model deepseek-v4-flash-ga-260731 --no-save --no-cache --format json "请只回复 ok"`
-- 当前会话未确认有效 `ARK_API_KEY` 且未注入可用值时，返回：
+- 使用 `./scripts/run-grey-smoke-p2.sh` 且传入 `ARK_API_KEY=$ARK_API_KEY`（或 `VOLCANO_API_KEY`）执行时，返回：
   `OpenAI provider returned 401 Unauthorized`（API key missing or invalid）。
   说明请求路径与模型映射已到位，阻塞点为密钥注入。
 
