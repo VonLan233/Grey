@@ -102,10 +102,9 @@ cargo run -q -p grey-cli -- --no-save "hello"
 
 ### 5.1 阻塞项
 
-自动化验收已完成，当前仅剩实网冒烟为手工步骤（需有效 OpenAI API Key，Volcano 保留为可选补充）：
+自动化验收已完成，当前仅剩实网冒烟为手工步骤（默认以 OpenAI 的 `gpt-5.3-codex-spark` 为主；`volcano` 复核保留）：
 
-`grey-cli` 在 `gpt-5.3-codex-spark` 上的端到端调用需要设置有效 `GREY_PROVIDER_OPENAI_API_KEY`（OpenAI API Key，以 `sk-` 开头）后执行。  
-如需同时复核 Volcano 方舟，可先设置 `ARK_API_KEY`（或 `VOLCANO_API_KEY`）。
+`grey-cli` 在 `gpt-5.3-codex-spark`（`openai` provider）上的端到端调用需要设置有效 `GREY_PROVIDER_OPENAI_API_KEY`（OpenAI API Key，以 `sk-` 开头）后执行。  
 
 建议命令（OpenAI key 放 `GREY_PROVIDER_OPENAI_API_KEY`）：
 
@@ -146,11 +145,11 @@ cargo run -q -p grey-cli -- --provider volcano --model deepseek-v4-flash-ga-2607
 ### 2026-08-18 复验补充
 
 
-### 2026-08-18 订阅实测补充（显式配置复核）
+### 2026-08-18 订阅实测补充（OpenAI 复核）
 
-- 用 `GREY_CONFIG=/tmp/grey-openai-smoke.toml`（显式配置 `openai`）并传入 `GREY_PROVIDER_OPENAI_API_KEY=$YUNWU_API_KEY` 复测：
+- 用 `GREY_PROVIDER_OPENAI_API_KEY=$YUNWU_API_KEY` 复测（`gpt-5.3-codex-spark`）：
   `OpenAI provider returned 401 Unauthorized`（`invalid_api_key`）。
-- 结论：当前阻塞点仅为 `sk-...` Key 非法，与项目代码实现/配置无关。
+- 结论：当前阻塞点为 OpenAI key 非法，与项目代码实现/配置无关。
 
 
 执行 `PATH=~/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin:$PATH` 下的全量门禁：
@@ -172,9 +171,8 @@ MCP/Hook 覆盖执行结果：
 
 人工 smoke 运行：
 
-- 使用 `./scripts/run-grey-smoke-p2.sh` 且设置 `GREY_PROVIDER_OPENAI_API_KEY=$YUNWU_API_KEY` 执行时，返回 TLS 连接失败：
-  `client error (Connect): tls handshake eof`。  
-  说明实网路径当前受环境网络/TLS 拦截，未能进入鉴权阶段，无法在本会话直接完成 GPT 订阅实测。
+- 使用 `./scripts/run-grey-smoke-p2.sh` 且设置 `GREY_PROVIDER_OPENAI_API_KEY=$YUNWU_API_KEY` 执行时，返回：
+  `OpenAI provider returned 401 Unauthorized`（`invalid_api_key`）。
 
 火山方舟 DeepSeek smoke 补充（`deepseek-v4-flash-ga-260731`）：
 
