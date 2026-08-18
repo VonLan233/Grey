@@ -176,6 +176,7 @@ grey providers show mock
 grey cache stats
 grey usage show <SESSION_ID>
 grey usage summary
+./scripts/run-grey-smoke-p2.sh   # 运行 OpenAI/Volcano 实网 smoke（需有效 key，默认模型为 gpt-5.3-codex-spark）
 ```
 
 每个 Provider 还可以使用 `GREY_PROVIDER_<ID>_<FIELD>` 覆盖，例如
