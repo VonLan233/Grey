@@ -267,6 +267,8 @@ struct OrchestrateAgentResult {
     model: String,
     steps: usize,
     cached: bool,
+    success: bool,
+    error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -294,8 +296,8 @@ const DEFAULT_ORCHESTRATE_AGENTS: &[(&str, &str)] = &[
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    if let Some(command) = cli.command {
-        return run_command(command).await;
+    if let Some(command) = cli.command.clone() {
+        return run_command(&cli, command).await;
     }
     let config = config::load()?;
     let workspace = resolve_workspace(cli.workspace.as_deref())?;
@@ -308,7 +310,7 @@ async fn main() -> Result<()> {
     run_tui(&cli, &config, &workspace).await
 }
 
-async fn run_command(command: Command) -> Result<()> {
+async fn run_command(cli: &Cli, command: Command) -> Result<()> {
     match command {
         Command::SpikeA => grey_tui::run_stream_demo().await,
         Command::SpikeB { file, lsp } => {
@@ -330,12 +332,13 @@ async fn run_command(command: Command) -> Result<()> {
         Command::Providers { action } => run_providers(action),
         Command::Cache { action } => run_cache(action),
         Command::Usage { action } => run_usage(action),
-        Command::Orchestrate { prompt, agent } => run_orchestrate(prompt, agent).await,
+        Command::Orchestrate { prompt, agent } => run_orchestrate(cli, prompt, agent).await,
     }
 }
 
-async fn run_orchestrate(task: String, raw_specs: Vec<String>) -> Result<()> {
-    let cli = Cli::parse();
+const ORCHESTRATE_AGENT_TIMEOUT_SECS: u64 = 120;
+
+async fn run_orchestrate(cli: &Cli, task: String, raw_specs: Vec<String>) -> Result<()> {
     let config = config::load()?;
     let workspace = resolve_workspace(cli.workspace.as_deref())?;
     let config = Arc::new(config);
@@ -352,10 +355,7 @@ async fn run_orchestrate(task: String, raw_specs: Vec<String>) -> Result<()> {
         ));
     }
 
-    let subagent_results = join_all(futures)
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>>>()?;
+    let subagent_results = join_all(futures).await;
 
     let mut coordinator_cli = cli.clone();
     coordinator_cli.no_save = true;
@@ -454,17 +454,79 @@ async fn run_orchestrate_subagent(
     workspace: PathBuf,
     agent: OrchestrateAgent,
     task: String,
-) -> Result<OrchestrateAgentResult> {
+) -> OrchestrateAgentResult {
     cli.no_save = true;
     cli.read_only = true;
     cli.auto_approve = false;
-    let (agent_client, _, existing) = build_agent_and_session(&cli, &config, &workspace, false)?;
+    let model_hint = {
+        let resolved_provider = cli
+            .provider
+            .as_deref()
+            .unwrap_or(&config.default_provider)
+            .to_string();
+        cli.model
+            .clone()
+            .unwrap_or_else(|| default_model_for_provider(&config, &resolved_provider))
+    };
+    let (agent_client, _store, existing) =
+        match build_agent_and_session(&cli, &config, &workspace, false) {
+            Ok((agent_client, _store, existing)) => (agent_client, _store, existing),
+            Err(error) => {
+                return OrchestrateAgentResult {
+                    name: agent.name,
+                    task: agent.task,
+                    response: "sub-agent initialization failed".to_string(),
+                    provider: cli
+                        .provider
+                        .clone()
+                        .unwrap_or_else(|| "unresolved".to_string()),
+                    model: model_hint,
+                    steps: 0,
+                    cached: false,
+                    success: false,
+                    error: Some(error.to_string()),
+                };
+            }
+        };
+    let agent_provider = agent_client.provider_id().to_string();
     let _ = existing;
     let prompt = format!("主任务: {task}\n子任务: {}\n请直接输出结论。", agent.task);
-    let outcome = agent_client
-        .run_new(agent.system_prompt, prompt, None)
-        .await?;
-    Ok(OrchestrateAgentResult {
+    let run = agent_client.run_new(agent.system_prompt, prompt, None);
+    let outcome = match tokio::time::timeout(
+        Duration::from_secs(ORCHESTRATE_AGENT_TIMEOUT_SECS),
+        run,
+    )
+    .await
+    {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(error)) => {
+            return OrchestrateAgentResult {
+                name: agent.name,
+                task: agent.task,
+                response: "sub-agent execution failed".to_string(),
+                provider: agent_provider,
+                model: model_hint,
+                steps: 0,
+                cached: false,
+                success: false,
+                error: Some(error.to_string()),
+            };
+        }
+        Err(_) => {
+            return OrchestrateAgentResult {
+                name: agent.name,
+                task: agent.task,
+                response: "sub-agent execution timed out".to_string(),
+                provider: agent_provider,
+                model: model_hint,
+                steps: 0,
+                cached: false,
+                success: false,
+                error: Some("sub-agent execution timed out".to_string()),
+            };
+        }
+    };
+    OrchestrateAgentResult {
         name: agent.name,
         task: agent.task,
         response: outcome.response,
@@ -472,7 +534,9 @@ async fn run_orchestrate_subagent(
         model: outcome.model,
         steps: outcome.steps,
         cached: outcome.cached,
-    })
+        success: true,
+        error: None,
+    }
 }
 
 async fn run_headless(

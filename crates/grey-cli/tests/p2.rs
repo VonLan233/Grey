@@ -358,3 +358,27 @@ fn orchestrate_custom_agent_spec_is_parsed() {
         .unwrap()
         .contains("（mock"));
 }
+
+#[test]
+fn orchestrate_rejects_invalid_agent_spec() {
+    let env = temp_home();
+    let output = env
+        .command()
+        .args([
+            "orchestrate",
+            "help",
+            "--agent",
+            "invalid_spec_without_colon",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "unexpected success: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("invalid --agent spec"));
+}
