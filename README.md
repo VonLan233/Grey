@@ -164,6 +164,8 @@ rust_analyzer = "rust-analyzer"
 常用覆盖：
 
 ```bash
+GREY_PROVIDER_OPENAI_API_KEY=sk-xxx GREY_PROVIDER_OPENAI_BASE_URL=https://api.openai.com/v1 grey --provider openai --model gpt-5.3-codex-spark "Hello"
+GREY_PROVIDER_OPENAI_API_KEY=sk-xxx GREY_PROVIDER_OPENAI_BASE_URL=https://api.openai.com/v1 grey --provider openai --model gpt-5.3-codex-spark --no-cache --no-save "请只回复 ok"
 grey --provider openai --model qwen2.5:7b "修复测试失败"
 grey --provider anthropic "解释这个 workspace"
 GREY_OPENAI_BASE_URL=http://localhost:11434/v1 grey --provider openai "你好"
@@ -176,7 +178,7 @@ grey providers show mock
 grey cache stats
 grey usage show <SESSION_ID>
 grey usage summary
-./scripts/run-grey-smoke-p2.sh   # 运行 OpenAI/Volcano 实网 smoke（需有效 key，默认 Volcano 模型为 deepseek-v4-flash-ga-260731）
+./scripts/run-grey-smoke-p2.sh   # 运行 OpenAI/Volcano 实网 smoke（默认优先 OpenAI 模型 gpt-5.3-codex-spark，Volcano 为可选）
 ```
 
 每个 Provider 还可以使用 `GREY_PROVIDER_<ID>_<FIELD>` 覆盖，例如

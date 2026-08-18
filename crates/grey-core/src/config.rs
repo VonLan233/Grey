@@ -625,7 +625,8 @@ fn apply_env(cfg: &mut GreyConfig) -> Result<()> {
         );
         cfg.anthropic.max_tokens = max_tokens;
     }
-    let fallback_ark_api_key = env::var_os("ARK_API_KEY").or_else(|| env::var_os("VOLCANO_API_KEY"));
+    let fallback_ark_api_key =
+        env::var_os("ARK_API_KEY").or_else(|| env::var_os("VOLCANO_API_KEY"));
     for provider in cfg.providers.iter_mut() {
         let prefix = format!(
             "GREY_PROVIDER_{}_",

@@ -59,7 +59,7 @@ ok=true
 write_smoke_config
 
 if [[ -z "$OPENAI_API_KEY" && -z "$VOLCANO_API_KEY" ]]; then
-  echo "Skip smoke: no OpenAI (GREY_PROVIDER_OPENAI_API_KEY/OPENAI_API_KEY/YUNWU_API_KEY) nor ARK_API_KEY found."
+  echo "Skip smoke: no OpenAI (GREY_PROVIDER_OPENAI_API_KEY/OPENAI_API_KEY/YUNWU_API_KEY) nor VOLCANO/ARK API key found."
   exit 1
 fi
 
