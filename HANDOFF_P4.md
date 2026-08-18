@@ -19,12 +19,13 @@
   - `grey-tools` 增加 `lsp_diagnostics` 定义与失败返回测试。
   - `grey-tools` 增加 `lsp_definition` 定义与失败返回测试。
   - `grey-tools` 增加 `lsp_symbols` 定义与失败返回测试。
+- `lsp_diagnostics`、`lsp_definition`、`lsp_references`、`lsp_hover`、`lsp_rename`、`lsp_symbols` 输出改为结构化 compact JSON（含 `tool`、`path`、`count`、`shown`、`truncated`、`compact`）并统一 max_items 上限。
 
 ## 二、待完成项（P4 下一步）
 
-- 符号工具的语义注入与 LSP 输出治理（`lsp_symbols` 已完成定义接入，待上下文注入策略联动）。
+- 代码路径级语义视图的上下文联动（当前只完成了 `lsp_*` 输出结构化治理，未完成 Agent 侧会话注入策略）。
 - 诊断到会话的实时注入策略（`Agent` 上下文中的结构化语义视图）。
-- LSP 工具输出的缓存/去噪与 token 预算融合。
+- LSP 工具输出的缓存/去噪与 token 预算融合（重复调用、噪声聚合与预算分配优化）。
 
 ## 三、当前证据
 

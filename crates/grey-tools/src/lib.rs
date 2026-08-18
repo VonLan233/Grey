@@ -1,5 +1,6 @@
 //! Workspace-scoped built-in tools with explicit approval for side effects.
 
+use std::collections::HashSet;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
@@ -12,8 +13,7 @@ use globset::{Glob, GlobMatcher};
 use grey_core::{McpToolConfig, ToolCall, ToolDefinition, ToolExecutor, ToolResult, ToolRisk};
 use ignore::WalkBuilder;
 use regex::Regex;
-use serde::de::DeserializeOwned;
-use serde::Deserialize;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::json;
 use serde_json::Value;
 use tempfile::NamedTempFile;
@@ -21,6 +21,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 pub const BUILTIN_TOOL_NAMES: [&str; 5] = ["read_file", "edit_file", "bash", "glob", "grep"];
+const LSP_TOOL_DEFAULT_MAX_ITEMS: usize = 50;
+const LSP_TOOL_MAX_ITEMS: usize = 500;
 const DEFAULT_HOOK_TIMEOUT: u64 = 10_000;
 const DEFAULT_TOOL_TIMEOUT: u64 = 5_000;
 
@@ -32,6 +34,63 @@ pub struct McpTool {
     pub args: Vec<String>,
     pub input_schema: Option<Value>,
     pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct LspToolOutput<T: Serialize> {
+    tool: &'static str,
+    path: String,
+    count: usize,
+    shown: usize,
+    truncated: bool,
+    compact: Vec<T>,
+}
+
+#[derive(Debug, Serialize)]
+struct LspDiagnosticOutput {
+    line: u32,
+    character: u32,
+    end_line: u32,
+    end_character: u32,
+    severity: String,
+    code: String,
+    source: String,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct LspLocationOutput {
+    uri: String,
+    start_line: u32,
+    start_character: u32,
+    end_line: u32,
+    end_character: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct LspReferenceOutput {
+    path: String,
+    start_line: u32,
+    start_character: u32,
+    end_line: u32,
+    end_character: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct LspSymbolOutput {
+    name: String,
+    kind: String,
+    detail: Option<String>,
+    container_name: Option<String>,
+    start_line: u32,
+    start_character: u32,
+    end_line: u32,
+    end_character: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct LspTextOutput {
+    text: String,
 }
 
 pub struct LspTools {
@@ -71,29 +130,43 @@ impl LspTools {
             grey_lsp::collect_file_diagnostics(&path, Some(Path::new(&self.lsp_binary)))
                 .await
                 .with_context(|| format!("running LSP diagnostics for {file_path}"))?;
-        let mut output = String::new();
-        output.push_str(&format!(
-            "lsp diagnostics for {} ({}):\n",
-            file_path,
-            diagnostics.len()
-        ));
-        let max_items = args.max_items.unwrap_or(50);
-        for diagnostic in diagnostics.into_iter().take(max_items) {
+        let max_items = normalized_max_items(args.max_items);
+        let mut compact = Vec::new();
+        let mut seen = HashSet::new();
+        for diagnostic in diagnostics.iter().take(max_items) {
             let range = diagnostic.range;
-            let severity = diagnostic
-                .severity
-                .map(|severity| format!("{severity:?}"))
-                .unwrap_or_else(|| "unknown".into());
-            output.push_str(&format!(
-                "[{severity}] {}:{} {}\n",
-                range.start.line + 1,
-                range.start.character + 1,
-                diagnostic.message.replace('\n', " ")
-            ));
+            let item = LspDiagnosticOutput {
+                line: range.start.line + 1,
+                character: range.start.character + 1,
+                end_line: range.end.line + 1,
+                end_character: range.end.character + 1,
+                severity: diagnostic
+                    .severity
+                    .as_ref()
+                    .map(|value| format!("{value:?}"))
+                    .unwrap_or_else(|| "Unknown".into()),
+                code: diagnostic
+                    .code
+                    .as_ref()
+                    .map(std::string::ToString::to_string)
+                    .unwrap_or_default(),
+                source: diagnostic.source.clone().unwrap_or_default(),
+                message: diagnostic.message.replace('\n', " "),
+            };
+            let key = (
+                item.line,
+                item.character,
+                item.end_line,
+                item.end_character,
+                item.severity.clone(),
+                item.message.clone(),
+            );
+            if seen.insert(key) {
+                compact.push(item);
+            }
         }
-        if output.ends_with('\n') {
-            output.pop();
-        }
+        let output =
+            compact_tool_output("lsp_diagnostics", &file_path, diagnostics.len(), compact)?;
         Ok(ToolResult::success(call, output))
     }
 
@@ -109,26 +182,29 @@ impl LspTools {
         )
         .await
         .with_context(|| format!("running LSP definition for {file_path}"))?;
-        let mut output = String::new();
-        output.push_str(&format!(
-            "lsp definition for {} ({}):\n",
-            file_path,
-            definitions.len()
-        ));
-        let max_items = args.max_items.unwrap_or(50);
+        let max_items = normalized_max_items(args.max_items);
+        let total = definitions.len();
+        let mut compact = Vec::new();
+        let mut seen = HashSet::new();
         for definition in definitions.into_iter().take(max_items) {
-            output.push_str(&format!(
-                "{}:{}:{} -> {}:{}\n",
-                definition.uri,
+            let key = (
+                definition.uri.clone(),
                 definition.start_line,
                 definition.start_character,
                 definition.end_line,
-                definition.end_character
-            ));
+                definition.end_character,
+            );
+            if seen.insert(key) {
+                compact.push(LspLocationOutput {
+                    uri: definition.uri,
+                    start_line: definition.start_line,
+                    start_character: definition.start_character,
+                    end_line: definition.end_line,
+                    end_character: definition.end_character,
+                });
+            }
         }
-        if output.ends_with('\n') {
-            output.pop();
-        }
+        let output = compact_tool_output("lsp_definition", &file_path, total, compact)?;
         Ok(ToolResult::success(call, output))
     }
 
@@ -145,26 +221,29 @@ impl LspTools {
         )
         .await
         .with_context(|| format!("running LSP references for {file_path}"))?;
-        let mut output = String::new();
-        output.push_str(&format!(
-            "lsp references for {} ({}):\n",
-            file_path,
-            references.len()
-        ));
-        let max_items = args.max_items.unwrap_or(50);
+        let max_items = normalized_max_items(args.max_items);
+        let total = references.len();
+        let mut compact = Vec::new();
+        let mut seen = HashSet::new();
         for reference in references.into_iter().take(max_items) {
-            output.push_str(&format!(
-                "{}:{}:{} -> {}:{}\n",
-                reference.uri,
+            let key = (
+                reference.uri.clone(),
                 reference.start_line,
                 reference.start_character,
                 reference.end_line,
-                reference.end_character
-            ));
+                reference.end_character,
+            );
+            if seen.insert(key) {
+                compact.push(LspReferenceOutput {
+                    path: reference.uri,
+                    start_line: reference.start_line,
+                    start_character: reference.start_character,
+                    end_line: reference.end_line,
+                    end_character: reference.end_character,
+                });
+            }
         }
-        if output.ends_with('\n') {
-            output.pop();
-        }
+        let output = compact_tool_output("lsp_references", &file_path, total, compact)?;
         Ok(ToolResult::success(call, output))
     }
 
@@ -180,10 +259,8 @@ impl LspTools {
         )
         .await
         .with_context(|| format!("running LSP hover for {file_path}"))?;
-        Ok(ToolResult::success(
-            call,
-            format!("lsp hover for {}:\n{}", file_path, hover),
-        ))
+        let output = compact_text_tool_output("lsp_hover", &file_path, hover)?;
+        Ok(ToolResult::success(call, output))
     }
 
     async fn lsp_rename(&self, call: &ToolCall) -> Result<ToolResult> {
@@ -199,10 +276,8 @@ impl LspTools {
         )
         .await
         .with_context(|| format!("running LSP rename for {file_path}"))?;
-        Ok(ToolResult::success(
-            call,
-            format!("lsp rename for {}:\n{}", file_path, renamed),
-        ))
+        let output = compact_text_tool_output("lsp_rename", &file_path, renamed)?;
+        Ok(ToolResult::success(call, output))
     }
 
     async fn lsp_symbols(&self, call: &ToolCall) -> Result<ToolResult> {
@@ -212,27 +287,33 @@ impl LspTools {
         let symbols = grey_lsp::collect_file_symbols(&path, Some(Path::new(&self.lsp_binary)))
             .await
             .with_context(|| format!("running LSP symbols for {file_path}"))?;
-        let mut output = String::new();
-        output.push_str(&format!(
-            "lsp symbols for {} ({}):\n",
-            file_path,
-            symbols.len()
-        ));
-        let max_items = args.max_items.unwrap_or(50);
+        let max_items = normalized_max_items(args.max_items);
+        let total = symbols.len();
+        let mut compact = Vec::new();
+        let mut seen = HashSet::new();
         for symbol in symbols.into_iter().take(max_items) {
-            output.push_str(&format!(
-                "{} [{}] {}:{}-{}:{}\n",
-                symbol.name,
-                symbol.kind,
+            let key = (
+                symbol.name.clone(),
+                symbol.kind.clone(),
                 symbol.start_line,
                 symbol.start_character,
                 symbol.end_line,
-                symbol.end_character
-            ));
+                symbol.end_character,
+            );
+            if seen.insert(key) {
+                compact.push(LspSymbolOutput {
+                    name: symbol.name,
+                    kind: symbol.kind,
+                    detail: symbol.detail,
+                    container_name: symbol.container_name,
+                    start_line: symbol.start_line,
+                    start_character: symbol.start_character,
+                    end_line: symbol.end_line,
+                    end_character: symbol.end_character,
+                });
+            }
         }
-        if output.ends_with('\n') {
-            output.pop();
-        }
+        let output = compact_tool_output("lsp_symbols", &file_path, total, compact)?;
         Ok(ToolResult::success(call, output))
     }
 
@@ -979,6 +1060,77 @@ fn truncate_output(mut output: String) -> String {
     output.truncate(boundary);
     output.push_str("\n[output truncated by Grey]\n");
     output
+}
+
+fn normalized_max_items(value: Option<usize>) -> usize {
+    value
+        .unwrap_or(LSP_TOOL_DEFAULT_MAX_ITEMS)
+        .clamp(1, LSP_TOOL_MAX_ITEMS)
+}
+
+fn compact_tool_output<T: Serialize>(
+    tool: &'static str,
+    path: &str,
+    total: usize,
+    compact: Vec<T>,
+) -> Result<String> {
+    serde_json::to_string(&LspToolOutput {
+        tool,
+        path: path.to_string(),
+        count: total,
+        shown: compact.len(),
+        truncated: compact.len() < total,
+        compact,
+    })
+    .map_err(|error| anyhow::anyhow!("failed to serialize {tool} output: {error}"))
+}
+
+fn compact_text_tool_output(
+    tool: &'static str,
+    path: &str,
+    text: impl Into<String>,
+) -> Result<String> {
+    let output = compact_tool_output(
+        tool,
+        path,
+        1,
+        vec![LspTextOutput {
+            text: truncate_output(text.into()),
+        }],
+    )?;
+    Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_tool_output_marks_truncated_items() {
+        let output = compact_tool_output(
+            "lsp_symbols",
+            "src/main.rs",
+            12,
+            vec![LspTextOutput {
+                text: "symbol".into(),
+            }],
+        )
+        .expect("tool output should serialize");
+        let value: serde_json::Value =
+            serde_json::from_str(&output).expect("output should be JSON");
+        assert_eq!(value["tool"], "lsp_symbols");
+        assert_eq!(value["path"], "src/main.rs");
+        assert_eq!(value["count"], 12);
+        assert_eq!(value["shown"], 1);
+        assert_eq!(value["truncated"], true);
+    }
+
+    #[test]
+    fn normalized_max_items_clamps_input() {
+        assert_eq!(normalized_max_items(None), 50);
+        assert_eq!(normalized_max_items(Some(0)), 1);
+        assert_eq!(normalized_max_items(Some(1000)), 500);
+    }
 }
 
 async fn run_hook_chain(commands: &[String], event: &str, call: &ToolCall) -> Result<(), String> {
