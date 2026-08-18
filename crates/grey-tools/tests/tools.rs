@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use grey_core::{McpToolConfig, ToolCall, ToolExecutor};
 use grey_tools::{
-    AlwaysApprove, BuiltinTools, CombinedTools, DenySideEffects, HookedTools, McpTools,
+    AlwaysApprove, BuiltinTools, CombinedTools, DenySideEffects, HookedTools, LspTools, McpTools,
     BUILTIN_TOOL_NAMES,
 };
 
@@ -242,4 +242,58 @@ async fn post_tool_hook_error_marks_tool_failed_after_tool_success() {
     assert!(result
         .output
         .contains("post_tool_call hook failed for tool read_file"));
+}
+
+#[tokio::test]
+async fn lsp_diagnostics_is_defined_and_readonly() {
+    let workspace = tempfile::tempdir().unwrap();
+    let lsp = LspTools::new(workspace.path(), "rust-analyzer".into()).unwrap();
+    let names: Vec<_> = lsp
+        .definitions()
+        .into_iter()
+        .map(|definition| definition.name)
+        .collect();
+    assert!(names.contains(&"lsp_diagnostics".to_string()));
+}
+
+#[tokio::test]
+async fn lsp_diagnostics_fails_with_invalid_server_path() {
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("main.rs"), "fn main() {}\n").unwrap();
+    let lsp = LspTools::new(workspace.path(), "non-existent-lsp-server".into()).unwrap();
+    let result = lsp
+        .execute(&crate::call(
+            "lsp_diagnostics",
+            serde_json::json!({"path":"main.rs"}),
+        ))
+        .await;
+    assert!(!result.success);
+    assert!(result.output.contains("running LSP diagnostics"));
+}
+
+#[tokio::test]
+async fn lsp_definition_is_defined_and_readonly() {
+    let workspace = tempfile::tempdir().unwrap();
+    let lsp = LspTools::new(workspace.path(), "rust-analyzer".into()).unwrap();
+    let names: Vec<_> = lsp
+        .definitions()
+        .into_iter()
+        .map(|definition| definition.name)
+        .collect();
+    assert!(names.contains(&"lsp_definition".to_string()));
+}
+
+#[tokio::test]
+async fn lsp_definition_fails_with_invalid_server_path() {
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("main.rs"), "fn main() {}\n").unwrap();
+    let lsp = LspTools::new(workspace.path(), "non-existent-lsp-server".into()).unwrap();
+    let result = lsp
+        .execute(&crate::call(
+            "lsp_definition",
+            serde_json::json!({"path":"main.rs"}),
+        ))
+        .await;
+    assert!(!result.success);
+    assert!(result.output.contains("running LSP definition"));
 }

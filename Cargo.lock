@@ -675,6 +675,7 @@ dependencies = [
  "async-trait",
  "globset",
  "grey-core",
+ "grey-lsp",
  "ignore",
  "regex",
  "serde",

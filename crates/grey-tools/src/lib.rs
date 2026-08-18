@@ -34,6 +34,161 @@ pub struct McpTool {
     pub timeout_ms: Option<u64>,
 }
 
+pub struct LspTools {
+    workspace: PathBuf,
+    lsp_binary: String,
+}
+
+impl LspTools {
+    pub fn new(workspace: &Path, lsp_binary: String) -> Result<Self> {
+        let workspace = workspace
+            .canonicalize()
+            .with_context(|| format!("canonicalizing workspace {}", workspace.display()))?;
+        anyhow::ensure!(workspace.is_dir(), "workspace must be a directory");
+        Ok(Self {
+            workspace,
+            lsp_binary,
+        })
+    }
+
+    async fn dispatch(&self, call: &ToolCall) -> Result<ToolResult> {
+        match call.name.as_str() {
+            "lsp_diagnostics" => self.lsp_diagnostics(call).await,
+            "lsp_definition" => self.lsp_definition(call).await,
+            _ => bail!("unknown tool {:?}", call.name),
+        }
+    }
+
+    async fn lsp_diagnostics(&self, call: &ToolCall) -> Result<ToolResult> {
+        let args: LspDiagnosticsArgs = parse_args(call)?;
+        let path = self.resolve_existing(&args.path)?;
+        let file_path = path.to_string_lossy().into_owned();
+        let diagnostics =
+            grey_lsp::collect_file_diagnostics(&path, Some(Path::new(&self.lsp_binary)))
+                .await
+                .with_context(|| format!("running LSP diagnostics for {file_path}"))?;
+        let mut output = String::new();
+        output.push_str(&format!(
+            "lsp diagnostics for {} ({}):\n",
+            file_path,
+            diagnostics.len()
+        ));
+        let max_items = args.max_items.unwrap_or(50);
+        for diagnostic in diagnostics.into_iter().take(max_items) {
+            let range = diagnostic.range;
+            let severity = diagnostic
+                .severity
+                .map(|severity| format!("{severity:?}"))
+                .unwrap_or_else(|| "unknown".into());
+            output.push_str(&format!(
+                "[{severity}] {}:{} {}\n",
+                range.start.line + 1,
+                range.start.character + 1,
+                diagnostic.message.replace('\n', " ")
+            ));
+        }
+        if output.ends_with('\n') {
+            output.pop();
+        }
+        Ok(ToolResult::success(call, output))
+    }
+
+    async fn lsp_definition(&self, call: &ToolCall) -> Result<ToolResult> {
+        let args: LspDefinitionArgs = parse_args(call)?;
+        let path = self.resolve_existing(&args.path)?;
+        let file_path = path.to_string_lossy().into_owned();
+        let definitions = grey_lsp::collect_file_definitions(
+            &path,
+            Some(Path::new(&self.lsp_binary)),
+            args.line,
+            args.character,
+        )
+        .await
+        .with_context(|| format!("running LSP definition for {file_path}"))?;
+        let mut output = String::new();
+        output.push_str(&format!(
+            "lsp definition for {} ({}):\n",
+            file_path,
+            definitions.len()
+        ));
+        let max_items = args.max_items.unwrap_or(50);
+        for definition in definitions.into_iter().take(max_items) {
+            output.push_str(&format!(
+                "{}:{}:{} -> {}:{}\n",
+                definition.uri,
+                definition.start_line,
+                definition.start_character,
+                definition.end_line,
+                definition.end_character
+            ));
+        }
+        if output.ends_with('\n') {
+            output.pop();
+        }
+        Ok(ToolResult::success(call, output))
+    }
+
+    fn resolve_existing(&self, relative: &str) -> Result<PathBuf> {
+        ensure_relative_path(relative)?;
+        let candidate = self.workspace.join(relative);
+        let canonical = candidate
+            .canonicalize()
+            .with_context(|| format!("resolving workspace path {relative:?}"))?;
+        anyhow::ensure!(
+            canonical.starts_with(&self.workspace),
+            "path must remain inside the workspace"
+        );
+        Ok(canonical)
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for LspTools {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        vec![
+            ToolDefinition {
+                name: "lsp_diagnostics".into(),
+                description: "Run LSP diagnostics for a workspace file and return findings.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "max_items": {"type": "integer", "minimum": 1, "maximum": 500}
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }),
+                risk: ToolRisk::ReadOnly,
+            },
+            ToolDefinition {
+                name: "lsp_definition".into(),
+                description:
+                    "Run LSP definition lookup for a workspace file and return target locations."
+                        .into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "line": {"type": "integer", "minimum": 1},
+                        "character": {"type": "integer", "minimum": 1},
+                        "max_items": {"type": "integer", "minimum": 1, "maximum": 500}
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }),
+                risk: ToolRisk::ReadOnly,
+            },
+        ]
+    }
+
+    async fn execute(&self, call: &ToolCall) -> ToolResult {
+        match self.dispatch(call).await {
+            Ok(result) => result,
+            Err(error) => ToolResult::failure(call, format!("{error:#}")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 struct McpResponse {
     success: Option<bool>,
@@ -768,4 +923,20 @@ struct GrepArgs {
     pattern: String,
     path: Option<String>,
     glob: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LspDiagnosticsArgs {
+    path: String,
+    max_items: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LspDefinitionArgs {
+    path: String,
+    line: Option<u32>,
+    character: Option<u32>,
+    max_items: Option<usize>,
 }

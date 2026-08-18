@@ -18,11 +18,10 @@ use lsp_types::{
     ClientCapabilities, ClientInfo, Diagnostic, DiagnosticClientCapabilities,
     DidOpenTextDocumentParams, DocumentDiagnosticParams, DocumentDiagnosticReport,
     DocumentDiagnosticReportResult, GotoDefinitionParams, GotoDefinitionResponse, InitializeParams,
-    InitializedParams, Position, PublishDiagnosticsParams, TextDocumentClientCapabilities,
+    InitializedParams, Position, PublishDiagnosticsParams, Range, TextDocumentClientCapabilities,
     TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Uri, WorkspaceFolder,
 };
-use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -32,6 +31,30 @@ const MAX_CONTENT_LENGTH: usize = 16 * 1024 * 1024;
 const MAX_PENDING_NOTIFICATIONS: usize = 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DefinitionLocation {
+    pub uri: String,
+    pub start_line: u32,
+    pub start_character: u32,
+    pub end_line: u32,
+    pub end_character: u32,
+}
+
+impl DefinitionLocation {
+    fn from_location(location: lsp_types::Location) -> Self {
+        Self::from_range(location.uri, location.range)
+    }
+
+    fn from_range(uri: Uri, range: Range) -> Self {
+        Self {
+            uri: uri.to_string(),
+            start_line: range.start.line + 1,
+            start_character: range.start.character + 1,
+            end_line: range.end.line + 1,
+            end_character: range.end.character + 1,
+        }
+    }
+}
 
 struct JsonRpcTransport<R, W> {
     reader: R,
@@ -345,6 +368,72 @@ where
 /// Spike B entry: run the full initialize -> open -> diagnostics flow against
 /// a real language server, then report what came back.
 pub async fn run_lsp_spike(file: &Path, lsp_path: Option<&Path>) -> Result<()> {
+    let diagnostics = collect_file_diagnostics(file, lsp_path).await?;
+    let definitions = collect_file_definitions(file, lsp_path, None, None).await?;
+    if diagnostics.is_empty() {
+        println!("[spike-b] OK: no problems reported for the file");
+    } else {
+        println!("[spike-b] OK: {} diagnostic(s):", diagnostics.len());
+        for d in &diagnostics {
+            print_diagnostic(d);
+        }
+    }
+    if definitions.is_empty() {
+        println!("[spike-b] definition: none");
+    } else {
+        println!("[spike-b] definition(s):");
+        for definition in &definitions {
+            println!(
+                "[spike-b] {}:{}:{} -> {}:{}",
+                definition.uri,
+                definition.start_line,
+                definition.start_character,
+                definition.end_line,
+                definition.end_character
+            );
+        }
+    }
+    Ok(())
+}
+
+pub async fn collect_file_diagnostics(
+    file: &Path,
+    lsp_path: Option<&Path>,
+) -> Result<Vec<Diagnostic>> {
+    let result = collect_file_data(file, lsp_path, None).await?;
+    Ok(result.diagnostics)
+}
+
+pub async fn collect_file_definitions(
+    file: &Path,
+    lsp_path: Option<&Path>,
+    line: Option<u32>,
+    character: Option<u32>,
+) -> Result<Vec<DefinitionLocation>> {
+    if line.is_some() != character.is_some() {
+        bail!("line and character must both be provided");
+    }
+    let position = match (line, character) {
+        (Some(line), Some(character)) => Some(Position {
+            line: line.saturating_sub(1),
+            character: character.saturating_sub(1),
+        }),
+        _ => None,
+    };
+    let result = collect_file_data(file, lsp_path, position).await?;
+    Ok(result.definitions)
+}
+
+struct LspCollectResult {
+    diagnostics: Vec<Diagnostic>,
+    definitions: Vec<DefinitionLocation>,
+}
+
+async fn collect_file_data(
+    file: &Path,
+    lsp_path: Option<&Path>,
+    definition_position: Option<Position>,
+) -> Result<LspCollectResult> {
     let lsp = lsp_path
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("rust-analyzer"));
@@ -355,8 +444,7 @@ pub async fn run_lsp_spike(file: &Path, lsp_path: Option<&Path>) -> Result<()> {
     let file_uri = path_to_uri(&file_abs)?;
     let text = std::fs::read_to_string(&file_abs)
         .with_context(|| format!("reading {}", file_abs.display()))?;
-    let definition_position = definition_probe_position(&text);
-
+    let definition_position = definition_position.or_else(|| definition_probe_position(&text));
     println!(
         "[spike-b] lsp={} file={} workspace={}",
         lsp.display(),
@@ -377,12 +465,12 @@ pub async fn run_lsp_spike(file: &Path, lsp_path: Option<&Path>) -> Result<()> {
     let shutdown_result = client.shutdown().await;
 
     match (session_result, shutdown_result) {
-        (Ok(()), Ok(())) => {
+        (Ok(result), Ok(())) => {
             println!("[spike-b] done");
-            Ok(())
+            Ok(result)
         }
         (Err(session_error), Ok(())) => Err(session_error),
-        (Ok(()), Err(shutdown_error)) => Err(shutdown_error),
+        (Ok(_), Err(shutdown_error)) => Err(shutdown_error),
         (Err(session_error), Err(shutdown_error)) => bail!(
             "{session_error:#}; additionally failed to shut down LSP server: {shutdown_error:#}"
         ),
@@ -397,7 +485,7 @@ async fn run_lsp_session(
     file_uri: Uri,
     text: String,
     definition_position: Option<Position>,
-) -> Result<()> {
+) -> Result<LspCollectResult> {
     let init = request_with_timeout::<Initialize>(
         client,
         InitializeParams {
@@ -447,7 +535,6 @@ async fn run_lsp_session(
         })
         .await?;
 
-    println!("[spike-b] waiting for diagnostics (push timeout 15s, then pull)...");
     let diags = match tokio::time::timeout(
         Duration::from_secs(15),
         wait_for_diagnostics(client, &file_uri),
@@ -461,18 +548,11 @@ async fn run_lsp_session(
             pull_diagnostics(client, &file_uri).await?
         }
     };
-
-    if diags.is_empty() {
-        println!("[spike-b] OK: no problems reported for the file");
-    } else {
-        println!("[spike-b] OK: {} diagnostic(s):", diags.len());
-        for d in &diags {
-            print_diagnostic(d);
-        }
-    }
-
-    probe_definition(client, &file_uri, definition_position).await;
-    Ok(())
+    let definitions = probe_definition(client, &file_uri, definition_position).await?;
+    Ok(LspCollectResult {
+        diagnostics: diags,
+        definitions,
+    })
 }
 
 async fn wait_for_diagnostics(client: &mut LspClient, uri: &Uri) -> Result<Vec<Diagnostic>> {
@@ -525,10 +605,13 @@ async fn pull_diagnostics(client: &mut LspClient, uri: &Uri) -> Result<Vec<Diagn
     Ok(last)
 }
 
-async fn probe_definition(client: &mut LspClient, uri: &Uri, position: Option<Position>) {
+async fn probe_definition(
+    client: &mut LspClient,
+    uri: &Uri,
+    position: Option<Position>,
+) -> Result<Vec<DefinitionLocation>> {
     let Some(position) = position else {
-        println!("[spike-b] definition: skipped (no function symbol found)");
-        return;
+        return Ok(Vec::new());
     };
     let params = GotoDefinitionParams {
         text_document_position_params: TextDocumentPositionParams {
@@ -545,45 +628,22 @@ async fn probe_definition(client: &mut LspClient, uri: &Uri, position: Option<Po
     )
     .await
     {
-        Ok(Ok(Some(response))) => {
-            let count = match response {
-                GotoDefinitionResponse::Scalar(location) => {
-                    println!(
-                        "[spike-b] definition: {}:{}:{}",
-                        location.uri.as_str(),
-                        location.range.start.line + 1,
-                        location.range.start.character + 1
-                    );
-                    1
-                }
-                GotoDefinitionResponse::Array(locations) => {
-                    for location in &locations {
-                        println!(
-                            "[spike-b] definition: {}:{}:{}",
-                            location.uri.as_str(),
-                            location.range.start.line + 1,
-                            location.range.start.character + 1
-                        );
-                    }
-                    locations.len()
-                }
-                GotoDefinitionResponse::Link(links) => {
-                    for link in &links {
-                        println!(
-                            "[spike-b] definition: {}:{}:{}",
-                            link.target_uri.as_str(),
-                            link.target_selection_range.start.line + 1,
-                            link.target_selection_range.start.character + 1
-                        );
-                    }
-                    links.len()
-                }
-            };
-            println!("[spike-b] definition lookup returned {count} location(s)");
-        }
-        Ok(Ok(None)) => println!("[spike-b] definition: no location returned"),
-        Ok(Err(error)) => println!("[spike-b] definition unavailable: {error}"),
-        Err(_) => println!("[spike-b] definition unavailable: request timed out"),
+        Ok(Ok(Some(response))) => Ok(match response {
+            GotoDefinitionResponse::Scalar(location) => {
+                vec![DefinitionLocation::from_location(location)]
+            }
+            GotoDefinitionResponse::Array(locations) => locations
+                .into_iter()
+                .map(DefinitionLocation::from_location)
+                .collect(),
+            GotoDefinitionResponse::Link(links) => links
+                .into_iter()
+                .map(|link| DefinitionLocation::from_range(link.target_uri, link.target_range))
+                .collect(),
+        }),
+        Ok(Ok(None)) => Ok(Vec::new()),
+        Ok(Err(error)) => Err(anyhow!("definition unavailable: {error}")),
+        Err(_) => Err(anyhow!("definition unavailable: request timed out")),
     }
 }
 

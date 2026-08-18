@@ -15,8 +15,10 @@ use grey_core::{
     ToolExecutor,
 };
 use grey_provider::router::ProviderRouter;
-use grey_tools::{AlwaysApprove, Approver, BuiltinTools, DenySideEffects, StdioApprover};
-use grey_tools::{CombinedTools, HookedTools, McpTools};
+use grey_tools::{
+    AlwaysApprove, Approver, BuiltinTools, DenySideEffects, LspTools, McpTools, StdioApprover,
+};
+use grey_tools::{CombinedTools, HookedTools};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::process::Stdio;
@@ -800,6 +802,10 @@ fn build_agent_and_session(
     };
     let builtin = Arc::new(BuiltinTools::new(workspace, approver)?);
     let mut executors: Vec<Arc<dyn ToolExecutor>> = vec![builtin];
+    let lsp_binary = config.lsp.rust_analyzer.clone();
+    if !lsp_binary.trim().is_empty() {
+        executors.push(Arc::new(LspTools::new(workspace, lsp_binary)?));
+    }
     let mcp = McpTools::new(config.mcp_tools.clone());
     if !mcp.is_empty() {
         executors.push(Arc::new(mcp));

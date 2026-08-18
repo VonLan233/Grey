@@ -9,6 +9,7 @@ license.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 globset.workspace = true
+grey-lsp = { path = "../grey-lsp" }
 grey-core = { path = "../grey-core" }
 ignore.workspace = true
 regex.workspace = true
