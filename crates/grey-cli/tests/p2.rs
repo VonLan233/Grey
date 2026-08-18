@@ -417,6 +417,47 @@ fn orchestrate_share_context_summary_injects_session_tail() {
 }
 
 #[test]
+fn orchestrate_session_is_persisted_by_default() {
+    let env = temp_home();
+    let output = env
+        .command()
+        .args([
+            "orchestrate",
+            "给我一份这个项目的协作说明",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let session_id = value["session_id"].as_str().unwrap();
+
+    let show = env
+        .command()
+        .args(["sessions", "show", session_id])
+        .output()
+        .unwrap();
+    assert!(
+        show.status.success(),
+        "{}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let session: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
+    let messages = session["messages"].as_array().unwrap();
+    assert!(!messages.is_empty());
+    assert!(messages.iter().any(|message| message["content"]
+        .as_str()
+        .unwrap_or("")
+        .contains("[orchestrate] task")));
+}
+
+#[test]
 fn orchestrate_subagents_do_not_leak_other_agents_context() {
     let env = temp_home();
     let marker_a = "planner only";

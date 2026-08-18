@@ -1,7 +1,7 @@
 # HANDOFF_P3: 多 Agent 编排与 MCP 接口（阶段性交接）
 
 > 日期：2026-08-18  
-> 状态：P3 原型实现完成，尚未进入阶段交付完成状态
+> 状态：P3 交付阶段完成，待确认运行验证证据归档
 
 ## 一、交付摘要
 
@@ -32,11 +32,15 @@
 | 上下文隔离验证 | ✅ | `orchestrate_subagents_do_not_leak_other_agents_context` |
 | MCP/Hook 接入复用 | ✅ | `build_agent_and_session` 与现有工具链复用 |
 | 主协调器输出/schema 校验增强（含 JSON Schema） | ✅ | `OrchestrateCoordinatorContract` + `parse_orchestrate_coordinator_contract` + `cargo test --workspace --all-features` |
+| 子 agent 面板渲染（TUI） | ✅ | `render_orchestrate_text_panels` + `--format text` 分层面板输出 |
+| 会话化记忆持久化 | ✅ | `run_orchestrate` 持久化 `Session`，并有 `orchestrate_session_is_persisted_by_default` 覆盖 |
 
 ## 四、尚未完成（P3 to-do）
 
-1. 子 agent 面板渲染（TUI）与会话化记忆持久化。
+无
 
 ## 五、建议下一步
 
-在不改动现有 `grey-core` 边界的前提下，先补齐 1)共享上下文白名单、2)子 Agent 失败恢复策略、3)P3 文档里勾选验收项，再切换到 P4 的 LSP 语义视图接入。
+在不改动现有 `grey-core` 边界的前提下，建议完成以下收尾动作：
+1. 统一更新 README 与阶段性开发文档中的 P3 完成状态。
+2. 运行 `workspace` 级别的验收门禁（fmt/clippy/tests/build）。

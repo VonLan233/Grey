@@ -14,6 +14,7 @@ Grey 已完成 P2 的 Provider/上下文/缓存/usage 能力。P3 目标是从�
 2. 子 agent 采用独立会话上下文运行（`read_only + no_save`），以避免上下文污染；主任务与合成结果由 coordinator 子循环串起来。
 3. 子 agent 输出通过 JSON 合约（`status/summary/recommendations/risks/artifacts`）归一化，失败/降级时回退到明文提取。
 4. 当前阶段将子 agent 的 MCP 与 Hook 沿用现有工具链，不在 CLI 层新增 MCP 协议栈；只补足子 agent 并发调度与结果结构化的稳定输出。
+5. Orchestrate 结果在文本模式下以面板化方式展示子 agent 状态；会话默认持久化，`--no-save` 时保持不落盘。
 
 ## Consequences
 
@@ -28,3 +29,4 @@ Grey 已完成 P2 的 Provider/上下文/缓存/usage 能力。P3 目标是从�
 - 子 agent 合约解析与容错：已实现（`crates/grey-cli/src/main.rs`，`parse_orchestrate_contract`）
 - 上下文隔离验证测试：已实现（`crates/grey-cli/tests/p2.rs`）
 - 子 agent 聚合输出：已实现（`crates/grey-cli/src/main.rs`）
+- 子 agent 会话化记忆持久化：已实现（`crates/grey-cli/src/main.rs`）

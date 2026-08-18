@@ -10,10 +10,10 @@ Grey 已完成 P0 技术验证，并具备 P1 的首个可用纵向闭环：同�
 同时服务单发 CLI 与 TUI，模型可以流式回答、调用工作区工具、接收工具结果并继续推理，
 会话可保存到 SQLite 后恢复。
 
-当前版本是 **v0.2/P2 MVP**，不是路线图中的 v1.0。P2 已完成多 Provider 路由、故障切换、
+当前版本是 **v0.3/P3 MVP**（非 v1.0）。P2 已完成多 Provider 路由、故障切换、
 上下文预算、请求缓存和 usage 持久化；MCP 与 Hook 也已接入（Prompt Hook、工具前后
-Hook、MCP Command Tool）。多 Agent、完整 LSP 语义工具、WASM 插件、图片、桌面提醒与发布
-打包仍按 P3–P7 推进。
+Hook、MCP Command Tool）；P3 已补齐多 Agent 编排与会话化记忆持久化。
+完整 LSP 语义工具、WASM 插件、图片、桌面提醒与发布打包仍在 P4–P7。
 
 ## 已实现
 
@@ -33,6 +33,7 @@ Hook、MCP Command Tool）。多 Agent、完整 LSP 语义工具、WASM 插件�
 - SQLite 请求缓存（TTL/LRU/provider 隔离）与 `--no-cache` 控制
 - 每会话 token/cost usage 记录，跨 CLI 调用累积并由 `usage show/summary` 查询
 - MCP 命令工具与 Hook：`pre_prompt`、`pre_tool_call`、`post_tool_call`
+- 多 Agent 编排：`grey orchestrate` 并行运行子 agent，支持 `--session`/`--continue` 与结果持久化
 
 完整路线图见[阶段性开发文档](docs/阶段性开发文档.md)，架构背景见[项目计划书](docs/项目计划书.md)。
 

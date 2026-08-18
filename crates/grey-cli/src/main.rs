@@ -292,6 +292,7 @@ const ORCHESTRATE_MAX_SUMMARY_CHARS: usize = 500;
 const ORCHESTRATE_MAX_LIST_ITEMS: usize = 24;
 const ORCHESTRATE_MAX_LIST_ITEM_CHARS: usize = 180;
 const ORCHESTRATE_MAX_SYNTHESIS_RESPONSE_CHARS: usize = 1024;
+const ORCHESTRATE_SESSION_MESSAGE_PREVIEW_CHARS: usize = 320;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -333,6 +334,7 @@ struct OrchestrateOutput {
     task: String,
     subagents: Vec<OrchestrateAgentResult>,
     synthesis: AgentOutcomeSummary,
+    session_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -433,20 +435,49 @@ async fn run_orchestrate(
     let subagent_results = join_all(futures).await;
 
     let mut coordinator_cli = cli.clone();
-    coordinator_cli.no_save = true;
+    coordinator_cli.no_save = cli.no_save;
     coordinator_cli.read_only = true;
     coordinator_cli.auto_approve = false;
-    let (coordinator, _, _) =
+    let (coordinator, store, existing) =
         build_agent_and_session(&coordinator_cli, &config, &workspace, false)?;
+    let coordinator_prompt = build_coordinator_prompt(&task, &subagent_results);
     let synthesis_outcome = coordinator
         .run_new(
             "你是任务协调子代理，负责把子代理结论合成为可执行计划。",
-            build_coordinator_prompt(&task, &subagent_results),
+            coordinator_prompt.as_str(),
             None,
         )
         .await?;
     let synthesis =
         parse_orchestrate_coordinator_contract(&synthesis_outcome.response, &synthesis_outcome);
+    let usage_tracker = coordinator.usage_tracker();
+    let existing_messages = existing
+        .as_ref()
+        .map(|session| session.messages.as_slice())
+        .unwrap_or(&[]);
+    let orchestration_messages = build_orchestrate_session_messages(
+        existing_messages,
+        &task,
+        &subagent_results,
+        &synthesis_outcome.response,
+    );
+    let session_id = persist_outcome(
+        store.as_ref(),
+        existing,
+        &AgentOutcome {
+            messages: orchestration_messages,
+            response: synthesis_outcome.response.clone(),
+            usage: synthesis_outcome.usage,
+            steps: synthesis_outcome.steps,
+            cached: synthesis_outcome.cached,
+            provider_id: synthesis_outcome.provider_id,
+            model: synthesis_outcome.model,
+        },
+        &task,
+        &workspace,
+        cli.no_save,
+        usage_tracker.as_deref(),
+    )?;
 
     if cli.format == OutputFormat::Json {
         println!(
@@ -461,46 +492,23 @@ async fn run_orchestrate(
                     steps: synthesis.steps,
                     cached: synthesis.cached,
                 },
+                session_id,
             })?
         );
         return Ok(());
     }
 
-    println!("task: {}", task);
-    for result in &subagent_results {
-        let status = match result.status.as_str() {
-            "ok" => "success",
-            "warn" => "warning",
-            "fail" => "failure",
-            _ => "warning",
-        };
-        println!(
-            "\n[{name}] status={status} provider={provider} model={model} steps={steps} cached={cached}",
-            name = result.name,
-            status = status,
-            provider = result.provider,
-            model = result.model,
-            steps = result.steps,
-            cached = result.cached
-        );
-        if !result.summary.is_empty() {
-            println!("  摘要: {}", result.summary);
-        }
-        if !result.recommendations.is_empty() {
-            println!("  建议: {}", result.recommendations.join("，"));
-        }
-        if !result.risks.is_empty() {
-            println!("  风险: {}", result.risks.join("，"));
-        }
-        if !result.artifacts.is_empty() {
-            println!("  产物: {}", result.artifacts.join("，"));
-        }
-        if let Some(error) = &result.error {
-            println!("  错误: {error}");
-        }
-        println!("{}", result.response);
+    for line in render_orchestrate_text_panels(
+        &task,
+        &subagent_results,
+        &synthesis,
+        &synthesis_outcome.response,
+    ) {
+        println!("{}", line);
     }
-    println!("\n== Synthesis ==\n{}", synthesis.response);
+    if let Some(session_id) = &session_id {
+        eprintln!("[session {session_id}]");
+    }
     Ok(())
 }
 
@@ -1005,6 +1013,134 @@ fn fallback_orchestrate_coordinator_contract(
         steps: fallback.steps,
         cached: fallback.cached,
     }
+}
+
+fn build_orchestrate_session_messages(
+    existing_messages: &[ChatMessage],
+    task: &str,
+    subagents: &[OrchestrateAgentResult],
+    synthesis: &str,
+) -> Vec<ChatMessage> {
+    let mut messages = existing_messages.to_vec();
+    messages.push(ChatMessage::new(
+        Role::User,
+        format!("[orchestrate] task: {task}"),
+    ));
+
+    for result in subagents {
+        let mut lines = vec![
+            format!(
+                "子代理: {} | status={} | provider={} model={} steps={} cached={}",
+                result.name,
+                result.status,
+                result.provider,
+                result.model,
+                result.steps,
+                result.cached
+            ),
+            format!("任务: {}", result.task),
+            format!(
+                "摘要: {}",
+                compact_message_preview_with_limit(&result.summary, 160)
+            ),
+        ];
+        if !result.recommendations.is_empty() {
+            lines.push(format!("建议: {}", result.recommendations.join("，")));
+        }
+        if !result.risks.is_empty() {
+            lines.push(format!("风险: {}", result.risks.join("，")));
+        }
+        if !result.artifacts.is_empty() {
+            lines.push(format!("产物: {}", result.artifacts.join("，")));
+        }
+        if let Some(error) = &result.error {
+            lines.push(format!("错误: {error}"));
+        }
+        if !result.response.is_empty() {
+            lines.push(format!(
+                "原文: {}",
+                compact_message_preview_with_limit(
+                    &result.response,
+                    ORCHESTRATE_SESSION_MESSAGE_PREVIEW_CHARS,
+                )
+            ));
+        }
+        messages.push(ChatMessage::new(Role::Assistant, lines.join("\n")));
+    }
+
+    messages.push(ChatMessage::new(
+        Role::Assistant,
+        format!(
+            "协调总结: {}\n{}",
+            compact_message_preview_with_limit(synthesis, ORCHESTRATE_MAX_SUMMARY_CHARS),
+            compact_message_preview_with_limit(synthesis, ORCHESTRATE_MAX_SUMMARY_CHARS * 2)
+        ),
+    ));
+    messages
+}
+
+fn render_orchestrate_text_panels(
+    task: &str,
+    subagents: &[OrchestrateAgentResult],
+    summary: &OrchestrateCoordinatorContract,
+    synthesis_raw: &str,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push("╭─ Orchestrate 子 Agent 面板 ─╮".to_string());
+    lines.push(format!("│ 任务：{task}"));
+    lines.push("├───────────────────────────".to_string());
+
+    for result in subagents {
+        lines.push(format!(
+            "│ {:<7}: {:<6} | {:<14}@{:<12}",
+            result.name, result.status, result.provider, result.model
+        ));
+        lines.push(format!("│ 任务：{}", result.task));
+        if !result.summary.is_empty() {
+            lines.push(format!("│ 摘要：{}", result.summary));
+        }
+        if !result.recommendations.is_empty() {
+            lines.push(format!("│ 建议：{}", result.recommendations.join("，")));
+        }
+        if !result.risks.is_empty() {
+            lines.push(format!("│ 风险：{}", result.risks.join("，")));
+        }
+        if !result.artifacts.is_empty() {
+            lines.push(format!("│ 产物：{}", result.artifacts.join("，")));
+        }
+        if result.response.is_empty() {
+            continue;
+        }
+        lines.push(format!(
+            "│ 响应：{}",
+            compact_message_preview_with_limit(&result.response, 120)
+        ));
+        if let Some(error) = &result.error {
+            lines.push(format!("│ 错误：{error}"));
+        }
+        lines.push("│".to_string());
+    }
+
+    lines.push("├─ Synthesis ──────────────".to_string());
+    lines.push(format!(
+        "│ {}",
+        compact_message_preview_with_limit(synthesis_raw, ORCHESTRATE_MAX_SUMMARY_CHARS)
+    ));
+    lines.push(format!(
+        "│ 归一化: {}",
+        compact_message_preview_with_limit(&summary.response, ORCHESTRATE_MAX_SUMMARY_CHARS)
+    ));
+    lines.push(format!(
+        "│ provider: {} model: {}",
+        summary.provider, summary.model
+    ));
+    lines.push(format!(
+        "│ steps: {} cached: {}",
+        summary.steps,
+        if summary.cached { "true" } else { "false" }
+    ));
+    lines.push("╰───────────────────────────".to_string());
+    lines
 }
 
 async fn run_headless(
