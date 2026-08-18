@@ -102,19 +102,19 @@ cargo run -q -p grey-cli -- --no-save "hello"
 
 ### 5.1 阻塞项
 
-自动化验收已完成，当前仅剩实网冒烟为手工步骤（需有效 OpenAI API Key）：
+自动化验收已完成，当前仅剩实网冒烟为手工步骤（需有效 ARK/VOLCANO API Key 或 OpenAI API Key）：
 
-- `grey-cli` 在 `gpt-5.3-codex-spark` 上的端到端调用需要设置有效 `GREY_PROVIDER_OPENAI_API_KEY`（OpenAI API Key，以 `sk-` 开头）后执行。
+- `grey-cli` 在 `deepseek-v4-flash-ga-260731` 上的端到端调用需要设置有效 `ARK_API_KEY`（或 `VOLCANO_API_KEY`）后执行。  
+  （如仍需 OpenAI 验证，可临时使用 `GREY_PROVIDER_OPENAI_API_KEY`，仅当以 `sk-` 前缀的 key 有效时生效。）
 
-建议命令（`sk-` key 可放在环境变量中）：
+建议命令（`ARK/VOLCANO` key 可放在环境变量中）：
 
 ```bash
-GREY_PROVIDER_OPENAI_API_KEY=sk-... \
-GREY_PROVIDER_OPENAI_BASE_URL=https://api.openai.com/v1 \
-cargo run -q -p grey-cli -- --provider openai --model gpt-5.3-codex-spark --no-save --no-cache --format json "只回复 ok"
+ARK_API_KEY=... \
+cargo run -q -p grey-cli -- --provider volcano --model deepseek-v4-flash-ga-260731 --no-save --no-cache --format json "只回复 ok"
 ```
 
-预期：HTTP 200，JSON 输出包含 `provider: "openai"`, `model: "gpt-5.3-codex-spark"`，且命令返回文本 `"ok"`。
+预期：HTTP 200，JSON 输出包含 `provider: "volcano"`, `model: "deepseek-v4-flash-ga-260731"`，且命令返回文本 `"ok"`。
 
 严格验收补充项已完成：
 

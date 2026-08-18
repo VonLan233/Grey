@@ -4,7 +4,7 @@ set -euo pipefail
 OPENAI_API_KEY="${GREY_PROVIDER_OPENAI_API_KEY:-${OPENAI_API_KEY:-${YUNWU_API_KEY:-}}}"
 OPENAI_BASE_URL="${GREY_PROVIDER_OPENAI_BASE_URL:-https://api.openai.com/v1}"
 OPENAI_MODEL="${GREY_PROVIDER_OPENAI_MODEL:-gpt-5.3-codex-spark}"
-VOLCANO_API_KEY="${ARK_API_KEY:-${VOLCANO_API_KEY:-${GREY_PROVIDER_VOLCANO_API_KEY:-}}}"
+VOLCANO_API_KEY="${GREY_PROVIDER_VOLCANO_API_KEY:-${ARK_API_KEY:-${VOLCANO_API_KEY:-}}}"
 VOLCANO_BASE_URL="${GREY_PROVIDER_VOLCANO_BASE_URL:-https://ark.cn-beijing.volces.com/api/v3}"
 VOLCANO_MODEL="${GREY_PROVIDER_VOLCANO_MODEL:-deepseek-v4-flash-ga-260731}"
 SMOKE_CONFIG="$(mktemp)"
@@ -76,7 +76,7 @@ if [[ -n "$VOLCANO_API_KEY" ]]; then
     ok=false
   fi
 else
-  printf '\nSkip Volcano smoke: ARK_API_KEY not set. Set ARK_API_KEY to run DeepSeek smoke.\n'
+  printf '\nSkip Volcano smoke: VOLCANO_API_KEY/ARK_API_KEY not set. Set one of these to run DeepSeek smoke.\n'
 fi
 
 if [[ "$ok" == "false" ]]; then

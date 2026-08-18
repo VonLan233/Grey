@@ -167,8 +167,8 @@ rust_analyzer = "rust-analyzer"
 grey --provider openai --model qwen2.5:7b "修复测试失败"
 grey --provider anthropic "解释这个 workspace"
 GREY_OPENAI_BASE_URL=http://localhost:11434/v1 grey --provider openai "你好"
-GREY_PROVIDER_OPENAI_API_KEY=sk-xxx GREY_PROVIDER_OPENAI_BASE_URL=https://api.openai.com/v1 grey --provider openai --model gpt-5.3-codex-spark "Hello"
-GREY_PROVIDER_OPENAI_API_KEY=sk-xxx GREY_PROVIDER_OPENAI_BASE_URL=https://api.openai.com/v1 grey --provider openai --model gpt-5.3-codex-spark --no-cache --no-save "请只回复 ok"
+ARK_API_KEY=ark-xxx GREY_PROVIDER_VOLCANO_BASE_URL=https://ark.cn-beijing.volces.com/api/v3 grey --provider volcano --model deepseek-v4-flash-ga-260731 "Hello"
+ARK_API_KEY=ark-xxx GREY_PROVIDER_VOLCANO_BASE_URL=https://ark.cn-beijing.volces.com/api/v3 grey --provider volcano --model deepseek-v4-flash-ga-260731 --no-cache --no-save "请只回复 ok"
 ARK_API_KEY=<VOLCANO_API_KEY> GREY_PROVIDER_VOLCANO_BASE_URL=https://ark.cn-beijing.volces.com/api/v3 grey --provider volcano --model deepseek-v4-flash-ga-260731 --no-cache --no-save "请只回复 ok"
 grey --task coding --no-cache "修复测试失败"
 grey providers list
@@ -176,16 +176,16 @@ grey providers show mock
 grey cache stats
 grey usage show <SESSION_ID>
 grey usage summary
-./scripts/run-grey-smoke-p2.sh   # 运行 OpenAI/Volcano 实网 smoke（需有效 key，默认模型为 gpt-5.3-codex-spark）
+./scripts/run-grey-smoke-p2.sh   # 运行 OpenAI/Volcano 实网 smoke（需有效 key，默认 Volcano 模型为 deepseek-v4-flash-ga-260731）
 ```
 
 每个 Provider 还可以使用 `GREY_PROVIDER_<ID>_<FIELD>` 覆盖，例如
 `GREY_PROVIDER_LOCAL_BASE_URL`、`GREY_PROVIDER_LOCAL_API_KEY`。在动态 `[[providers]]` 配置下，
 `GREY_PROVIDER_OPENAI_API_KEY`/`GREY_PROVIDER_OPENAI_BASE_URL` 可用于覆盖 openai 配置；
-若未显式设置，`run-grey-smoke-p2.sh` 也会回退到 `YUNWU_API_KEY`。
+若未显式设置，`run-grey-smoke-p2.sh` 也会回退到 OpenAI 的 `YUNWU_API_KEY`；`volcano` 分支支持 `ARK_API_KEY`（或 `VOLCANO_API_KEY`）兜底。
 `ARK_API_KEY` 也可直接用于 `volcano` provider；
 旧的 `GREY_OPENAI_*` / `GREY_ANTHROPIC_*` 变量也继续有效（用于 legacy 兼容）。
-进行 GPT 订阅实网验证时请使用 `sk-` 前缀的 OpenAI API key（非 ChatGPT 会话 token）。
+进行 OpenAI 实网验证时请使用 `sk-` 前缀的 OpenAI API key（非 ChatGPT 会话 token）。进行火山方舟验证时请使用 `ARK_API_KEY`/`VOLCANO_API_KEY`。
 未知 Provider、重复 Provider ID
 和无效 fallback 引用会直接报错，不会静默降级为 Mock。
 

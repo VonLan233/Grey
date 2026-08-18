@@ -625,7 +625,7 @@ fn apply_env(cfg: &mut GreyConfig) -> Result<()> {
         );
         cfg.anthropic.max_tokens = max_tokens;
     }
-    let fallback_ark_api_key = env::var_os("ARK_API_KEY");
+    let fallback_ark_api_key = env::var_os("ARK_API_KEY").or_else(|| env::var_os("VOLCANO_API_KEY"));
     for provider in cfg.providers.iter_mut() {
         let prefix = format!(
             "GREY_PROVIDER_{}_",
@@ -1030,5 +1030,31 @@ description = "echo test tool"
             .find(|provider| provider.id == "volcano")
             .expect("volcano provider should exist");
         assert_eq!(volcano.api_key, "ark-demo-key");
+    }
+
+    #[test]
+    fn applies_volcano_api_key_to_volcano_provider_when_unset() {
+        let mut cfg = GreyConfig::default();
+        cfg.providers.push(ProviderEntry {
+            id: "volcano".into(),
+            protocol: "openai".into(),
+            ..Default::default()
+        });
+        let previous_volcano = env::var_os("VOLCANO_API_KEY");
+        unsafe { env::set_var("VOLCANO_API_KEY", "volcano-demo-key") };
+        let result = apply_env(&mut cfg);
+        unsafe {
+            match previous_volcano {
+                Some(value) => env::set_var("VOLCANO_API_KEY", value),
+                None => env::remove_var("VOLCANO_API_KEY"),
+            }
+        }
+        assert!(result.is_ok(), "{}", result.unwrap_err());
+        let volcano = cfg
+            .providers
+            .iter()
+            .find(|provider| provider.id == "volcano")
+            .expect("volcano provider should exist");
+        assert_eq!(volcano.api_key, "volcano-demo-key");
     }
 }
