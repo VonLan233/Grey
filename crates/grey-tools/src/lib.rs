@@ -56,6 +56,8 @@ impl LspTools {
             "lsp_diagnostics" => self.lsp_diagnostics(call).await,
             "lsp_definition" => self.lsp_definition(call).await,
             "lsp_references" => self.lsp_references(call).await,
+            "lsp_hover" => self.lsp_hover(call).await,
+            "lsp_rename" => self.lsp_rename(call).await,
             _ => bail!("unknown tool {:?}", call.name),
         }
     }
@@ -165,6 +167,43 @@ impl LspTools {
         Ok(ToolResult::success(call, output))
     }
 
+    async fn lsp_hover(&self, call: &ToolCall) -> Result<ToolResult> {
+        let args: LspPositionArgs = parse_args(call)?;
+        let path = self.resolve_existing(&args.path)?;
+        let file_path = path.to_string_lossy().into_owned();
+        let hover = grey_lsp::collect_file_hover(
+            &path,
+            Some(Path::new(&self.lsp_binary)),
+            args.line,
+            args.character,
+        )
+        .await
+        .with_context(|| format!("running LSP hover for {file_path}"))?;
+        Ok(ToolResult::success(
+            call,
+            format!("lsp hover for {}:\n{}", file_path, hover),
+        ))
+    }
+
+    async fn lsp_rename(&self, call: &ToolCall) -> Result<ToolResult> {
+        let args: LspRenameArgs = parse_args(call)?;
+        let path = self.resolve_existing(&args.path)?;
+        let file_path = path.to_string_lossy().into_owned();
+        let renamed = grey_lsp::collect_file_rename(
+            &path,
+            Some(Path::new(&self.lsp_binary)),
+            args.line,
+            args.character,
+            args.new_name,
+        )
+        .await
+        .with_context(|| format!("running LSP rename for {file_path}"))?;
+        Ok(ToolResult::success(
+            call,
+            format!("lsp rename for {}:\n{}", file_path, renamed),
+        ))
+    }
+
     fn resolve_existing(&self, relative: &str) -> Result<PathBuf> {
         ensure_relative_path(relative)?;
         let candidate = self.workspace.join(relative);
@@ -230,6 +269,40 @@ impl ToolExecutor for LspTools {
                         "max_items": {"type": "integer", "minimum": 1, "maximum": 500}
                     },
                     "required": ["path"],
+                    "additionalProperties": false
+                }),
+                risk: ToolRisk::ReadOnly,
+            },
+            ToolDefinition {
+                name: "lsp_hover".into(),
+                description:
+                    "Run LSP hover lookup for a workspace file and return hovered symbol documentation."
+                        .into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "line": {"type": "integer", "minimum": 1},
+                        "character": {"type": "integer", "minimum": 1}
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }),
+                risk: ToolRisk::ReadOnly,
+            },
+            ToolDefinition {
+                name: "lsp_rename".into(),
+                description: "Run LSP rename preview for a workspace file and return the proposed edit."
+                    .into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "line": {"type": "integer", "minimum": 1},
+                        "character": {"type": "integer", "minimum": 1},
+                        "new_name": {"type": "string"},
+                    },
+                    "required": ["path", "new_name"],
                     "additionalProperties": false
                 }),
                 risk: ToolRisk::ReadOnly,
@@ -999,10 +1072,27 @@ struct LspDefinitionArgs {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct LspPositionArgs {
+    path: String,
+    line: Option<u32>,
+    character: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LspReferencesArgs {
     path: String,
     line: Option<u32>,
     character: Option<u32>,
     include_declaration: Option<bool>,
     max_items: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LspRenameArgs {
+    path: String,
+    line: Option<u32>,
+    character: Option<u32>,
+    new_name: String,
 }

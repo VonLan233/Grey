@@ -15,14 +15,16 @@ use anyhow::{anyhow, bail, Context, Result};
 use lsp_types::{
     notification::{DidOpenTextDocument, Exit, Initialized, Notification, PublishDiagnostics},
     request::{
-        DocumentDiagnosticRequest, GotoDefinition, Initialize, References, Request, Shutdown,
+        DocumentDiagnosticRequest, GotoDefinition, HoverRequest, Initialize, References, Rename,
+        Request, Shutdown,
     },
     ClientCapabilities, ClientInfo, Diagnostic, DiagnosticClientCapabilities,
-    DidOpenTextDocumentParams, DocumentDiagnosticParams, DocumentDiagnosticReport,
-    DocumentDiagnosticReportResult, GotoDefinitionParams, GotoDefinitionResponse, InitializeParams,
-    InitializedParams, Position, PublishDiagnosticsParams, Range, ReferenceContext,
-    ReferenceParams, TextDocumentClientCapabilities, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, Uri, WorkspaceFolder,
+    DidOpenTextDocumentParams, DocumentChangeOperation, DocumentChanges, DocumentDiagnosticParams,
+    DocumentDiagnosticReport, DocumentDiagnosticReportResult, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverContents, HoverParams, InitializeParams, InitializedParams,
+    Position, PublishDiagnosticsParams, Range, ReferenceContext, ReferenceParams, RenameParams,
+    TextDocumentClientCapabilities, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, Uri, WorkspaceEdit, WorkspaceFolder,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -448,6 +450,47 @@ pub async fn collect_file_references(
     Ok(result)
 }
 
+pub async fn collect_file_hover(
+    file: &Path,
+    lsp_path: Option<&Path>,
+    line: Option<u32>,
+    character: Option<u32>,
+) -> Result<String> {
+    if line.is_some() != character.is_some() {
+        bail!("line and character must both be provided");
+    }
+    let position = match (line, character) {
+        (Some(line), Some(character)) => Some(Position {
+            line: line.saturating_sub(1),
+            character: character.saturating_sub(1),
+        }),
+        _ => None,
+    };
+    let result = collect_file_hover_data(file, lsp_path, position).await?;
+    Ok(result)
+}
+
+pub async fn collect_file_rename(
+    file: &Path,
+    lsp_path: Option<&Path>,
+    line: Option<u32>,
+    character: Option<u32>,
+    new_name: String,
+) -> Result<String> {
+    if line.is_some() != character.is_some() {
+        bail!("line and character must both be provided");
+    }
+    let position = match (line, character) {
+        (Some(line), Some(character)) => Some(Position {
+            line: line.saturating_sub(1),
+            character: character.saturating_sub(1),
+        }),
+        _ => None,
+    };
+    let result = collect_file_rename_data(file, lsp_path, position, new_name).await?;
+    Ok(result)
+}
+
 struct LspCollectResult {
     diagnostics: Vec<Diagnostic>,
     definitions: Vec<DefinitionLocation>,
@@ -534,6 +577,97 @@ async fn collect_file_reference_data(
         text,
         definition_position,
         include_declaration,
+    )
+    .await;
+    let shutdown_result = client.shutdown().await;
+
+    match (session_result, shutdown_result) {
+        (Ok(result), Ok(())) => {
+            println!("[spike-b] done");
+            Ok(result)
+        }
+        (Err(session_error), Ok(())) => Err(session_error),
+        (Ok(_), Err(shutdown_error)) => Err(shutdown_error),
+        (Err(session_error), Err(shutdown_error)) => bail!(
+            "{session_error:#}; additionally failed to shut down LSP server: {shutdown_error:#}"
+        ),
+    }
+}
+
+async fn collect_file_hover_data(
+    file: &Path,
+    lsp_path: Option<&Path>,
+    position: Option<Position>,
+) -> Result<String> {
+    let lsp = lsp_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("rust-analyzer"));
+    let file_abs = std::fs::canonicalize(file)
+        .with_context(|| format!("canonicalizing {}", file.display()))?;
+    let workspace_root = discover_workspace_root(&file_abs)?;
+    let root = path_to_uri(&workspace_root)?;
+    let file_uri = path_to_uri(&file_abs)?;
+    let text = std::fs::read_to_string(&file_abs)
+        .with_context(|| format!("reading {}", file_abs.display()))?;
+    let position = position.or_else(|| definition_probe_position(&text));
+    println!(
+        "[spike-b] lsp={} file={} workspace={}",
+        lsp.display(),
+        file_abs.display(),
+        workspace_root.display()
+    );
+
+    let mut client = LspClient::spawn(&lsp).await?;
+    let session_result =
+        run_lsp_hover_session(&mut client, root, &workspace_root, file_uri, text, position).await;
+    let shutdown_result = client.shutdown().await;
+
+    match (session_result, shutdown_result) {
+        (Ok(result), Ok(())) => {
+            println!("[spike-b] done");
+            Ok(result)
+        }
+        (Err(session_error), Ok(())) => Err(session_error),
+        (Ok(_), Err(shutdown_error)) => Err(shutdown_error),
+        (Err(session_error), Err(shutdown_error)) => bail!(
+            "{session_error:#}; additionally failed to shut down LSP server: {shutdown_error:#}"
+        ),
+    }
+}
+
+async fn collect_file_rename_data(
+    file: &Path,
+    lsp_path: Option<&Path>,
+    position: Option<Position>,
+    new_name: String,
+) -> Result<String> {
+    let lsp = lsp_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("rust-analyzer"));
+    let file_abs = std::fs::canonicalize(file)
+        .with_context(|| format!("canonicalizing {}", file.display()))?;
+    let workspace_root = discover_workspace_root(&file_abs)?;
+    let root = path_to_uri(&workspace_root)?;
+    let file_uri = path_to_uri(&file_abs)?;
+    let text = std::fs::read_to_string(&file_abs)
+        .with_context(|| format!("reading {}", file_abs.display()))?;
+    let position = position.or_else(|| definition_probe_position(&text));
+    println!(
+        "[spike-b] lsp={} file={} workspace={}",
+        lsp.display(),
+        file_abs.display(),
+        workspace_root.display()
+    );
+
+    let mut client = LspClient::spawn(&lsp).await?;
+    let session_result = run_lsp_rename_session(
+        &mut client,
+        root,
+        &workspace_root,
+        file_uri,
+        text,
+        position,
+        new_name,
     )
     .await;
     let shutdown_result = client.shutdown().await;
@@ -697,6 +831,141 @@ async fn run_lsp_reference_session(
     probe_references(client, &file_uri, definition_position, include_declaration).await
 }
 
+#[allow(deprecated)] // root_uri + workspace_folders both sent for maximal server compat
+async fn run_lsp_hover_session(
+    client: &mut LspClient,
+    root: Uri,
+    workspace_root: &Path,
+    file_uri: Uri,
+    text: String,
+    position: Option<Position>,
+) -> Result<String> {
+    let init = request_with_timeout::<Initialize>(
+        client,
+        InitializeParams {
+            process_id: Some(std::process::id()),
+            root_uri: Some(root.clone()),
+            workspace_folders: Some(vec![WorkspaceFolder {
+                uri: root,
+                name: workspace_root
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| workspace_root.display().to_string()),
+            }]),
+            capabilities: ClientCapabilities {
+                text_document: Some(TextDocumentClientCapabilities {
+                    diagnostic: Some(DiagnosticClientCapabilities {
+                        dynamic_registration: None,
+                        related_document_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            client_info: Some(ClientInfo {
+                name: "grey-spike".into(),
+                version: None,
+            }),
+            ..Default::default()
+        },
+        REQUEST_TIMEOUT,
+    )
+    .await?;
+    println!(
+        "[spike-b] initialized: server={:?}",
+        init.server_info
+            .map(|i| format!("{} {}", i.name, i.version.unwrap_or_default()))
+    );
+
+    client.notify::<Initialized>(InitializedParams {}).await?;
+    client
+        .notify::<DidOpenTextDocument>(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: file_uri.clone(),
+                language_id: "rust".into(),
+                version: 1,
+                text,
+            },
+        })
+        .await?;
+
+    let _ = tokio::time::timeout(
+        Duration::from_secs(15),
+        wait_for_diagnostics(client, &file_uri),
+    )
+    .await;
+
+    probe_hover(client, &file_uri, position).await
+}
+
+#[allow(deprecated)] // root_uri + workspace_folders both sent for maximal server compat
+async fn run_lsp_rename_session(
+    client: &mut LspClient,
+    root: Uri,
+    workspace_root: &Path,
+    file_uri: Uri,
+    text: String,
+    position: Option<Position>,
+    new_name: String,
+) -> Result<String> {
+    let init = request_with_timeout::<Initialize>(
+        client,
+        InitializeParams {
+            process_id: Some(std::process::id()),
+            root_uri: Some(root.clone()),
+            workspace_folders: Some(vec![WorkspaceFolder {
+                uri: root,
+                name: workspace_root
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| workspace_root.display().to_string()),
+            }]),
+            capabilities: ClientCapabilities {
+                text_document: Some(TextDocumentClientCapabilities {
+                    diagnostic: Some(DiagnosticClientCapabilities {
+                        dynamic_registration: None,
+                        related_document_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            client_info: Some(ClientInfo {
+                name: "grey-spike".into(),
+                version: None,
+            }),
+            ..Default::default()
+        },
+        REQUEST_TIMEOUT,
+    )
+    .await?;
+    println!(
+        "[spike-b] initialized: server={:?}",
+        init.server_info
+            .map(|i| format!("{} {}", i.name, i.version.unwrap_or_default()))
+    );
+
+    client.notify::<Initialized>(InitializedParams {}).await?;
+    client
+        .notify::<DidOpenTextDocument>(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: file_uri.clone(),
+                language_id: "rust".into(),
+                version: 1,
+                text,
+            },
+        })
+        .await?;
+
+    let _ = tokio::time::timeout(
+        Duration::from_secs(15),
+        wait_for_diagnostics(client, &file_uri),
+    )
+    .await;
+
+    probe_rename(client, &file_uri, position, new_name).await
+}
+
 async fn wait_for_diagnostics(client: &mut LspClient, uri: &Uri) -> Result<Vec<Diagnostic>> {
     loop {
         let msg = client.read_raw().await?;
@@ -787,6 +1056,135 @@ async fn probe_definition(
         Ok(Err(error)) => Err(anyhow!("definition unavailable: {error}")),
         Err(_) => Err(anyhow!("definition unavailable: request timed out")),
     }
+}
+
+async fn probe_hover(
+    client: &mut LspClient,
+    uri: &Uri,
+    position: Option<Position>,
+) -> Result<String> {
+    let Some(position) = position else {
+        return Ok("hover unavailable: no valid symbol position".into());
+    };
+    let params = HoverParams {
+        text_document_position_params: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            position,
+        },
+        work_done_progress_params: Default::default(),
+    };
+
+    match tokio::time::timeout(
+        Duration::from_secs(10),
+        client.request::<HoverRequest>(params),
+    )
+    .await
+    {
+        Ok(Ok(Some(hover))) => Ok(hover_contents_to_text(hover)),
+        Ok(Ok(None)) => Ok("hover unavailable".into()),
+        Ok(Err(error)) => Err(anyhow!("hover unavailable: {error}")),
+        Err(_) => Err(anyhow!("hover unavailable: request timed out")),
+    }
+}
+
+fn hover_contents_to_text(hover: Hover) -> String {
+    let mut output = match hover.contents {
+        HoverContents::Scalar(content) => hover_content_to_text(content),
+        HoverContents::Array(contents) => contents
+            .into_iter()
+            .map(hover_content_to_text)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        HoverContents::Markup(markup) => markup.value,
+    };
+    if output.is_empty() {
+        output.push_str("hover available but empty");
+    }
+    if let Some(range) = hover.range {
+        output.push_str(&format!(
+            " [range {}:{}-{}:{}]",
+            range.start.line + 1,
+            range.start.character + 1,
+            range.end.line + 1,
+            range.end.character + 1
+        ));
+    }
+    output
+}
+
+fn hover_content_to_text(content: lsp_types::MarkedString) -> String {
+    match content {
+        lsp_types::MarkedString::String(value) => value,
+        lsp_types::MarkedString::LanguageString(language) => {
+            format!("```{}\n{}\n```", language.language, language.value)
+        }
+    }
+}
+
+async fn probe_rename(
+    client: &mut LspClient,
+    uri: &Uri,
+    position: Option<Position>,
+    new_name: String,
+) -> Result<String> {
+    let Some(position) = position else {
+        return Ok("rename unavailable: no valid symbol position".into());
+    };
+    let params = RenameParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            position,
+        },
+        new_name,
+        work_done_progress_params: Default::default(),
+    };
+
+    match tokio::time::timeout(Duration::from_secs(10), client.request::<Rename>(params)).await {
+        Ok(Ok(Some(edit))) => Ok(format_workspace_edit(edit)),
+        Ok(Ok(None)) => Ok("rename unavailable".into()),
+        Ok(Err(error)) => Err(anyhow!("rename unavailable: {error}")),
+        Err(_) => Err(anyhow!("rename unavailable: request timed out")),
+    }
+}
+
+fn format_workspace_edit(edit: WorkspaceEdit) -> String {
+    let mut change_count: usize = 0;
+    let mut file_count: usize = 0;
+    if let Some(changes) = &edit.changes {
+        file_count += changes.len();
+        change_count += changes.values().map(|edits| edits.len()).sum::<usize>();
+    }
+    if let Some(document_changes) = &edit.document_changes {
+        match document_changes {
+            DocumentChanges::Edits(changes) => {
+                file_count += changes.len();
+                change_count += changes
+                    .iter()
+                    .map(|change| change.edits.len())
+                    .sum::<usize>();
+            }
+            DocumentChanges::Operations(changes) => {
+                file_count += changes.len();
+                change_count += changes
+                    .iter()
+                    .map(|change| match change {
+                        DocumentChangeOperation::Edit(text_edit) => text_edit.edits.len(),
+                        DocumentChangeOperation::Op(_) => 1,
+                    })
+                    .sum::<usize>();
+            }
+        }
+    }
+    if change_count == 0 {
+        return "rename unavailable: no changes".into();
+    }
+    let details = serde_json::to_string_pretty(&edit).unwrap_or_else(|_| String::new());
+    let mut output = format!(
+        "rename preview: {} file(s), {} change(s)\n",
+        file_count, change_count
+    );
+    output.push_str(&details);
+    output
 }
 
 async fn probe_references(
