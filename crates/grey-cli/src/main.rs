@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use futures_util::future::join_all;
 use grey_core::{
     config, Agent, AgentEvent, AgentOptions, AgentOutcome, CharApproxCounter, ChatMessage,
     ChatRequest, ContextManager, GreyConfig, Provider, Role, Session, SessionStore, SummaryEngine,
@@ -31,7 +32,7 @@ Keep changes scoped to the user's request, report tool failures honestly, and ne
 without verification evidence."#;
 const DEFAULT_HOOK_TIMEOUT_MS: u64 = 10_000;
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(
     name = "grey",
     version,
@@ -123,7 +124,7 @@ enum OutputFormat {
     Json,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum Command {
     /// P0 Spike A: streaming-render benchmark in a minimal TUI.
     #[command(name = "spike-a")]
@@ -171,9 +172,16 @@ enum Command {
         #[command(subcommand)]
         action: UsageAction,
     },
+    /// Multi-agent orchestration: run sub-agents in parallel and synthesize.
+    Orchestrate {
+        prompt: String,
+        /// Add as `name:task` pairs, e.g. `--agent coder:给出 patch 方案`.
+        #[arg(long, value_name = "name:task")]
+        agent: Vec<String>,
+    },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum ConfigAction {
     /// Print effective configuration with secrets masked.
     Show,
@@ -187,7 +195,7 @@ enum ConfigAction {
     Path,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum SessionAction {
     /// List recent sessions.
     List {
@@ -198,7 +206,7 @@ enum SessionAction {
     Show { id: String },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum ProviderAction {
     /// List all configured providers and their models.
     List,
@@ -206,7 +214,7 @@ enum ProviderAction {
     Show { id: String },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum CacheAction {
     /// Remove all cached responses.
     Clear,
@@ -214,7 +222,7 @@ enum CacheAction {
     Stats,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum UsageAction {
     /// Show token usage and cost for a session.
     Show { id: String },
@@ -242,6 +250,46 @@ struct HeadlessUsage {
     provider: String,
     model: String,
 }
+
+#[derive(Debug, Clone)]
+struct OrchestrateAgent {
+    name: String,
+    task: String,
+    system_prompt: String,
+}
+
+#[derive(Serialize)]
+struct OrchestrateAgentResult {
+    name: String,
+    task: String,
+    response: String,
+    provider: String,
+    model: String,
+    steps: usize,
+    cached: bool,
+}
+
+#[derive(Serialize)]
+struct OrchestrateOutput {
+    task: String,
+    subagents: Vec<OrchestrateAgentResult>,
+    synthesis: AgentOutcomeSummary,
+}
+
+#[derive(Serialize)]
+struct AgentOutcomeSummary {
+    response: String,
+    provider: String,
+    model: String,
+    steps: usize,
+    cached: bool,
+}
+
+const DEFAULT_ORCHESTRATE_AGENTS: &[(&str, &str)] = &[
+    ("researcher", "研究主任务并给出关键点、边界与风险。"),
+    ("coder", "给出最小可执行实现路径和文件级改动建议。"),
+    ("reviewer", "评估方案可测性、回归风险与遗漏项。"),
+];
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -282,7 +330,149 @@ async fn run_command(command: Command) -> Result<()> {
         Command::Providers { action } => run_providers(action),
         Command::Cache { action } => run_cache(action),
         Command::Usage { action } => run_usage(action),
+        Command::Orchestrate { prompt, agent } => run_orchestrate(prompt, agent).await,
     }
+}
+
+async fn run_orchestrate(task: String, raw_specs: Vec<String>) -> Result<()> {
+    let cli = Cli::parse();
+    let config = config::load()?;
+    let workspace = resolve_workspace(cli.workspace.as_deref())?;
+    let config = Arc::new(config);
+    let subagents = parse_orchestrate_agents(raw_specs)?;
+
+    let mut futures = Vec::with_capacity(subagents.len());
+    for agent in subagents {
+        let child_cli = cli.clone();
+        let config = config.clone();
+        let workspace = workspace.clone();
+        let task = task.clone();
+        futures.push(run_orchestrate_subagent(
+            child_cli, config, workspace, agent, task,
+        ));
+    }
+
+    let subagent_results = join_all(futures)
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut coordinator_cli = cli.clone();
+    coordinator_cli.no_save = true;
+    coordinator_cli.read_only = true;
+    coordinator_cli.auto_approve = false;
+    let (coordinator, _, _) =
+        build_agent_and_session(&coordinator_cli, &config, &workspace, false)?;
+    let synthesis = coordinator
+        .run_new(
+            "你是任务协调子代理，负责把子代理结论合成为可执行计划。",
+            build_coordinator_prompt(&task, &subagent_results),
+            None,
+        )
+        .await?;
+
+    if cli.format == OutputFormat::Json {
+        println!(
+            "{}",
+            serde_json::to_string(&OrchestrateOutput {
+                task,
+                subagents: subagent_results,
+                synthesis: AgentOutcomeSummary {
+                    response: synthesis.response,
+                    provider: synthesis.provider_id,
+                    model: synthesis.model,
+                    steps: synthesis.steps,
+                    cached: synthesis.cached,
+                },
+            })?
+        );
+        return Ok(());
+    }
+
+    println!("task: {}", task);
+    for result in &subagent_results {
+        println!(
+            "\n[{name}] provider={provider} model={model} steps={steps} cached={cached}",
+            name = result.name,
+            provider = result.provider,
+            model = result.model,
+            steps = result.steps,
+            cached = result.cached
+        );
+        println!("{}", result.response);
+    }
+    println!("\n== Synthesis ==\n{}", synthesis.response);
+    Ok(())
+}
+
+fn parse_orchestrate_agents(raw_specs: Vec<String>) -> Result<Vec<OrchestrateAgent>> {
+    if raw_specs.is_empty() {
+        return Ok(default_orchestrate_agents());
+    }
+    raw_specs
+        .into_iter()
+        .map(|raw| {
+            let (name, task) = raw.split_once(':').ok_or_else(|| {
+                anyhow::anyhow!("invalid --agent spec `{raw}`, expected name:task")
+            })?;
+            Ok(OrchestrateAgent {
+                name: name.to_string(),
+                task: task.to_string(),
+                system_prompt: format!("你是{name}子代理，直接输出结论即可。"),
+            })
+        })
+        .collect()
+}
+
+fn default_orchestrate_agents() -> Vec<OrchestrateAgent> {
+    DEFAULT_ORCHESTRATE_AGENTS
+        .iter()
+        .map(|(name, task)| OrchestrateAgent {
+            name: (*name).to_string(),
+            task: (*task).to_string(),
+            system_prompt: format!("你是{name}子代理，直接输出结论即可。"),
+        })
+        .collect()
+}
+
+fn build_coordinator_prompt(task: &str, subagents: &[OrchestrateAgentResult]) -> String {
+    let mut chunks = Vec::with_capacity(subagents.len() + 2);
+    chunks.push(format!("主任务: {task}"));
+    for result in subagents {
+        chunks.push(format!(
+            "[{}]\n子任务: {}\n结论:\n{}\n",
+            result.name, result.task, result.response
+        ));
+    }
+    chunks.push("请输出：1)最终结论 2)最小落地步骤 3)测试检查清单".to_string());
+    chunks.join("\n")
+}
+
+async fn run_orchestrate_subagent(
+    mut cli: Cli,
+    config: Arc<GreyConfig>,
+    workspace: PathBuf,
+    agent: OrchestrateAgent,
+    task: String,
+) -> Result<OrchestrateAgentResult> {
+    cli.no_save = true;
+    cli.read_only = true;
+    cli.auto_approve = false;
+    let (agent_client, _, existing) = build_agent_and_session(&cli, &config, &workspace, false)?;
+    let _ = existing;
+    let prompt = format!("主任务: {task}\n子任务: {}\n请直接输出结论。", agent.task);
+    let outcome = agent_client
+        .run_new(agent.system_prompt, prompt, None)
+        .await?;
+    Ok(OrchestrateAgentResult {
+        name: agent.name,
+        task: agent.task,
+        response: outcome.response,
+        provider: outcome.provider_id,
+        model: outcome.model,
+        steps: outcome.steps,
+        cached: outcome.cached,
+    })
 }
 
 async fn run_headless(

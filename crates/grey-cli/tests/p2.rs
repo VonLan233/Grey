@@ -302,3 +302,59 @@ pre_prompt = ["printf 'from hook pre prompt'"]
         .unwrap()
         .contains("from hook pre prompt"));
 }
+
+#[test]
+fn orchestrate_runs_default_subagents_and_returns_json() {
+    let env = temp_home();
+    let output = env
+        .command()
+        .args(["orchestrate", "优化这个仓库的文档结构", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["task"].as_str().unwrap(), "优化这个仓库的文档结构");
+    let subagents = value["subagents"].as_array().unwrap();
+    assert_eq!(subagents.len(), 3);
+    for item in subagents {
+        assert!(item["response"].as_str().unwrap().contains("（mock"));
+        assert!(item["name"].as_str().is_some());
+    }
+    let synthesis = &value["synthesis"];
+    assert!(synthesis["response"].as_str().is_some());
+    assert!(synthesis["provider"].as_str().is_some());
+}
+
+#[test]
+fn orchestrate_custom_agent_spec_is_parsed() {
+    let env = temp_home();
+    let output = env
+        .command()
+        .args([
+            "orchestrate",
+            "帮我改一个 bug",
+            "--agent",
+            "planner:只给出排障顺序",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let subagents = value["subagents"].as_array().unwrap();
+    assert_eq!(subagents.len(), 1);
+    assert_eq!(subagents[0]["name"].as_str().unwrap(), "planner");
+    assert!(subagents[0]["response"]
+        .as_str()
+        .unwrap()
+        .contains("（mock"));
+}
