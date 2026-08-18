@@ -367,6 +367,56 @@ fn orchestrate_custom_agent_spec_is_parsed() {
 }
 
 #[test]
+fn orchestrate_share_context_summary_injects_session_tail() {
+    let env = temp_home();
+
+    let first = env
+        .command()
+        .args(["--format", "json", "前置上下文：会话共享标记-abc-123"])
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_json: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    let session_id = first_json["session_id"].as_str().unwrap();
+
+    let output = env
+        .command()
+        .args([
+            "orchestrate",
+            "请复用上下文做一次建议",
+            "--session",
+            session_id,
+            "--share-context",
+            "summary",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let subagents = value["subagents"].as_array().unwrap();
+    assert_eq!(subagents.len(), 3);
+
+    let contains_marker = subagents.iter().all(|agent| {
+        agent["response"]
+            .as_str()
+            .unwrap()
+            .contains("会话共享标记-abc-123")
+    });
+    assert!(contains_marker);
+}
+
+#[test]
 fn orchestrate_subagents_do_not_leak_other_agents_context() {
     let env = temp_home();
     let marker_a = "planner only";

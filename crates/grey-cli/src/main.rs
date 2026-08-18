@@ -180,6 +180,9 @@ enum Command {
         /// Add as `name:task` pairs, e.g. `--agent coder:给出 patch 方案`.
         #[arg(long, value_name = "name:task")]
         agent: Vec<String>,
+        /// Share selected context fields with every sub-agent (`task`, `summary`).
+        #[arg(long, value_enum)]
+        share_context: Vec<OrchestrateShareContext>,
     },
 }
 
@@ -258,6 +261,13 @@ struct OrchestrateAgent {
     name: String,
     task: String,
     system_prompt: String,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+enum OrchestrateShareContext {
+    Task,
+    Summary,
 }
 
 #[derive(Serialize)]
@@ -357,17 +367,27 @@ async fn run_command(cli: &Cli, command: Command) -> Result<()> {
         Command::Providers { action } => run_providers(action),
         Command::Cache { action } => run_cache(action),
         Command::Usage { action } => run_usage(action),
-        Command::Orchestrate { prompt, agent } => run_orchestrate(cli, prompt, agent).await,
+        Command::Orchestrate {
+            prompt,
+            agent,
+            share_context,
+        } => run_orchestrate(cli, prompt, agent, share_context).await,
     }
 }
 
 const ORCHESTRATE_AGENT_TIMEOUT_SECS: u64 = 120;
 
-async fn run_orchestrate(cli: &Cli, task: String, raw_specs: Vec<String>) -> Result<()> {
+async fn run_orchestrate(
+    cli: &Cli,
+    task: String,
+    raw_specs: Vec<String>,
+    share_context: Vec<OrchestrateShareContext>,
+) -> Result<()> {
     let config = config::load()?;
     let workspace = resolve_workspace(cli.workspace.as_deref())?;
     let config = Arc::new(config);
     let subagents = parse_orchestrate_agents(raw_specs)?;
+    let shared_context = build_orchestrate_shared_context(&task, &share_context, cli, &workspace)?;
 
     let mut futures = Vec::with_capacity(subagents.len());
     for agent in subagents {
@@ -375,8 +395,14 @@ async fn run_orchestrate(cli: &Cli, task: String, raw_specs: Vec<String>) -> Res
         let config = config.clone();
         let workspace = workspace.clone();
         let task = task.clone();
+        let shared_context = shared_context.clone();
         futures.push(run_orchestrate_subagent(
-            child_cli, config, workspace, agent, task,
+            child_cli,
+            config,
+            workspace,
+            agent,
+            task,
+            shared_context,
         ));
     }
 
@@ -508,6 +534,7 @@ async fn run_orchestrate_subagent(
     workspace: PathBuf,
     agent: OrchestrateAgent,
     task: String,
+    shared_context: String,
 ) -> OrchestrateAgentResult {
     cli.no_save = true;
     cli.read_only = true;
@@ -549,9 +576,15 @@ async fn run_orchestrate_subagent(
         };
     let agent_provider = agent_client.provider_id().to_string();
     let _ = existing;
+    let context_line = if shared_context.is_empty() {
+        String::new()
+    } else {
+        format!("\n共享上下文（白名单）:\n{shared_context}\n")
+    };
     let prompt = format!(
-        "{}\n主任务: {task}\n子任务: {}\n请按固定 JSON 输出。\n",
+        "{}\n{}主任务: {task}\n子任务: {}\n请按固定 JSON 输出。\n",
         build_orchestrate_subagent_system_prompt(&agent.name),
+        context_line,
         agent.task
     );
     let run = agent_client.run_new(agent.system_prompt, prompt, None);
@@ -636,6 +669,105 @@ fn parse_orchestrate_contract(raw: &str) -> OrchestrateAgentContract {
         return normalize_orchestrate_contract(contract);
     }
     fallback_orchestrate_contract(raw)
+}
+
+fn build_orchestrate_shared_context(
+    task: &str,
+    share_context: &[OrchestrateShareContext],
+    cli: &Cli,
+    workspace: &Path,
+) -> Result<String> {
+    let mut sections = Vec::new();
+    let include_task = share_context
+        .iter()
+        .any(|context| matches!(context, OrchestrateShareContext::Task));
+    if include_task {
+        sections.push(format!("主任务: {task}"));
+    }
+
+    let include_summary = share_context
+        .iter()
+        .any(|context| matches!(context, OrchestrateShareContext::Summary));
+    if include_summary {
+        if let Some(session) = load_orchestrate_session(cli, workspace)? {
+            let summary = compact_session_tail(&session.messages, 6);
+            if !summary.is_empty() {
+                sections.push(format!("会话摘要:\n{summary}"));
+            }
+        }
+    }
+
+    Ok(sections.join("\n"))
+}
+
+fn load_orchestrate_session(cli: &Cli, workspace: &Path) -> Result<Option<grey_core::Session>> {
+    if cli.session.is_none() && !cli.continue_session {
+        return Ok(None);
+    }
+
+    let store = SessionStore::open(&session_database_path())?;
+    let workspace_text = workspace.to_string_lossy();
+    let session = if let Some(id) = &cli.session {
+        Some(
+            store
+                .load(id)?
+                .context(format!("session not found: {id}"))?,
+        )
+    } else {
+        store.latest_for_workspace(&workspace_text)?
+    };
+
+    match session {
+        Some(session) if session.workspace == workspace_text => Ok(Some(session)),
+        Some(session) => {
+            bail!(
+                "session workspace mismatch: stored {}, current {}",
+                session.workspace,
+                workspace.display()
+            )
+        }
+        None => Ok(None),
+    }
+}
+
+fn compact_session_tail(messages: &[grey_core::ChatMessage], max_messages: usize) -> String {
+    let visible: Vec<&grey_core::ChatMessage> = messages
+        .iter()
+        .filter(|message| message.role != Role::Tool)
+        .rev()
+        .take(max_messages)
+        .collect();
+    visible
+        .into_iter()
+        .rev()
+        .map(|message| {
+            format!(
+                "[{}] {}",
+                match message.role {
+                    Role::System => "system",
+                    Role::User => "user",
+                    Role::Assistant => "assistant",
+                    Role::Tool => "tool",
+                },
+                compact_message_preview(&message.content)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn compact_message_preview(content: &str) -> String {
+    let max_chars = 180;
+    let chars: Vec<char> = content.chars().collect();
+    if chars.len() <= max_chars {
+        content.to_string()
+    } else {
+        chars
+            .into_iter()
+            .take(max_chars)
+            .chain("...".chars())
+            .collect()
+    }
 }
 
 fn extract_orchestrate_json(raw: &str) -> Option<String> {

@@ -27,15 +27,15 @@
 | 子 Agent 并行执行 | ✅ | `run_orchestrate` + `join_all` |
 | 子 Agent 协作回填 | ✅ | `build_coordinator_prompt` + `synthesis` |
 | 结构化契约解析 | ✅ | `OrchestrateAgentContract` + `parse_orchestrate_contract` |
+| 共享上下文白名单 | ✅ | `--share-context task|summary` + `orchestrate_share_context_summary_injects_session_tail` |
 | 上下文隔离验证 | ✅ | `orchestrate_subagents_do_not_leak_other_agents_context` |
 | MCP/Hook 接入复用 | ✅ | `build_agent_and_session` 与现有工具链复用 |
 
 ## 四、尚未完成（P3 to-do）
 
-1. 子 Agent 共享上下文策略（显式白名单、摘要共享）；
-2. 并发失败重试/降级策略细化（当前为基础超时+错误短路）；
-3. 子 Agent contract 与主协调器输出的 schema 校验增强（如 JSON Schema）；
-4. 子 agent 面板渲染（TUI）与会话化记忆持久化。
+1. 并发失败重试/降级策略细化（当前为基础超时+错误短路）；
+2. 子 Agent contract 与主协调器输出的 schema 校验增强（如 JSON Schema）；
+3. 子 agent 面板渲染（TUI）与会话化记忆持久化。
 
 ## 五、建议下一步
 
