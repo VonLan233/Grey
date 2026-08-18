@@ -1,11 +1,13 @@
 //! Bounded provider/tool loop shared by the headless CLI and TUI.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Result};
 use futures_util::StreamExt;
 use serde::Serialize;
+use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::{
@@ -229,6 +231,7 @@ impl Agent {
         let definitions = self.tools.definitions();
         let mut total_usage = Usage::default();
         let mut cached = false;
+        let mut semantic_view_cache: HashMap<(String, String), String> = HashMap::new();
 
         for step in 1..=self.options.max_steps {
             let (prepared, audit) = self.context.prepare(&messages).await;
@@ -302,7 +305,12 @@ impl Agent {
                         send_event(events, AgentEvent::ToolStarted(call.clone()));
                         let result = self.tools.execute(&call).await;
                         send_event(events, AgentEvent::ToolFinished(result.clone()));
-                        messages.push(ChatMessage::tool_result(&call, result.model_content()));
+                        self.push_tool_result_messages(
+                            &call,
+                            result,
+                            &mut messages,
+                            &mut semantic_view_cache,
+                        );
                     }
                     continue;
                 }
@@ -370,7 +378,12 @@ impl Agent {
                 send_event(events, AgentEvent::ToolStarted(call.clone()));
                 let result = self.tools.execute(&call).await;
                 send_event(events, AgentEvent::ToolFinished(result.clone()));
-                messages.push(ChatMessage::tool_result(&call, result.model_content()));
+                self.push_tool_result_messages(
+                    &call,
+                    result,
+                    &mut messages,
+                    &mut semantic_view_cache,
+                );
             }
         }
 
@@ -542,6 +555,65 @@ impl Agent {
         );
         tokio::time::sleep(self.options.retry_delay).await;
     }
+
+    fn push_tool_result_messages(
+        &self,
+        call: &ToolCall,
+        result: ToolResult,
+        messages: &mut Vec<ChatMessage>,
+        semantic_view_cache: &mut HashMap<(String, String), String>,
+    ) {
+        messages.push(ChatMessage::tool_result(call, result.model_content()));
+        let Some(summary) = Self::semantic_view_summary(call, &result) else {
+            return;
+        };
+        let key = (summary.tool.clone(), summary.path.clone());
+        let should_emit = semantic_view_cache
+            .get(&key)
+            .is_none_or(|cached| cached != &summary.message);
+        if should_emit {
+            semantic_view_cache.insert(key, summary.message.clone());
+            messages.push(ChatMessage::new(Role::System, summary.message));
+        }
+    }
+
+    fn semantic_view_summary(
+        call: &ToolCall,
+        result: &ToolResult,
+    ) -> Option<LspSemanticViewSummary> {
+        if !call.name.starts_with("lsp_") || !result.success {
+            return None;
+        }
+
+        #[derive(serde::Deserialize)]
+        struct CompactToolOutput {
+            tool: String,
+            path: String,
+            count: usize,
+            shown: usize,
+            truncated: bool,
+            compact: Value,
+        }
+
+        let parsed = serde_json::from_str::<CompactToolOutput>(&result.output).ok()?;
+        if parsed.tool != call.name {
+            return None;
+        }
+
+        let message = compact_lsp_summary(
+            &parsed.tool,
+            &parsed.path,
+            parsed.count,
+            parsed.shown,
+            parsed.truncated,
+            parsed.compact,
+        );
+        Some(LspSemanticViewSummary {
+            tool: parsed.tool,
+            path: parsed.path,
+            message,
+        })
+    }
 }
 
 fn unix_timestamp() -> i64 {
@@ -549,6 +621,100 @@ fn unix_timestamp() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+struct LspSemanticViewSummary {
+    tool: String,
+    path: String,
+    message: String,
+}
+
+fn compact_lsp_summary(
+    tool: &str,
+    path: &str,
+    count: usize,
+    shown: usize,
+    truncated: bool,
+    compact: Value,
+) -> String {
+    let mut message = format!("[semantic-view] {tool} path={path} shown={shown} total={count}");
+    if truncated {
+        message.push_str(" truncated");
+    }
+    for line in compact_preview(tool, &compact) {
+        message.push('\n');
+        message.push_str(&line);
+    }
+    message
+}
+
+fn compact_preview(tool: &str, compact: &Value) -> Vec<String> {
+    compact
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .take(3)
+                .filter_map(|item| compact_preview_line(tool, item))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn compact_preview_line(tool: &str, item: &Value) -> Option<String> {
+    match tool {
+        "lsp_diagnostics" => {
+            let message = item.get("message")?.as_str()?;
+            let line = item
+                .get("line")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            let severity = item
+                .get("severity")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown");
+            Some(format!(
+                "- line {line} [{severity}] {}",
+                compact_text(message, 120)
+            ))
+        }
+        "lsp_definition" | "lsp_references" => {
+            let path = item
+                .get("path")
+                .or_else(|| item.get("uri"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let line = item
+                .get("start_line")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            Some(format!("- {path}:{line}"))
+        }
+        "lsp_symbols" => {
+            let name = item.get("name").and_then(|value| value.as_str())?;
+            let kind = item
+                .get("kind")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            Some(format!("- {name} {kind}"))
+        }
+        "lsp_hover" | "lsp_rename" => {
+            let text = item.get("text")?.as_str()?;
+            Some(format!("- {}", compact_text(text, 120)))
+        }
+        _ => None,
+    }
+}
+
+fn compact_text(message: &str, max_chars: usize) -> String {
+    let normalized = message.replace('\n', " ");
+    if normalized.chars().count() <= max_chars {
+        return normalized;
+    }
+    let keep = max_chars.saturating_sub(1);
+    let mut compact: String = normalized.chars().take(keep).collect();
+    compact.push('…');
+    compact
 }
 
 struct CompletedTurn {
@@ -625,6 +791,30 @@ mod tests {
         }
     }
 
+    struct ReusableTools {
+        output: String,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for ReusableTools {
+        fn definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition {
+                name: "lsp_diagnostics".into(),
+                description: "lsp".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                risk: ToolRisk::ReadOnly,
+            }]
+        }
+
+        async fn execute(&self, call: &ToolCall) -> ToolResult {
+            if call.name != "lsp_diagnostics" {
+                ToolResult::failure(call, "unsupported tool")
+            } else {
+                ToolResult::success(call, &self.output)
+            }
+        }
+    }
+
     struct FixedProvider {
         id: &'static str,
         events: Vec<ProviderEvent>,
@@ -694,6 +884,67 @@ mod tests {
             .unwrap()
             .content
             .contains("contents"));
+    }
+
+    #[tokio::test]
+    async fn injects_semantic_view_for_repeated_lsp_diagnostics_tool_calls() {
+        let call = ToolCall {
+            id: "call-1".into(),
+            name: "lsp_diagnostics".into(),
+            arguments: serde_json::json!({"path": "src/main.rs"}),
+        };
+        let call_revisit = ToolCall {
+            id: "call-2".into(),
+            name: "lsp_diagnostics".into(),
+            arguments: serde_json::json!({"path": "src/main.rs"}),
+        };
+        let compact = serde_json::json!({
+            "tool": "lsp_diagnostics",
+            "path": "src/main.rs",
+            "count": 1,
+            "shown": 1,
+            "truncated": false,
+            "compact": [
+                {"message": "unused variable", "line": 12, "severity": "warning"}
+            ]
+        })
+        .to_string();
+        let provider = Arc::new(ScriptedProvider {
+            turns: Mutex::new(VecDeque::from([
+                vec![
+                    ProviderEvent::ToolCall(call.clone()),
+                    ProviderEvent::Done(Usage::default()),
+                ],
+                vec![
+                    ProviderEvent::ToolCall(call_revisit.clone()),
+                    ProviderEvent::Done(Usage::default()),
+                ],
+                vec![
+                    ProviderEvent::Delta("ok".into()),
+                    ProviderEvent::Done(Usage::default()),
+                ],
+            ])),
+            requests: Mutex::new(Vec::new()),
+        });
+        let mut options = AgentOptions::new("model");
+        options.max_steps = 3;
+        options.retries = 0;
+        let outcome = Agent::new(
+            provider,
+            Arc::new(ReusableTools { output: compact }),
+            ContextManager::default(),
+            options,
+        )
+        .run_new("system", "please inspect", None)
+        .await
+        .unwrap();
+
+        let system_views = outcome
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::System)
+            .filter(|message| message.content.starts_with("[semantic-view]"));
+        assert_eq!(system_views.count(), 1);
     }
 
     #[tokio::test]

@@ -812,6 +812,7 @@ mod tests {
             dropped_messages: 3,
             retained_tokens: 1000,
             summary_created: false,
+            tool_outputs_deduplicated: 0,
             tool_outputs_truncated: 0,
             budget: grey_core::context::TokenBudget::default(),
         }));

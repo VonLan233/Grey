@@ -25,6 +25,7 @@ pub struct ContextAudit {
     pub dropped_messages: usize,
     pub retained_tokens: u64,
     pub summary_created: bool,
+    pub tool_outputs_deduplicated: usize,
     pub tool_outputs_truncated: usize,
     pub budget: TokenBudget,
 }
@@ -82,6 +83,7 @@ impl ContextManager {
     pub async fn prepare(&self, messages: &[ChatMessage]) -> (Vec<ChatMessage>, ContextAudit) {
         let original_chars: usize = messages.iter().map(message_size).sum();
         let mut working = messages.to_vec();
+        let tool_outputs_deduplicated = self.deduplicate_semantic_tool_messages(&mut working);
         let partition_truncated = self.apply_partition_budgets(&mut working);
         let partition_tokens = self.count_tokens(&working);
 
@@ -94,6 +96,7 @@ impl ContextManager {
                     dropped_messages: messages.len().saturating_sub(working.len()),
                     retained_tokens: partition_tokens,
                     summary_created: false,
+                    tool_outputs_deduplicated,
                     tool_outputs_truncated: partition_truncated,
                     budget: self.budget,
                 },
@@ -115,6 +118,7 @@ impl ContextManager {
                     dropped_messages: dropped,
                     retained_tokens: after_trim_tokens,
                     summary_created: false,
+                    tool_outputs_deduplicated,
                     tool_outputs_truncated: truncated,
                     budget: self.budget,
                 },
@@ -135,6 +139,7 @@ impl ContextManager {
                     dropped_messages: dropped,
                     retained_tokens: after_summary_tokens,
                     summary_created,
+                    tool_outputs_deduplicated,
                     tool_outputs_truncated: truncated,
                     budget: self.budget,
                 },
@@ -166,6 +171,7 @@ impl ContextManager {
                 dropped_messages: dropped,
                 retained_tokens,
                 summary_created,
+                tool_outputs_deduplicated,
                 tool_outputs_truncated: truncated,
                 budget: self.budget,
             },
@@ -338,6 +344,40 @@ impl ContextManager {
         }
         Self::strip_leading_tool_messages(messages);
     }
+
+    fn deduplicate_semantic_tool_messages(&self, messages: &mut Vec<ChatMessage>) -> usize {
+        let mut seen = std::collections::HashSet::<(String, String)>::new();
+        let mut removed = 0;
+        let mut index = messages.len();
+        while index > 0 {
+            index -= 1;
+            if messages[index].role != Role::System {
+                continue;
+            }
+            let Some((tool, path)) = parse_semantic_tool_key(&messages[index].content) else {
+                continue;
+            };
+            if seen.insert((tool, path)) {
+                continue;
+            }
+            messages.remove(index);
+            removed += 1;
+        }
+        removed
+    }
+}
+
+fn parse_semantic_tool_key(content: &str) -> Option<(String, String)> {
+    let prefix = "[semantic-view]";
+    if !content.starts_with(prefix) {
+        return None;
+    }
+    let mut parts = content[prefix.len()..].split_whitespace();
+    let tool = parts.next()?.trim().to_string();
+    let path = parts
+        .find_map(|part| part.strip_prefix("path="))
+        .map(str::to_string)?;
+    Some((tool, path))
 }
 
 fn truncate_content(content: &mut String, budget_chars: usize) -> bool {
@@ -397,6 +437,35 @@ mod tests {
         assert_eq!(prepared.first().unwrap().role, Role::System);
         assert_eq!(prepared.last().unwrap().content, "latest");
         assert!(audit.dropped_messages > 0);
+    }
+
+    #[tokio::test]
+    async fn deduplicates_lsp_semantic_views_by_path() {
+        let cm = ContextManager::new(10_000);
+        let messages = vec![
+            ChatMessage::new(
+                Role::System,
+                "[semantic-view] lsp_diagnostics path=src/main.rs shown=1 total=1",
+            ),
+            ChatMessage::new(
+                Role::System,
+                "[semantic-view] lsp_diagnostics path=src/main.rs shown=1 total=1",
+            ),
+            ChatMessage::new(
+                Role::System,
+                "[semantic-view] lsp_symbols path=src/lib.rs shown=2 total=2",
+            ),
+            ChatMessage::new(Role::User, "ask"),
+        ];
+        let (prepared, audit) = cm.prepare(&messages).await;
+        assert_eq!(
+            prepared
+                .iter()
+                .filter(|message| message.content.starts_with("[semantic-view]"))
+                .count(),
+            2
+        );
+        assert_eq!(audit.tool_outputs_deduplicated, 1);
     }
 
     #[tokio::test]

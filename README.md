@@ -13,7 +13,8 @@ Grey 已完成 P0 技术验证，并具备 P1 的首个可用纵向闭环：同�
 当前版本是 **v0.3/P3 MVP**（非 v1.0）。P2 已完成多 Provider 路由、故障切换、
 上下文预算、请求缓存和 usage 持久化；MCP 与 Hook 也已接入（Prompt Hook、工具前后
 Hook、MCP Command Tool）；P3 已补齐多 Agent 编排与会话化记忆持久化。
-完整 LSP 语义工具、WASM 插件、图片、桌面提醒与发布打包仍在 P4–P7。
+LSP 工具现已支持 `lsp_*` 结果的路径级语义视图注入会话（并按 tool/path 去重），
+WASM 插件、图片、桌面提醒与发布打包仍在 P5–P7。
 
 ## 已实现
 
@@ -30,6 +31,7 @@ Hook、MCP Command Tool）；P3 已补齐多 Agent 编排与会话化记忆持�
 - 动态 `[[providers]]` 注册表、planning/coding/fast/default 路由和 CLI 覆盖
 - Provider/model fallback：只在尚未产生可见输出时切换，并带失败冷却与恢复
 - system/history/tool/input 分区预算、工具输出 token 截断、滚动摘要和裁剪审计事件
+- LSP 语义视图注入：`lsp_*` 工具结果会按文件路径写入紧凑上下文摘要，去重计数暴露在 `tool_outputs_deduplicated`
 - SQLite 请求缓存（TTL/LRU/provider 隔离）与 `--no-cache` 控制
 - 每会话 token/cost usage 记录，跨 CLI 调用累积并由 `usage show/summary` 查询
 - MCP 命令工具与 Hook：`pre_prompt`、`pre_tool_call`、`post_tool_call`
