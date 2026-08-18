@@ -148,7 +148,7 @@ impl LspTools {
                 code: diagnostic
                     .code
                     .as_ref()
-                    .map(std::string::ToString::to_string)
+                    .map(diagnostic_code_to_string)
                     .unwrap_or_default(),
                 source: diagnostic.source.clone().unwrap_or_default(),
                 message: diagnostic.message.replace('\n', " "),
@@ -329,6 +329,13 @@ impl LspTools {
         );
         Ok(canonical)
     }
+}
+
+fn diagnostic_code_to_string(code: &impl serde::Serialize) -> String {
+    serde_json::to_string(code)
+        .unwrap_or_default()
+        .trim_matches('"')
+        .to_string()
 }
 
 #[async_trait]
