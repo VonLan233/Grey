@@ -288,7 +288,13 @@ struct OrchestrateAgentResult {
     error: Option<String>,
 }
 
+const ORCHESTRATE_MAX_SUMMARY_CHARS: usize = 500;
+const ORCHESTRATE_MAX_LIST_ITEMS: usize = 24;
+const ORCHESTRATE_MAX_LIST_ITEM_CHARS: usize = 180;
+const ORCHESTRATE_MAX_SYNTHESIS_RESPONSE_CHARS: usize = 1024;
+
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct OrchestrateAgentContract {
     #[serde(default = "default_orchestrate_status")]
     status: String,
@@ -300,6 +306,22 @@ struct OrchestrateAgentContract {
     risks: Vec<String>,
     #[serde(default)]
     artifacts: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default)]
+#[serde(default)]
+#[serde(deny_unknown_fields)]
+struct OrchestrateCoordinatorContract {
+    #[serde(default)]
+    response: String,
+    #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    steps: usize,
+    #[serde(default)]
+    cached: bool,
 }
 
 fn default_orchestrate_status() -> String {
@@ -416,13 +438,15 @@ async fn run_orchestrate(
     coordinator_cli.auto_approve = false;
     let (coordinator, _, _) =
         build_agent_and_session(&coordinator_cli, &config, &workspace, false)?;
-    let synthesis = coordinator
+    let synthesis_outcome = coordinator
         .run_new(
             "你是任务协调子代理，负责把子代理结论合成为可执行计划。",
             build_coordinator_prompt(&task, &subagent_results),
             None,
         )
         .await?;
+    let synthesis =
+        parse_orchestrate_coordinator_contract(&synthesis_outcome.response, &synthesis_outcome);
 
     if cli.format == OutputFormat::Json {
         println!(
@@ -432,7 +456,7 @@ async fn run_orchestrate(
                 subagents: subagent_results,
                 synthesis: AgentOutcomeSummary {
                     response: synthesis.response,
-                    provider: synthesis.provider_id,
+                    provider: synthesis.provider,
                     model: synthesis.model,
                     steps: synthesis.steps,
                     cached: synthesis.cached,
@@ -717,6 +741,21 @@ fn parse_orchestrate_contract(raw: &str) -> OrchestrateAgentContract {
     fallback_orchestrate_contract(raw)
 }
 
+fn parse_orchestrate_coordinator_contract(
+    raw: &str,
+    fallback: &AgentOutcome,
+) -> OrchestrateCoordinatorContract {
+    if let Some(json_blob) = extract_orchestrate_json(raw) {
+        if let Ok(contract) = serde_json::from_str::<OrchestrateCoordinatorContract>(&json_blob) {
+            return normalize_orchestrate_coordinator_contract(contract, fallback);
+        }
+    }
+    if let Ok(contract) = serde_json::from_str::<OrchestrateCoordinatorContract>(raw.trim()) {
+        return normalize_orchestrate_coordinator_contract(contract, fallback);
+    }
+    fallback_orchestrate_coordinator_contract(raw, fallback)
+}
+
 fn build_orchestrate_shared_context(
     task: &str,
     share_context: &[OrchestrateShareContext],
@@ -816,6 +855,30 @@ fn compact_message_preview(content: &str) -> String {
     }
 }
 
+fn compact_message_preview_with_limit(content: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = content.chars().collect();
+    if chars.len() <= max_chars {
+        content.to_string()
+    } else {
+        chars
+            .into_iter()
+            .take(max_chars)
+            .chain("...".chars())
+            .collect()
+    }
+}
+
+fn sanitize_contract_list(values: Vec<String>) -> Vec<String> {
+    values
+        .into_iter()
+        .map(|value| {
+            compact_message_preview_with_limit(value.trim(), ORCHESTRATE_MAX_LIST_ITEM_CHARS)
+        })
+        .filter(|value| !value.is_empty())
+        .take(ORCHESTRATE_MAX_LIST_ITEMS)
+        .collect()
+}
+
 fn is_retriable_subagent_error(error: &str) -> bool {
     let lower = error.to_lowercase();
     const TRANSIENT_HINTS: &[&str] = &[
@@ -886,7 +949,62 @@ fn normalize_orchestrate_contract(
     if contract.summary.is_empty() {
         contract.summary = "no summary provided".to_string();
     }
+    contract.summary =
+        compact_message_preview_with_limit(&contract.summary, ORCHESTRATE_MAX_SUMMARY_CHARS);
+    contract.recommendations = sanitize_contract_list(contract.recommendations);
+    contract.risks = sanitize_contract_list(contract.risks);
+    contract.artifacts = sanitize_contract_list(contract.artifacts);
     contract
+}
+
+fn normalize_orchestrate_coordinator_contract(
+    mut contract: OrchestrateCoordinatorContract,
+    fallback: &AgentOutcome,
+) -> OrchestrateCoordinatorContract {
+    if contract.response.is_empty() {
+        contract.response = fallback.response.clone();
+    }
+    if contract.response.is_empty() {
+        contract.response = "no synthesis output".to_string();
+    }
+    if contract.provider.is_empty() {
+        contract.provider = fallback.provider_id.clone();
+    }
+    if contract.model.is_empty() {
+        contract.model = fallback.model.clone();
+    }
+    if contract.steps == 0 {
+        contract.steps = fallback.steps;
+    }
+    contract.cached |= fallback.cached;
+    contract.response = compact_message_preview_with_limit(
+        &contract.response,
+        ORCHESTRATE_MAX_SYNTHESIS_RESPONSE_CHARS,
+    );
+    contract
+}
+
+fn fallback_orchestrate_coordinator_contract(
+    raw: &str,
+    fallback: &AgentOutcome,
+) -> OrchestrateCoordinatorContract {
+    let response = raw.lines().next().unwrap_or_default().trim();
+    let response = if response.is_empty() {
+        fallback.response.clone()
+    } else {
+        response.to_string()
+    };
+    OrchestrateCoordinatorContract {
+        response: if response.is_empty() {
+            "no synthesis output".to_string()
+        } else {
+            response
+        },
+        provider: fallback.provider_id.clone(),
+        model: fallback.model.clone(),
+        steps: fallback.steps,
+        cached: fallback.cached,
+    }
 }
 
 async fn run_headless(
@@ -1729,6 +1847,83 @@ mod tests {
         assert!(contract.recommendations.is_empty());
         assert!(contract.risks.is_empty());
         assert!(contract.artifacts.is_empty());
+    }
+
+    #[test]
+    fn parse_orchestrate_contract_rejects_unknown_fields() {
+        let raw = r#"{"status":"ok","summary":"done","recommendations":[],"risks":[],"artifacts":[],"unexpected":"bad"}"#;
+        let contract = parse_orchestrate_contract(raw);
+        assert_eq!(contract.status, "warn");
+        assert!(contract.summary.starts_with("{\"status\""));
+        assert_eq!(contract.recommendations, vec!["response not in schema"]);
+        assert_eq!(contract.risks, vec!["requires normalization"]);
+        assert!(contract.artifacts.is_empty());
+    }
+
+    #[test]
+    fn parse_orchestrate_contract_rejects_invalid_list_types() {
+        let raw =
+            r#"{"status":"ok","summary":"done","recommendations":"bad","risks":[],"artifacts":[]}"#;
+        let contract = parse_orchestrate_contract(raw);
+        assert_eq!(contract.status, "warn");
+        assert!(contract.summary.starts_with("{\"status\""));
+        assert_eq!(contract.recommendations, vec!["response not in schema"]);
+        assert_eq!(contract.risks, vec!["requires normalization"]);
+        assert!(contract.artifacts.is_empty());
+    }
+
+    #[test]
+    fn sanitize_lists_caps_length() {
+        let raw = format!(
+            r#"{{"status":"ok","summary":"x","recommendations":[{}],"risks":[],"artifacts":[]}}"#,
+            (0..30)
+                .map(|i| format!(r#""r{i}""#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let contract = parse_orchestrate_contract(&raw);
+        assert_eq!(contract.recommendations.len(), ORCHESTRATE_MAX_LIST_ITEMS);
+    }
+
+    #[test]
+    fn parse_orchestrate_coordinator_contract_prefers_json_schema() {
+        let fallback = AgentOutcome {
+            messages: Vec::new(),
+            response: "fallback response".to_string(),
+            usage: grey_core::Usage::default(),
+            steps: 99,
+            cached: false,
+            provider_id: "fallback-provider".to_string(),
+            model: "fallback-model".to_string(),
+        };
+        let contract = parse_orchestrate_coordinator_contract(
+            r#"{"response":"coordinator report","provider":"p","model":"m","steps":1,"cached":false}"#,
+            &fallback,
+        );
+        assert_eq!(contract.response, "coordinator report");
+        assert_eq!(contract.provider, "p");
+        assert_eq!(contract.model, "m");
+        assert_eq!(contract.steps, 1);
+        assert!(!contract.cached);
+    }
+
+    #[test]
+    fn parse_orchestrate_coordinator_contract_falls_back_to_outcome() {
+        let fallback = AgentOutcome {
+            messages: Vec::new(),
+            response: "fallback raw".to_string(),
+            usage: grey_core::Usage::default(),
+            steps: 4,
+            cached: true,
+            provider_id: "fallback-provider".to_string(),
+            model: "fallback-model".to_string(),
+        };
+        let contract = parse_orchestrate_coordinator_contract("plain text", &fallback);
+        assert_eq!(contract.response, "plain text");
+        assert_eq!(contract.provider, "fallback-provider");
+        assert_eq!(contract.model, "fallback-model");
+        assert_eq!(contract.steps, 4);
+        assert!(contract.cached);
     }
 
     #[test]

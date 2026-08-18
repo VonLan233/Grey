@@ -31,11 +31,11 @@
 | 共享上下文白名单 | ✅ | `--share-context task|summary` + `orchestrate_share_context_summary_injects_session_tail` |
 | 上下文隔离验证 | ✅ | `orchestrate_subagents_do_not_leak_other_agents_context` |
 | MCP/Hook 接入复用 | ✅ | `build_agent_and_session` 与现有工具链复用 |
+| 主协调器输出/schema 校验增强（含 JSON Schema） | ✅ | `OrchestrateCoordinatorContract` + `parse_orchestrate_coordinator_contract` + `cargo test --workspace --all-features` |
 
 ## 四、尚未完成（P3 to-do）
 
-1. 子 Agent contract 与主协调器输出的 schema 校验增强（如 JSON Schema）；
-2. 子 agent 面板渲染（TUI）与会话化记忆持久化。
+1. 子 agent 面板渲染（TUI）与会话化记忆持久化。
 
 ## 五、建议下一步
 
