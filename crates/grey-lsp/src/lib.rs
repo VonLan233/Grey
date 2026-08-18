@@ -15,14 +15,16 @@ use anyhow::{anyhow, bail, Context, Result};
 use lsp_types::{
     notification::{DidOpenTextDocument, Exit, Initialized, Notification, PublishDiagnostics},
     request::{
-        DocumentDiagnosticRequest, GotoDefinition, HoverRequest, Initialize, References, Rename,
-        Request, Shutdown,
+        DocumentDiagnosticRequest, DocumentSymbolRequest, GotoDefinition, HoverRequest, Initialize,
+        References, Rename, Request, Shutdown,
     },
     ClientCapabilities, ClientInfo, Diagnostic, DiagnosticClientCapabilities,
     DidOpenTextDocumentParams, DocumentChangeOperation, DocumentChanges, DocumentDiagnosticParams,
-    DocumentDiagnosticReport, DocumentDiagnosticReportResult, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverContents, HoverParams, InitializeParams, InitializedParams,
-    Position, PublishDiagnosticsParams, Range, ReferenceContext, ReferenceParams, RenameParams,
+    DocumentDiagnosticReport, DocumentDiagnosticReportResult, DocumentSymbol,
+    DocumentSymbolClientCapabilities, DocumentSymbolParams, DocumentSymbolResponse,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
+    InitializeParams, InitializedParams, Position, PublishDiagnosticsParams, Range,
+    ReferenceContext, ReferenceParams, RenameParams, SymbolInformation, SymbolKind,
     TextDocumentClientCapabilities, TextDocumentIdentifier, TextDocumentItem,
     TextDocumentPositionParams, Uri, WorkspaceEdit, WorkspaceFolder,
 };
@@ -491,6 +493,26 @@ pub async fn collect_file_rename(
     Ok(result)
 }
 
+#[derive(Debug, Clone)]
+pub struct SymbolLocation {
+    pub name: String,
+    pub kind: String,
+    pub detail: Option<String>,
+    pub container_name: Option<String>,
+    pub start_line: u32,
+    pub start_character: u32,
+    pub end_line: u32,
+    pub end_character: u32,
+}
+
+pub async fn collect_file_symbols(
+    file: &Path,
+    lsp_path: Option<&Path>,
+) -> Result<Vec<SymbolLocation>> {
+    let result = collect_file_symbol_data(file, lsp_path).await?;
+    Ok(result)
+}
+
 struct LspCollectResult {
     diagnostics: Vec<Diagnostic>,
     definitions: Vec<DefinitionLocation>,
@@ -670,6 +692,45 @@ async fn collect_file_rename_data(
         new_name,
     )
     .await;
+    let shutdown_result = client.shutdown().await;
+
+    match (session_result, shutdown_result) {
+        (Ok(result), Ok(())) => {
+            println!("[spike-b] done");
+            Ok(result)
+        }
+        (Err(session_error), Ok(())) => Err(session_error),
+        (Ok(_), Err(shutdown_error)) => Err(shutdown_error),
+        (Err(session_error), Err(shutdown_error)) => bail!(
+            "{session_error:#}; additionally failed to shut down LSP server: {shutdown_error:#}"
+        ),
+    }
+}
+
+async fn collect_file_symbol_data(
+    file: &Path,
+    lsp_path: Option<&Path>,
+) -> Result<Vec<SymbolLocation>> {
+    let lsp = lsp_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("rust-analyzer"));
+    let file_abs = std::fs::canonicalize(file)
+        .with_context(|| format!("canonicalizing {}", file.display()))?;
+    let workspace_root = discover_workspace_root(&file_abs)?;
+    let root = path_to_uri(&workspace_root)?;
+    let file_uri = path_to_uri(&file_abs)?;
+    let text = std::fs::read_to_string(&file_abs)
+        .with_context(|| format!("reading {}", file_abs.display()))?;
+    println!(
+        "[spike-b] lsp={} file={} workspace={}",
+        lsp.display(),
+        file_abs.display(),
+        workspace_root.display()
+    );
+
+    let mut client = LspClient::spawn(&lsp).await?;
+    let session_result =
+        run_lsp_symbol_session(&mut client, root, &workspace_root, file_uri, text).await;
     let shutdown_result = client.shutdown().await;
 
     match (session_result, shutdown_result) {
@@ -966,6 +1027,76 @@ async fn run_lsp_rename_session(
     probe_rename(client, &file_uri, position, new_name).await
 }
 
+#[allow(deprecated)] // root_uri + workspace_folders both sent for maximal server compat
+async fn run_lsp_symbol_session(
+    client: &mut LspClient,
+    root: Uri,
+    workspace_root: &Path,
+    file_uri: Uri,
+    text: String,
+) -> Result<Vec<SymbolLocation>> {
+    let init = request_with_timeout::<Initialize>(
+        client,
+        InitializeParams {
+            process_id: Some(std::process::id()),
+            root_uri: Some(root.clone()),
+            workspace_folders: Some(vec![WorkspaceFolder {
+                uri: root,
+                name: workspace_root
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| workspace_root.display().to_string()),
+            }]),
+            capabilities: ClientCapabilities {
+                text_document: Some(TextDocumentClientCapabilities {
+                    document_symbol: Some(DocumentSymbolClientCapabilities {
+                        hierarchical_document_symbol_support: Some(true),
+                        ..Default::default()
+                    }),
+                    diagnostic: Some(DiagnosticClientCapabilities {
+                        dynamic_registration: None,
+                        related_document_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            client_info: Some(ClientInfo {
+                name: "grey-spike".into(),
+                version: None,
+            }),
+            ..Default::default()
+        },
+        REQUEST_TIMEOUT,
+    )
+    .await?;
+    println!(
+        "[spike-b] initialized: server={:?}",
+        init.server_info
+            .map(|i| format!("{} {}", i.name, i.version.unwrap_or_default()))
+    );
+
+    client.notify::<Initialized>(InitializedParams {}).await?;
+    client
+        .notify::<DidOpenTextDocument>(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: file_uri.clone(),
+                language_id: "rust".into(),
+                version: 1,
+                text,
+            },
+        })
+        .await?;
+
+    let _ = tokio::time::timeout(
+        Duration::from_secs(15),
+        wait_for_diagnostics(client, &file_uri),
+    )
+    .await;
+
+    probe_symbols(client, &file_uri).await
+}
+
 async fn wait_for_diagnostics(client: &mut LspClient, uri: &Uri) -> Result<Vec<Diagnostic>> {
     loop {
         let msg = client.read_raw().await?;
@@ -1119,6 +1250,78 @@ fn hover_content_to_text(content: lsp_types::MarkedString) -> String {
             format!("```{}\n{}\n```", language.language, language.value)
         }
     }
+}
+
+async fn probe_symbols(client: &mut LspClient, uri: &Uri) -> Result<Vec<SymbolLocation>> {
+    let params = DocumentSymbolParams {
+        text_document: TextDocumentIdentifier { uri: uri.clone() },
+        work_done_progress_params: Default::default(),
+        partial_result_params: Default::default(),
+    };
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.request::<DocumentSymbolRequest>(params),
+    )
+    .await
+    .map_err(|_| anyhow!("symbols unavailable: request timed out"))?;
+
+    match response {
+        Ok(None) => Ok(Vec::new()),
+        Ok(Some(DocumentSymbolResponse::Flat(symbols))) => Ok(symbols
+            .into_iter()
+            .map(symbol_information_to_location)
+            .collect()),
+        Ok(Some(DocumentSymbolResponse::Nested(symbols))) => Ok(flatten_document_symbols(symbols)),
+        Err(error) => Err(anyhow!("symbols unavailable: {error}")),
+    }
+}
+
+fn symbol_information_to_location(symbol: SymbolInformation) -> SymbolLocation {
+    SymbolLocation {
+        name: symbol.name,
+        kind: format!("{:?}", symbol.kind),
+        detail: None,
+        container_name: symbol.container_name,
+        start_line: symbol.location.range.start.line + 1,
+        start_character: symbol.location.range.start.character + 1,
+        end_line: symbol.location.range.end.line + 1,
+        end_character: symbol.location.range.end.character + 1,
+    }
+}
+
+fn symbol_kind_from(kind: &SymbolKind) -> String {
+    format!("{:?}", kind)
+}
+
+fn flatten_document_symbols(symbols: Vec<DocumentSymbol>) -> Vec<SymbolLocation> {
+    flatten_document_symbols_inner(symbols, None)
+}
+
+fn flatten_document_symbols_inner(
+    symbols: Vec<DocumentSymbol>,
+    container: Option<String>,
+) -> Vec<SymbolLocation> {
+    let mut out = Vec::new();
+    for symbol in symbols {
+        out.push(SymbolLocation {
+            name: symbol.name,
+            kind: symbol_kind_from(&symbol.kind),
+            detail: symbol.detail,
+            container_name: container.clone(),
+            start_line: symbol.range.start.line + 1,
+            start_character: symbol.range.start.character + 1,
+            end_line: symbol.range.end.line + 1,
+            end_character: symbol.range.end.character + 1,
+        });
+        if let Some(children) = symbol.children {
+            out.extend(flatten_document_symbols_inner(
+                children,
+                out.last().map(|parent| parent.name.clone()),
+            ));
+        }
+    }
+    out
 }
 
 async fn probe_rename(

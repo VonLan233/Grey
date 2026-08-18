@@ -58,6 +58,7 @@ impl LspTools {
             "lsp_references" => self.lsp_references(call).await,
             "lsp_hover" => self.lsp_hover(call).await,
             "lsp_rename" => self.lsp_rename(call).await,
+            "lsp_symbols" => self.lsp_symbols(call).await,
             _ => bail!("unknown tool {:?}", call.name),
         }
     }
@@ -204,6 +205,37 @@ impl LspTools {
         ))
     }
 
+    async fn lsp_symbols(&self, call: &ToolCall) -> Result<ToolResult> {
+        let args: LspSymbolsArgs = parse_args(call)?;
+        let path = self.resolve_existing(&args.path)?;
+        let file_path = path.to_string_lossy().into_owned();
+        let symbols = grey_lsp::collect_file_symbols(&path, Some(Path::new(&self.lsp_binary)))
+            .await
+            .with_context(|| format!("running LSP symbols for {file_path}"))?;
+        let mut output = String::new();
+        output.push_str(&format!(
+            "lsp symbols for {} ({}):\n",
+            file_path,
+            symbols.len()
+        ));
+        let max_items = args.max_items.unwrap_or(50);
+        for symbol in symbols.into_iter().take(max_items) {
+            output.push_str(&format!(
+                "{} [{}] {}:{}-{}:{}\n",
+                symbol.name,
+                symbol.kind,
+                symbol.start_line,
+                symbol.start_character,
+                symbol.end_line,
+                symbol.end_character
+            ));
+        }
+        if output.ends_with('\n') {
+            output.pop();
+        }
+        Ok(ToolResult::success(call, output))
+    }
+
     fn resolve_existing(&self, relative: &str) -> Result<PathBuf> {
         ensure_relative_path(relative)?;
         let candidate = self.workspace.join(relative);
@@ -303,6 +335,21 @@ impl ToolExecutor for LspTools {
                         "new_name": {"type": "string"},
                     },
                     "required": ["path", "new_name"],
+                    "additionalProperties": false
+                }),
+                risk: ToolRisk::ReadOnly,
+            },
+            ToolDefinition {
+                name: "lsp_symbols".into(),
+                description: "List symbols in a workspace file from LSP documentSymbol."
+                    .into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "max_items": {"type": "integer", "minimum": 1, "maximum": 500}
+                    },
+                    "required": ["path"],
                     "additionalProperties": false
                 }),
                 risk: ToolRisk::ReadOnly,
@@ -1095,4 +1142,11 @@ struct LspRenameArgs {
     line: Option<u32>,
     character: Option<u32>,
     new_name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LspSymbolsArgs {
+    path: String,
+    max_items: Option<usize>,
 }

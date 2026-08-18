@@ -10,6 +10,7 @@
 - 在 `grey-tools` 增加 `lsp_definition` 工具，支持按位置信息返回定义定位。
 - 在 `grey-lsp` 增加 `collect_file_references`，并在 `grey-tools` 增加 `lsp_references` 工具用于返回项目内符号引用位置。
 - 在 `grey-lsp` 增加 `collect_file_hover` 与 `collect_file_rename`，并在 `grey-tools` 增加 `lsp_hover` 与 `lsp_rename` 工具用于悬停展示与重命名预览。
+- 在 `grey-lsp` 增加 `collect_file_symbols`，并在 `grey-tools` 增加 `lsp_symbols` 工具用于导出文档符号。
 - 工具定义与执行已接入 `grey-cli` 的统一工具链（`build_agent_and_session`）：
   - 在 `--read_only`/主会话下可直接被 agent 调用；
   - 使用 `config.lsp.rust_analyzer` 作为后端命令；
@@ -17,16 +18,17 @@
 - 工具测试：
   - `grey-tools` 增加 `lsp_diagnostics` 定义与失败返回测试。
   - `grey-tools` 增加 `lsp_definition` 定义与失败返回测试。
+  - `grey-tools` 增加 `lsp_symbols` 定义与失败返回测试。
 
 ## 二、待完成项（P4 下一步）
 
-- 符号工具的语义注入与 LSP 输出治理。
+- 符号工具的语义注入与 LSP 输出治理（`lsp_symbols` 已完成定义接入，待上下文注入策略联动）。
 - 诊断到会话的实时注入策略（`Agent` 上下文中的结构化语义视图）。
 - LSP 工具输出的缓存/去噪与 token 预算融合。
 
 ## 三、当前证据
 
 - `crates/grey-lsp/src/lib.rs`：新增 `collect_file_diagnostics`、`collect_file_definitions`、`collect_file_references`、`collect_file_hover` 与 `collect_file_rename`。
-- `crates/grey-tools/src/lib.rs`：新增 `LspTools` 与 `lsp_diagnostics` / `lsp_definition` / `lsp_references` / `lsp_hover` / `lsp_rename`。
+- `crates/grey-tools/src/lib.rs`：新增 `LspTools` 与 `lsp_diagnostics` / `lsp_definition` / `lsp_references` / `lsp_hover` / `lsp_rename` / `lsp_symbols`。
 - `crates/grey-cli/src/main.rs`：工具链组装时挂载 `LspTools`。
-- `crates/grey-tools/tests/tools.rs`：新增 `lsp_hover` 与 `lsp_rename`，总计 8 个 LSP 工具验证测试。
+- `crates/grey-tools/tests/tools.rs`：新增 `lsp_symbols` 定义与失败返回测试，总计 10 个 LSP 工具验证测试。
