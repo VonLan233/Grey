@@ -595,16 +595,28 @@ fn build_orchestrate_subagent_system_prompt(agent_name: &str) -> String {
 fn parse_orchestrate_contract(raw: &str) -> OrchestrateAgentContract {
     if let Some(json_blob) = extract_orchestrate_json(raw) {
         if let Ok(contract) = serde_json::from_str::<OrchestrateAgentContract>(&json_blob) {
-            return contract;
+            return normalize_orchestrate_contract(contract);
         }
     }
     if let Ok(contract) = serde_json::from_str::<OrchestrateAgentContract>(raw.trim()) {
-        return contract;
+        return normalize_orchestrate_contract(contract);
     }
     fallback_orchestrate_contract(raw)
 }
 
 fn extract_orchestrate_json(raw: &str) -> Option<String> {
+    let fence_start = raw.find("```json");
+    let fence_end = raw.rfind("```");
+    if let Some(start) = fence_start {
+        if let Some(end) = fence_end {
+            if end > start + 6 {
+                let inner = raw[start + 6..end].trim();
+                if inner.starts_with('{') && inner.ends_with('}') {
+                    return Some(inner.to_string());
+                }
+            }
+        }
+    }
     let start = raw.find('{')?;
     let end = raw.rfind('}')?;
     if end > start {
@@ -628,6 +640,16 @@ fn fallback_orchestrate_contract(raw: &str) -> OrchestrateAgentContract {
         risks: vec!["requires normalization".to_string()],
         artifacts: Vec::new(),
     }
+}
+
+fn normalize_orchestrate_contract(
+    mut contract: OrchestrateAgentContract,
+) -> OrchestrateAgentContract {
+    contract.status = match contract.status.as_str() {
+        "ok" | "warn" | "fail" => contract.status,
+        _ => "warn".to_string(),
+    };
+    contract
 }
 
 async fn run_headless(
@@ -1426,6 +1448,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_orchestrate_contract_parses_code_block_json() {
+        let raw = r#"分析如下：
+```json
+{"status":"fail","summary":"found issue","recommendations":["retry"],"risks":["timeout"],"artifacts":["fix.patch"]}
+```
+"#;
+        let contract = parse_orchestrate_contract(raw);
+        assert_eq!(contract.status, "fail");
+        assert_eq!(contract.summary, "found issue");
+        assert_eq!(contract.artifacts, vec!["fix.patch"]);
+    }
+
+    #[test]
     fn parse_orchestrate_contract_falls_back_on_plain_text() {
         let raw = "只给了自然语言，没有 JSON";
         let contract = parse_orchestrate_contract(raw);
@@ -1434,5 +1469,13 @@ mod tests {
         assert_eq!(contract.recommendations, vec!["response not in schema"]);
         assert_eq!(contract.risks, vec!["requires normalization"]);
         assert!(contract.artifacts.is_empty());
+    }
+
+    #[test]
+    fn parse_orchestrate_contract_normalizes_unknown_status() {
+        let raw =
+            r#"{"status":"done","summary":"done","recommendations":[],"risks":[],"artifacts":[]}"#;
+        let contract = parse_orchestrate_contract(raw);
+        assert_eq!(contract.status, "warn");
     }
 }
