@@ -278,11 +278,20 @@ struct OrchestrateAgentResult {
 
 #[derive(Debug, Deserialize, Serialize)]
 struct OrchestrateAgentContract {
+    #[serde(default = "default_orchestrate_status")]
     status: String,
+    #[serde(default)]
     summary: String,
+    #[serde(default)]
     recommendations: Vec<String>,
+    #[serde(default)]
     risks: Vec<String>,
+    #[serde(default)]
     artifacts: Vec<String>,
+}
+
+fn default_orchestrate_status() -> String {
+    "warn".to_string()
 }
 
 #[derive(Serialize)]
@@ -405,14 +414,31 @@ async fn run_orchestrate(cli: &Cli, task: String, raw_specs: Vec<String>) -> Res
 
     println!("task: {}", task);
     for result in &subagent_results {
+        let status = if result.success { "success" } else { "failure" };
         println!(
-            "\n[{name}] provider={provider} model={model} steps={steps} cached={cached}",
+            "\n[{name}] status={status} provider={provider} model={model} steps={steps} cached={cached}",
             name = result.name,
+            status = status,
             provider = result.provider,
             model = result.model,
             steps = result.steps,
             cached = result.cached
         );
+        if !result.summary.is_empty() {
+            println!("  摘要: {}", result.summary);
+        }
+        if !result.recommendations.is_empty() {
+            println!("  建议: {}", result.recommendations.join("，"));
+        }
+        if !result.risks.is_empty() {
+            println!("  风险: {}", result.risks.join("，"));
+        }
+        if !result.artifacts.is_empty() {
+            println!("  产物: {}", result.artifacts.join("，"));
+        }
+        if let Some(error) = &result.error {
+            println!("  错误: {error}");
+        }
         println!("{}", result.response);
     }
     println!("\n== Synthesis ==\n{}", synthesis.response);
@@ -645,10 +671,15 @@ fn fallback_orchestrate_contract(raw: &str) -> OrchestrateAgentContract {
 fn normalize_orchestrate_contract(
     mut contract: OrchestrateAgentContract,
 ) -> OrchestrateAgentContract {
-    contract.status = match contract.status.as_str() {
-        "ok" | "warn" | "fail" => contract.status,
-        _ => "warn".to_string(),
+    contract.status = match contract.status.to_lowercase().as_str() {
+        "ok" => "ok".to_string(),
+        "warn" => "warn".to_string(),
+        "fail" => "fail".to_string(),
+        _ => default_orchestrate_status(),
     };
+    if contract.summary.is_empty() {
+        contract.summary = "no summary provided".to_string();
+    }
     contract
 }
 
@@ -1477,5 +1508,16 @@ mod tests {
             r#"{"status":"done","summary":"done","recommendations":[],"risks":[],"artifacts":[]}"#;
         let contract = parse_orchestrate_contract(raw);
         assert_eq!(contract.status, "warn");
+    }
+
+    #[test]
+    fn parse_orchestrate_contract_defaults_missing_fields() {
+        let raw = r#"{"status":"OK"}"#;
+        let contract = parse_orchestrate_contract(raw);
+        assert_eq!(contract.status, "ok");
+        assert_eq!(contract.summary, "no summary provided");
+        assert!(contract.recommendations.is_empty());
+        assert!(contract.risks.is_empty());
+        assert!(contract.artifacts.is_empty());
     }
 }
