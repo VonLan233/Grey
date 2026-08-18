@@ -17,7 +17,7 @@ use grey_core::{
 use grey_provider::router::ProviderRouter;
 use grey_tools::{AlwaysApprove, Approver, BuiltinTools, DenySideEffects, StdioApprover};
 use grey_tools::{CombinedTools, HookedTools, McpTools};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
@@ -268,7 +268,21 @@ struct OrchestrateAgentResult {
     steps: usize,
     cached: bool,
     success: bool,
+    status: String,
+    summary: String,
+    recommendations: Vec<String>,
+    risks: Vec<String>,
+    artifacts: Vec<String>,
     error: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct OrchestrateAgentContract {
+    status: String,
+    summary: String,
+    recommendations: Vec<String>,
+    risks: Vec<String>,
+    artifacts: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -440,11 +454,18 @@ fn build_coordinator_prompt(task: &str, subagents: &[OrchestrateAgentResult]) ->
     chunks.push(format!("主任务: {task}"));
     for result in subagents {
         chunks.push(format!(
-            "[{}]\n子任务: {}\n结论:\n{}\n",
-            result.name, result.task, result.response
+            "[{}]\n子任务: {}\n状态: {}\n要点: {}\n建议: {:?}\n风险: {:?}\n",
+            result.name,
+            result.task,
+            result.status,
+            result.summary,
+            result.recommendations,
+            result.risks
         ));
     }
-    chunks.push("请输出：1)最终结论 2)最小落地步骤 3)测试检查清单".to_string());
+    chunks.push(
+        "请输出：1)最终结论 2)最小落地步骤 3)测试检查清单（严格结构化 JSON 输出更佳）".to_string(),
+    );
     chunks.join("\n")
 }
 
@@ -484,13 +505,22 @@ async fn run_orchestrate_subagent(
                     steps: 0,
                     cached: false,
                     success: false,
+                    status: "fail".to_string(),
+                    summary: "sub-agent initialization failed".to_string(),
+                    recommendations: Vec::new(),
+                    risks: vec!["initialize".to_string()],
+                    artifacts: Vec::new(),
                     error: Some(error.to_string()),
                 };
             }
         };
     let agent_provider = agent_client.provider_id().to_string();
     let _ = existing;
-    let prompt = format!("主任务: {task}\n子任务: {}\n请直接输出结论。", agent.task);
+    let prompt = format!(
+        "{}\n主任务: {task}\n子任务: {}\n请按固定 JSON 输出。\n",
+        build_orchestrate_subagent_system_prompt(&agent.name),
+        agent.task
+    );
     let run = agent_client.run_new(agent.system_prompt, prompt, None);
     let outcome = match tokio::time::timeout(
         Duration::from_secs(ORCHESTRATE_AGENT_TIMEOUT_SECS),
@@ -509,6 +539,11 @@ async fn run_orchestrate_subagent(
                 steps: 0,
                 cached: false,
                 success: false,
+                status: "fail".to_string(),
+                summary: "sub-agent execution failed".to_string(),
+                recommendations: Vec::new(),
+                risks: vec!["execution".to_string()],
+                artifacts: Vec::new(),
                 error: Some(error.to_string()),
             };
         }
@@ -522,10 +557,16 @@ async fn run_orchestrate_subagent(
                 steps: 0,
                 cached: false,
                 success: false,
+                status: "fail".to_string(),
+                summary: "sub-agent execution timed out".to_string(),
+                recommendations: Vec::new(),
+                risks: vec!["timeout".to_string()],
+                artifacts: Vec::new(),
                 error: Some("sub-agent execution timed out".to_string()),
             };
         }
     };
+    let contract = parse_orchestrate_contract(&outcome.response);
     OrchestrateAgentResult {
         name: agent.name,
         task: agent.task,
@@ -535,7 +576,57 @@ async fn run_orchestrate_subagent(
         steps: outcome.steps,
         cached: outcome.cached,
         success: true,
+        status: contract.status,
+        summary: contract.summary,
+        recommendations: contract.recommendations,
+        risks: contract.risks,
+        artifacts: contract.artifacts,
         error: None,
+    }
+}
+
+fn build_orchestrate_subagent_system_prompt(agent_name: &str) -> String {
+    format!(
+        "你是{agent_name}子代理。你必须只输出 JSON，不要输出额外解释：\
+{{\"status\":\"ok|warn|fail\",\"summary\":\"...\",\"recommendations\":[\"...\"],\"risks\":[\"...\"],\"artifacts\":[\"...\"]}}"
+    )
+}
+
+fn parse_orchestrate_contract(raw: &str) -> OrchestrateAgentContract {
+    if let Some(json_blob) = extract_orchestrate_json(raw) {
+        if let Ok(contract) = serde_json::from_str::<OrchestrateAgentContract>(&json_blob) {
+            return contract;
+        }
+    }
+    if let Ok(contract) = serde_json::from_str::<OrchestrateAgentContract>(raw.trim()) {
+        return contract;
+    }
+    fallback_orchestrate_contract(raw)
+}
+
+fn extract_orchestrate_json(raw: &str) -> Option<String> {
+    let start = raw.find('{')?;
+    let end = raw.rfind('}')?;
+    if end > start {
+        Some(raw[start..=end].to_string())
+    } else {
+        None
+    }
+}
+
+fn fallback_orchestrate_contract(raw: &str) -> OrchestrateAgentContract {
+    let summary = raw.lines().next().unwrap_or_default().trim().to_string();
+    let summary = if summary.is_empty() {
+        raw.to_string()
+    } else {
+        summary
+    };
+    OrchestrateAgentContract {
+        status: "warn".to_string(),
+        summary,
+        recommendations: vec!["response not in schema".to_string()],
+        risks: vec!["requires normalization".to_string()],
+        artifacts: Vec::new(),
     }
 }
 
@@ -1311,5 +1402,37 @@ mod tests {
             extract_prompt_from_hook_output("not-json"),
             Some("not-json".to_string())
         );
+    }
+
+    #[test]
+    fn parse_orchestrate_contract_parses_clean_json() {
+        let raw = r#"{"status":"ok","summary":"done","recommendations":["ship"],"risks":["none"],"artifacts":["report.md"]}"#;
+        let contract = parse_orchestrate_contract(raw);
+        assert_eq!(contract.status, "ok");
+        assert_eq!(contract.summary, "done");
+        assert_eq!(contract.recommendations, vec!["ship"]);
+        assert_eq!(contract.risks, vec!["none"]);
+        assert_eq!(contract.artifacts, vec!["report.md"]);
+    }
+
+    #[test]
+    fn parse_orchestrate_contract_parses_with_prefixed_text() {
+        let raw = r#"前面有说明，输出如下：{"status":"warn","summary":"partial","recommendations":["rerun"],"risks":["timeout"],"artifacts":[]}"#;
+        let contract = parse_orchestrate_contract(raw);
+        assert_eq!(contract.status, "warn");
+        assert_eq!(contract.summary, "partial");
+        assert_eq!(contract.recommendations, vec!["rerun"]);
+        assert_eq!(contract.risks, vec!["timeout"]);
+    }
+
+    #[test]
+    fn parse_orchestrate_contract_falls_back_on_plain_text() {
+        let raw = "只给了自然语言，没有 JSON";
+        let contract = parse_orchestrate_contract(raw);
+        assert_eq!(contract.status, "warn");
+        assert_eq!(contract.summary, "只给了自然语言，没有 JSON");
+        assert_eq!(contract.recommendations, vec!["response not in schema"]);
+        assert_eq!(contract.risks, vec!["requires normalization"]);
+        assert!(contract.artifacts.is_empty());
     }
 }

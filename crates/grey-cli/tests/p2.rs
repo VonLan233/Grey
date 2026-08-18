@@ -323,6 +323,11 @@ fn orchestrate_runs_default_subagents_and_returns_json() {
     for item in subagents {
         assert!(item["response"].as_str().unwrap().contains("（mock"));
         assert!(item["name"].as_str().is_some());
+        assert!(item["status"].as_str().is_some());
+        assert!(item["summary"].as_str().is_some());
+        assert!(item["recommendations"].as_array().is_some());
+        assert!(item["risks"].as_array().is_some());
+        assert!(item["artifacts"].as_array().is_some());
     }
     let synthesis = &value["synthesis"];
     assert!(synthesis["response"].as_str().is_some());
@@ -357,6 +362,8 @@ fn orchestrate_custom_agent_spec_is_parsed() {
         .as_str()
         .unwrap()
         .contains("（mock"));
+    assert!(!subagents[0]["status"].as_str().unwrap().is_empty());
+    assert!(subagents[0]["summary"].as_str().is_some());
 }
 
 #[test]
