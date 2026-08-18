@@ -376,6 +376,8 @@ async fn run_command(cli: &Cli, command: Command) -> Result<()> {
 }
 
 const ORCHESTRATE_AGENT_TIMEOUT_SECS: u64 = 120;
+const ORCHESTRATE_AGENT_MAX_ATTEMPTS: usize = 2;
+const ORCHESTRATE_AGENT_RETRY_DELAY_MS: u64 = 200;
 
 async fn run_orchestrate(
     cli: &Cli,
@@ -587,69 +589,113 @@ async fn run_orchestrate_subagent(
         context_line,
         agent.task
     );
-    let run = agent_client.run_new(agent.system_prompt, prompt, None);
-    let outcome = match tokio::time::timeout(
-        Duration::from_secs(ORCHESTRATE_AGENT_TIMEOUT_SECS),
-        run,
-    )
-    .await
-    {
-        Ok(Ok(outcome)) => outcome,
-        Ok(Err(error)) => {
-            return OrchestrateAgentResult {
-                name: agent.name,
-                task: agent.task,
-                response: "sub-agent execution failed".to_string(),
-                provider: agent_provider,
-                model: model_hint,
-                steps: 0,
-                cached: false,
-                success: false,
-                status: "fail".to_string(),
-                summary: "sub-agent execution failed".to_string(),
-                recommendations: Vec::new(),
-                risks: vec!["execution".to_string()],
-                artifacts: Vec::new(),
-                error: Some(error.to_string()),
-            };
+    for attempt in 1..=ORCHESTRATE_AGENT_MAX_ATTEMPTS {
+        let run = agent_client.run_new(agent.system_prompt.clone(), prompt.clone(), None);
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(ORCHESTRATE_AGENT_TIMEOUT_SECS), run).await;
+
+        match outcome {
+            Ok(Ok(outcome)) => {
+                let contract = parse_orchestrate_contract(&outcome.response);
+                let success = contract.status == "ok";
+                return OrchestrateAgentResult {
+                    name: agent.name,
+                    task: agent.task,
+                    response: outcome.response,
+                    provider: outcome.provider_id,
+                    model: outcome.model,
+                    steps: outcome.steps,
+                    cached: outcome.cached,
+                    success,
+                    status: contract.status,
+                    summary: contract.summary,
+                    recommendations: contract.recommendations,
+                    risks: contract.risks,
+                    artifacts: contract.artifacts,
+                    error: None,
+                };
+            }
+            Ok(Err(error)) => {
+                let error_text = error.to_string();
+                let mut risk = "execution".to_string();
+                let is_retriable = is_retriable_subagent_error(&error_text);
+                if is_retriable {
+                    risk = "transient_execution".to_string();
+                }
+                if is_retriable && attempt < ORCHESTRATE_AGENT_MAX_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(
+                        ORCHESTRATE_AGENT_RETRY_DELAY_MS * attempt as u64,
+                    ))
+                    .await;
+                    continue;
+                }
+                return OrchestrateAgentResult {
+                    name: agent.name,
+                    task: agent.task,
+                    response: if attempt == 1 {
+                        "sub-agent execution failed".to_string()
+                    } else {
+                        format!("sub-agent execution failed after {attempt} attempts")
+                    },
+                    provider: agent_provider.clone(),
+                    model: model_hint.clone(),
+                    steps: 0,
+                    cached: false,
+                    success: false,
+                    status: "fail".to_string(),
+                    summary: if attempt == 1 {
+                        "sub-agent execution failed".to_string()
+                    } else {
+                        format!("sub-agent execution failed after {attempt} attempts")
+                    },
+                    recommendations: vec![if attempt > 1 {
+                        format!("已重试 {attempt} 次后仍失败")
+                    } else {
+                        "无需重试".to_string()
+                    }],
+                    risks: vec![risk],
+                    artifacts: Vec::new(),
+                    error: Some(error_text),
+                };
+            }
+            Err(_) => {
+                let error = "sub-agent execution timed out".to_string();
+                if attempt < ORCHESTRATE_AGENT_MAX_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(
+                        ORCHESTRATE_AGENT_RETRY_DELAY_MS * attempt as u64,
+                    ))
+                    .await;
+                    continue;
+                }
+                return OrchestrateAgentResult {
+                    name: agent.name,
+                    task: agent.task,
+                    response: if attempt == 1 {
+                        "sub-agent execution timed out".to_string()
+                    } else {
+                        format!("sub-agent execution timed out after {attempt} attempts")
+                    },
+                    provider: agent_provider,
+                    model: model_hint,
+                    steps: 0,
+                    cached: false,
+                    success: false,
+                    status: "fail".to_string(),
+                    summary: if attempt == 1 {
+                        "sub-agent execution timed out".to_string()
+                    } else {
+                        format!("sub-agent execution timed out after {attempt} attempts")
+                    },
+                    recommendations: vec![format!("已重试 {attempt} 次后仍失败")],
+                    risks: vec!["timeout".to_string()],
+                    artifacts: Vec::new(),
+                    error: Some(error),
+                };
+            }
         }
-        Err(_) => {
-            return OrchestrateAgentResult {
-                name: agent.name,
-                task: agent.task,
-                response: "sub-agent execution timed out".to_string(),
-                provider: agent_provider,
-                model: model_hint,
-                steps: 0,
-                cached: false,
-                success: false,
-                status: "fail".to_string(),
-                summary: "sub-agent execution timed out".to_string(),
-                recommendations: Vec::new(),
-                risks: vec!["timeout".to_string()],
-                artifacts: Vec::new(),
-                error: Some("sub-agent execution timed out".to_string()),
-            };
-        }
-    };
-    let contract = parse_orchestrate_contract(&outcome.response);
-    let success = contract.status == "ok";
-    OrchestrateAgentResult {
-        name: agent.name,
-        task: agent.task,
-        response: outcome.response,
-        provider: outcome.provider_id,
-        model: outcome.model,
-        steps: outcome.steps,
-        cached: outcome.cached,
-        success,
-        status: contract.status,
-        summary: contract.summary,
-        recommendations: contract.recommendations,
-        risks: contract.risks,
-        artifacts: contract.artifacts,
-        error: None,
     }
+
+    unreachable!()
 }
 
 fn build_orchestrate_subagent_system_prompt(agent_name: &str) -> String {
@@ -768,6 +814,26 @@ fn compact_message_preview(content: &str) -> String {
             .chain("...".chars())
             .collect()
     }
+}
+
+fn is_retriable_subagent_error(error: &str) -> bool {
+    let lower = error.to_lowercase();
+    const TRANSIENT_HINTS: &[&str] = &[
+        "timeout",
+        "timed out",
+        "connection",
+        "rate limit",
+        "temporarily",
+        "temporary",
+        "500",
+        "502",
+        "503",
+        "504",
+        "service unavailable",
+        "network",
+        "econn",
+    ];
+    TRANSIENT_HINTS.iter().any(|hint| lower.contains(hint))
 }
 
 fn extract_orchestrate_json(raw: &str) -> Option<String> {
@@ -1663,5 +1729,17 @@ mod tests {
         assert!(contract.recommendations.is_empty());
         assert!(contract.risks.is_empty());
         assert!(contract.artifacts.is_empty());
+    }
+
+    #[test]
+    fn is_retriable_subagent_error_detects_hints() {
+        assert!(is_retriable_subagent_error(
+            "service temporarily unavailable"
+        ));
+        assert!(is_retriable_subagent_error("connection reset by peer"));
+        assert!(is_retriable_subagent_error("HTTP 503 service unavailable"));
+
+        assert!(!is_retriable_subagent_error("invalid api key"));
+        assert!(!is_retriable_subagent_error("session not found"));
     }
 }
