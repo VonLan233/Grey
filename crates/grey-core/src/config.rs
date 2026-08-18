@@ -625,6 +625,7 @@ fn apply_env(cfg: &mut GreyConfig) -> Result<()> {
         );
         cfg.anthropic.max_tokens = max_tokens;
     }
+    let fallback_ark_api_key = env::var_os("ARK_API_KEY");
     for provider in cfg.providers.iter_mut() {
         let prefix = format!(
             "GREY_PROVIDER_{}_",
@@ -658,6 +659,11 @@ fn apply_env(cfg: &mut GreyConfig) -> Result<()> {
                 .to_string_lossy()
                 .parse::<bool>()
                 .with_context(|| format!("{prefix}INCLUDE_USAGE must be true or false"))?;
+        }
+        if provider.id == "volcano" && provider.api_key.is_empty() {
+            if let Some(value) = &fallback_ark_api_key {
+                provider.api_key = value.to_string_lossy().into_owned();
+            }
         }
     }
     if let Ok(v) = env::var("GREY_RUST_ANALYZER") {
@@ -998,5 +1004,31 @@ description = "echo test tool"
         assert!(result.is_ok(), "{}", result.unwrap_err());
         assert_eq!(cfg.mcp_tools[0].command, "sh");
         assert_eq!(cfg.mcp_tools[0].args, vec!["-lc".to_string()]);
+    }
+
+    #[test]
+    fn applies_ark_api_key_to_volcano_provider_when_unset() {
+        let mut cfg = GreyConfig::default();
+        cfg.providers.push(ProviderEntry {
+            id: "volcano".into(),
+            protocol: "openai".into(),
+            ..Default::default()
+        });
+        let previous_ark = env::var_os("ARK_API_KEY");
+        unsafe { env::set_var("ARK_API_KEY", "ark-demo-key") };
+        let result = apply_env(&mut cfg);
+        unsafe {
+            match previous_ark {
+                Some(value) => env::set_var("ARK_API_KEY", value),
+                None => env::remove_var("ARK_API_KEY"),
+            }
+        }
+        assert!(result.is_ok(), "{}", result.unwrap_err());
+        let volcano = cfg
+            .providers
+            .iter()
+            .find(|provider| provider.id == "volcano")
+            .expect("volcano provider should exist");
+        assert_eq!(volcano.api_key, "ark-demo-key");
     }
 }

@@ -16,7 +16,7 @@ Grey 是一个轻量、高性能、可扩展的 Coding Agent Harness。当前处
 
 ## 二、P2 完成情况
 
-### 13 个 Task 状态
+### 14 个 Task 状态
 
 | Task | 内容 | 文件 | 测试数 | 状态 |
 |---|---|---|---|---|
@@ -32,20 +32,21 @@ Grey 是一个轻量、高性能、可扩展的 Coding Agent Harness。当前处
 | 10 | Context manager extension (token budget + summary + tool trim) | `crates/grey-core/src/context.rs` | 10 | ✅ |
 | 11 | Agent loop integration (router + cache + usage) | `crates/grey-core/src/agent.rs` | 7 | ✅ |
 | 12 | CLI integration (--task, providers, cache, usage subcommands) | `crates/grey-cli/src/main.rs` | 0 (集成测试在 Task 13) | ✅ |
-| 13 | Integration tests + release gate | `crates/grey-cli/tests/p2.rs` | 12 | ✅ |
-| 14 | MCP 工具与 hook 配置 | `crates/grey-core/src/config.rs`, `crates/grey-tools/src/lib.rs`, `crates/grey-cli/src/main.rs` | 新增若干 | ✅ |
+| 13 | MCP 工具与 hook 配置 | `crates/grey-core/src/config.rs`, `crates/grey-tools/src/lib.rs`, `crates/grey-cli/src/main.rs` | 新增若干 | ✅ |
+| 14 | Integration tests + release gate | `crates/grey-cli/tests/p2.rs` | 13 | ✅ |
 
 ### 测试总计
 
 - **单元测试**：已按 `cargo test --workspace --all-features` 结果为准
-- **集成测试**：`grey-cli --test p2`（12 个） + 新增 hook/MCP 覆盖测试（见执行记录）
+- **集成测试**：`grey-cli --test p2`（13 个） + 新增 hook/MCP 覆盖测试（见执行记录）
 - **总测试数**：以实际工作区执行结果为准
 
 ### 验证命令
 
 ```bash
-# 先确保 PATH 指向 rustup 的 1.97.1（避免旧版 Homebrew rustc）
-export PATH="$HOME/.cargo/bin:$PATH"
+# 先确保 PATH 指向 rustup 的 1.97.1（避免旧版 Homebrew rustc 回退）
+export PATH="$HOME/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin:$PATH"
+export RUSTC="$HOME/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/rustc"
 
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -163,9 +164,20 @@ MCP/Hook 覆盖执行结果：
 
 人工 smoke 运行：
 
-- 使用 `/tmp/run-grey-smoke-openai.sh` 且 `GREY_PROVIDER_OPENAI_API_KEY=sk-test-missing-token` 执行失败，返回：
+- 使用 `/tmp/run-grey-smoke-openai.sh` 且 `GREY_PROVIDER_OPENAI_API_KEY=$YUNWU_API_KEY` 执行（invalid key）失败，返回：
   `OpenAI provider returned 401 Unauthorized`（提示 key 无效）。  
   说明实网调用链路与 `gpt-5.3-codex-spark` 目标路径可达，当前阻塞点为有效 `sk-` key 缺失。
+
+火山方舟 DeepSeek smoke 补充（`deepseek-v4-flash-ga-260731`）：
+
+- 使用 `/tmp/grey-volcano.toml` 显式配置 `volcano` provider，并传入：
+  - `ARK_API_KEY=$ARK_API_KEY`
+  - `GREY_PROVIDER_VOLCANO_BASE_URL=https://ark.cn-beijing.volces.com/api/v3`
+- 执行命令：
+  `cargo run -q -p grey-cli -- --provider volcano --model deepseek-v4-flash-ga-260731 --no-save --no-cache --format json "请只回复 ok"`
+- 当前会话未注入 `ARK_API_KEY`，返回：
+  `OpenAI provider returned 401 Unauthorized`（API key missing or invalid）。
+  说明请求路径与模型映射已到位，阻塞点为密钥注入。
 
 ---
 
