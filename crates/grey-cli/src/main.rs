@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::env;
 use std::fs;
+use std::future::Future;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,7 +26,8 @@ use grey_tools::{
 use grey_tools::{CombinedTools, HookedTools};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 use tokio::time::Duration;
 
 const SYSTEM_PROMPT: &str = r#"You are Grey, a careful coding agent working inside one workspace.
@@ -34,6 +36,7 @@ only with an exact old_string that occurs once. After edits, run the relevant te
 Keep changes scoped to the user's request, report tool failures honestly, and never claim success
 without verification evidence."#;
 const DEFAULT_HOOK_TIMEOUT_MS: u64 = 10_000;
+const TUI_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Parser, Clone)]
 #[command(
@@ -1930,6 +1933,54 @@ fn persist_usage(
     Ok(())
 }
 
+#[derive(Debug)]
+struct TuiWorkerSummary {
+    prompt_count: usize,
+    last_error: Option<String>,
+    provider: String,
+    model: String,
+}
+
+impl TuiWorkerSummary {
+    fn new(provider: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            prompt_count: 0,
+            last_error: None,
+            provider: provider.into(),
+            model: model.into(),
+        }
+    }
+}
+
+async fn close_tui_runtime<F, Fut>(
+    prompts: mpsc::Sender<String>,
+    shutdown: watch::Sender<bool>,
+    mut worker: JoinHandle<TuiWorkerSummary>,
+    timeout: Duration,
+    mut fallback: TuiWorkerSummary,
+    session_end: F,
+) where
+    F: FnOnce(TuiWorkerSummary) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    drop(prompts);
+    let _ = shutdown.send(true);
+    let summary = match tokio::time::timeout(timeout, &mut worker).await {
+        Ok(Ok(summary)) => summary,
+        Ok(Err(error)) => {
+            fallback.last_error = Some(format!("TUI worker failed: {error}"));
+            fallback
+        }
+        Err(_) => {
+            worker.abort();
+            let _ = worker.await;
+            fallback.last_error = Some("TUI worker shutdown timed out".into());
+            fallback
+        }
+    };
+    session_end(summary).await;
+}
+
 async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()> {
     let session_start_hooks = hook_chain_with_plugins(
         &config.hooks.session_start,
@@ -1959,21 +2010,38 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
     run_hook_chain(&session_start_hooks, &session_start_payload).await?;
 
     let (events_tx, events_rx) = mpsc::channel(config.runtime.event_queue_capacity);
-    let (prompts_tx, mut prompts_rx) = mpsc::unbounded_channel::<String>();
+    let (prompts_tx, mut prompts_rx) =
+        mpsc::channel::<String>(config.runtime.prompt_queue_capacity);
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let workspace_for_worker = workspace.to_path_buf();
     let workspace_name_for_worker = workspace_for_worker.to_string_lossy().into_owned();
+    let workspace_name_for_cleanup = workspace_name_for_worker.clone();
     let no_save = cli.no_save;
-    let mut hook_session_provider = agent.provider_id().to_string();
-    let mut hook_session_model = agent.model().to_string();
+    let initial_provider = agent.provider_id().to_string();
+    let initial_model = agent.model().to_string();
+    let fallback_summary = TuiWorkerSummary::new(&initial_provider, &initial_model);
     let worker = tokio::spawn(async move {
         let mut session = existing;
-        let mut prompt_count = 0usize;
-        let mut last_error: Option<String> = None;
-        while let Some(prompt) = prompts_rx.recv().await {
+        let mut summary = TuiWorkerSummary::new(initial_provider, initial_model);
+        'worker: loop {
+            let prompt = tokio::select! {
+                biased;
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                    continue;
+                }
+                prompt = prompts_rx.recv() => match prompt {
+                    Some(prompt) => prompt,
+                    None => break,
+                },
+            };
             let prompt = match apply_pre_message_send_hooks(&pre_message_send_hooks, &prompt).await
             {
                 Ok(prompt) => prompt,
                 Err(error) => {
+                    summary.last_error = Some(error.to_string());
                     let _ = events_tx
                         .send(AgentEvent::Failed(format!("{error:#}")))
                         .await;
@@ -1983,28 +2051,47 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
             let prompt = match apply_pre_prompt_hooks(&pre_prompt_hooks, &prompt).await {
                 Ok(prompt) => prompt,
                 Err(error) => {
+                    summary.last_error = Some(error.to_string());
                     let _ = events_tx
                         .send(AgentEvent::Failed(format!("{error:#}")))
                         .await;
                     continue;
                 }
             };
-            let result = match &session {
-                Some(session) => {
-                    agent
-                        .continue_messages(session.messages.clone(), &prompt, Some(&events_tx))
-                        .await
+            let result = {
+                let run = async {
+                    match &session {
+                        Some(session) => {
+                            agent
+                                .continue_messages(
+                                    session.messages.clone(),
+                                    &prompt,
+                                    Some(&events_tx),
+                                )
+                                .await
+                        }
+                        None => {
+                            agent
+                                .run_new(SYSTEM_PROMPT, &prompt, Some(&events_tx))
+                                .await
+                        }
+                    }
+                };
+                tokio::pin!(run);
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx.changed() => None,
+                    result = &mut run => Some(result),
                 }
-                None => {
-                    agent
-                        .run_new(SYSTEM_PROMPT, &prompt, Some(&events_tx))
-                        .await
-                }
+            };
+            let Some(result) = result else {
+                summary.last_error = Some("cancelled".into());
+                break 'worker;
             };
             match result {
                 Ok(outcome) => {
-                    prompt_count = prompt_count.saturating_add(1);
-                    last_error = None;
+                    summary.prompt_count = summary.prompt_count.saturating_add(1);
+                    summary.last_error = None;
                     let provider = outcome.provider_id.clone();
                     let model = outcome.model.clone();
                     let mut current = match session.take() {
@@ -2027,6 +2114,7 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
                     if !no_save {
                         if let Some(store) = &store {
                             if let Err(error) = store.save(&mut current) {
+                                summary.last_error = Some(error.to_string());
                                 let _ = events_tx
                                     .send(AgentEvent::Failed(format!("saving session: {error:#}")))
                                     .await;
@@ -2043,8 +2131,8 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
                         }
                     }
                     session = Some(current);
-                    hook_session_provider = outcome.provider_id.clone();
-                    hook_session_model = outcome.model.clone();
+                    summary.provider = outcome.provider_id.clone();
+                    summary.model = outcome.model.clone();
                     let payload = completion_hook_payload(
                         true,
                         &prompt,
@@ -2069,7 +2157,7 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
                         .await;
                 }
                 Err(error) => {
-                    last_error = Some(error.to_string());
+                    summary.last_error = Some(error.to_string());
                     let payload = completion_hook_payload(
                         false,
                         &prompt,
@@ -2090,29 +2178,48 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
                 }
             }
         }
-
-        let payload = serde_json::json!({
-            "event": "session_end",
-            "workspace": workspace_name_for_worker,
-            "prompts_processed": prompt_count,
-            "success": last_error.is_none(),
-            "error": last_error.unwrap_or_default(),
-            "provider": hook_session_provider,
-            "model": hook_session_model,
-        });
-        if let Err(error) = run_hook_chain(&session_end_hooks, &payload).await {
-            let _ = events_tx
-                .send(AgentEvent::Failed(format!(
-                    "session_end hook failed: {error:#}"
-                )))
-                .await;
-        }
+        summary
     });
     let branch = detect_git_branch(&workspace_for_worker);
-    let ui_result =
-        grey_tui::run_agent_tui(events_rx, prompts_tx, &config.tui, branch.as_deref()).await;
-    worker.abort();
-    let _ = worker.await;
+    let ui_result = {
+        let ui = grey_tui::run_agent_tui(
+            events_rx,
+            prompts_tx.clone(),
+            &config.tui,
+            &config.runtime,
+            branch.as_deref(),
+        );
+        tokio::pin!(ui);
+        tokio::select! {
+            result = &mut ui => result,
+            signal = tokio::signal::ctrl_c() => match signal {
+                Ok(()) => Err(anyhow::anyhow!("interrupted")),
+                Err(error) => Err(error).context("installing Ctrl-C handler"),
+            },
+        }
+    };
+    close_tui_runtime(
+        prompts_tx,
+        shutdown_tx,
+        worker,
+        TUI_SHUTDOWN_TIMEOUT,
+        fallback_summary,
+        move |summary| async move {
+            let payload = serde_json::json!({
+                "event": "session_end",
+                "workspace": workspace_name_for_cleanup,
+                "prompts_processed": summary.prompt_count,
+                "success": summary.last_error.is_none(),
+                "error": summary.last_error.unwrap_or_default(),
+                "provider": summary.provider,
+                "model": summary.model,
+            });
+            if let Err(error) = run_hook_chain(&session_end_hooks, &payload).await {
+                eprintln!("session_end hook failed: {error:#}");
+            }
+        },
+    )
+    .await;
     ui_result
 }
 
@@ -2691,6 +2798,66 @@ fn duplicate_tool_names(tools: &[Arc<dyn ToolExecutor>]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn tui_cleanup_closes_prompts_then_signals_and_runs_session_end_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (prompts, mut prompt_rx) = mpsc::channel(1);
+        let (shutdown, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let worker = tokio::spawn(async move {
+            assert!(prompt_rx.recv().await.is_none());
+            shutdown_rx.changed().await.unwrap();
+            assert!(*shutdown_rx.borrow());
+            TuiWorkerSummary::new("provider", "model")
+        });
+        let ended = Arc::new(AtomicUsize::new(0));
+        let ended_for_hook = Arc::clone(&ended);
+
+        close_tui_runtime(
+            prompts,
+            shutdown,
+            worker,
+            Duration::from_secs(1),
+            TuiWorkerSummary::new("fallback", "fallback"),
+            move |_| async move {
+                ended_for_hook.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await;
+
+        assert_eq!(ended.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn tui_cleanup_aborts_only_after_timeout_and_still_runs_session_end_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (prompts, _prompt_rx) = mpsc::channel(1);
+        let (shutdown, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let worker = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            unreachable!()
+        });
+        let ended = Arc::new(AtomicUsize::new(0));
+        let ended_for_hook = Arc::clone(&ended);
+        let started = tokio::time::Instant::now();
+
+        close_tui_runtime(
+            prompts,
+            shutdown,
+            worker,
+            Duration::from_millis(20),
+            TuiWorkerSummary::new("provider", "model"),
+            move |_| async move {
+                ended_for_hook.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await;
+
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        assert_eq!(ended.load(Ordering::SeqCst), 1);
+    }
 
     #[tokio::test]
     async fn apply_pre_prompt_hooks_can_rewrite_from_plain_output() {

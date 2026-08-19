@@ -22,7 +22,9 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use grey_core::{AgentEvent, TuiCompletionConfig, TuiConfig, TuiKeysConfig, TuiLayoutConfig};
+use grey_core::{
+    AgentEvent, RuntimeConfig, TuiCompletionConfig, TuiConfig, TuiKeysConfig, TuiLayoutConfig,
+};
 use notify_rust::Notification;
 use ratatui::{
     backend::{Backend, CrosstermBackend},
@@ -39,6 +41,7 @@ const DEMO_REPLY: &str = "Grey 是一个轻量、高性能、可扩展的代码 
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(80);
 const SCROLL_PAGE_LINES: u16 = 5;
 const PERSISTENT_REMINDER_TICK: Duration = Duration::from_millis(1800);
+const TRUNCATED_MARKER: &str = "[cut]";
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum CompletionBell {
@@ -399,13 +402,16 @@ fn apply_theme_override(theme: &mut RenderTheme, overrides: &grey_core::TuiColor
 }
 
 /// Prompts submitted by the TUI are sent to the owner of the agent loop.
-pub type PromptSender = mpsc::UnboundedSender<String>;
+pub type PromptSender = mpsc::Sender<String>;
 
 /// A side effect requested by the otherwise-pure input reducer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiAction {
     None,
-    Submit(String),
+    Submit {
+        prompt: String,
+        rejected_input: String,
+    },
     Quit,
 }
 
@@ -499,11 +505,10 @@ impl InputBuffer {
         changed
     }
 
-    fn take_trimmed(&mut self) -> String {
-        let prompt = self.text.trim().to_owned();
-        self.text.clear();
+    fn take(&mut self) -> String {
+        let input = std::mem::take(&mut self.text);
         self.cursor_chars = 0;
-        prompt
+        input
     }
 
     fn cursor_display_column(&self) -> usize {
@@ -580,6 +585,7 @@ impl FrameStats {
 #[derive(Debug, Clone)]
 pub struct AppState {
     output: String,
+    transcript_max_bytes: usize,
     input: InputBuffer,
     status: String,
     current_task: Option<String>,
@@ -609,6 +615,7 @@ impl Default for AppState {
     fn default() -> Self {
         Self {
             output: String::new(),
+            transcript_max_bytes: RuntimeConfig::default().transcript_max_bytes,
             input: InputBuffer::default(),
             status: "ready".into(),
             current_task: None,
@@ -646,6 +653,13 @@ impl AppState {
             status_error: false,
             completion,
             ..AppState::default()
+        }
+    }
+
+    fn with_runtime(settings: TuiSettings, runtime: &RuntimeConfig) -> Self {
+        Self {
+            transcript_max_bytes: runtime.transcript_max_bytes,
+            ..Self::with_settings(settings)
         }
     }
 }
@@ -697,6 +711,40 @@ impl AppState {
         self.pending_completion_message = None;
         self.persistent_completion_message = None;
         self.next_persistent_tick = None;
+    }
+
+    fn append_output(&mut self, addition: &str) {
+        append_bounded(&mut self.output, addition, self.transcript_max_bytes);
+    }
+
+    fn note_prompt_submitted(&mut self, prompt: &str) {
+        let separator = if !self.output.is_empty() && !self.output.ends_with('\n') {
+            "\n"
+        } else {
+            ""
+        };
+        self.append_output(&format!("{separator}> {prompt}\n\n"));
+        self.current_task = Some(prompt.chars().take(60).collect());
+        self.follow_output = true;
+        self.turn_started_at = Some(Instant::now());
+        self.status_error = false;
+        self.pending_completion_bell = None;
+        self.current_provider = None;
+        self.current_model = None;
+        self.leader_armed = false;
+        self.clear_completion_notice();
+        self.status = "prompt submitted".into();
+        self.dirty = true;
+    }
+
+    fn note_prompt_busy(&mut self, prompt: Option<String>) {
+        if let Some(prompt) = prompt {
+            self.input.text = prompt;
+            self.input.cursor_chars = self.input.text.chars().count();
+        }
+        self.status = "busy: prompt not submitted".into();
+        self.status_error = true;
+        self.dirty = true;
     }
 
     fn completion_notice(&self) -> Option<&str> {
@@ -852,28 +900,20 @@ impl AppState {
             KeyCode::Home => self.input.move_home(),
             KeyCode::End => self.input.move_end(),
             KeyCode::Enter => {
-                let prompt = self.input.take_trimmed();
+                if self.turn_started_at.is_some() {
+                    self.note_prompt_busy(None);
+                    return UiAction::None;
+                }
+                let rejected_input = self.input.take();
+                let prompt = rejected_input.trim().to_owned();
                 self.dirty = true;
                 if prompt.is_empty() {
                     return UiAction::None;
                 }
-                if !self.output.is_empty() && !self.output.ends_with('\n') {
-                    self.output.push('\n');
-                }
-                self.output.push_str("> ");
-                self.output.push_str(&prompt);
-                self.output.push_str("\n\n");
-                self.current_task = Some(prompt.chars().take(60).collect());
-                self.follow_output = true;
-                self.turn_started_at = Some(Instant::now());
-                self.status_error = false;
-                self.pending_completion_bell = None;
-                self.current_provider = None;
-                self.current_model = None;
-                self.leader_armed = false;
-                self.clear_completion_notice();
-                self.status = "prompt submitted".into();
-                return UiAction::Submit(prompt);
+                return UiAction::Submit {
+                    prompt,
+                    rejected_input,
+                };
             }
             _ => false,
         };
@@ -885,12 +925,12 @@ impl AppState {
     pub fn reduce_agent_event(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::Delta(delta) => {
-                self.output.push_str(&delta);
+                self.append_output(&delta);
                 self.status_error = false;
                 self.status = "streaming".into();
             }
             AgentEvent::ToolStarted(call) => {
-                self.output.push_str(&format!(
+                self.append_output(&format!(
                     "\n[tool:start] {} {}\n",
                     call.name, call.arguments
                 ));
@@ -899,7 +939,7 @@ impl AppState {
             }
             AgentEvent::ToolFinished(result) => {
                 let outcome = if result.success { "ok" } else { "failed" };
-                self.output.push_str(&format!(
+                self.append_output(&format!(
                     "[tool:{outcome}] {}\n{}\n",
                     result.name, result.output
                 ));
@@ -907,13 +947,12 @@ impl AppState {
                 self.status = format!("{} {outcome}", result.name);
             }
             AgentEvent::Retry { attempt, error } => {
-                self.output
-                    .push_str(&format!("\n[retry {attempt}] {error}\n"));
+                self.append_output(&format!("\n[retry {attempt}] {error}\n"));
                 self.status_error = false;
                 self.status = format!("retry {attempt}: {error}");
             }
             AgentEvent::ContextTrimmed(audit) => {
-                self.output.push_str(&format!(
+                self.append_output(&format!(
                     "\n[context] dropped {} messages ({} -> {} chars)\n",
                     audit.dropped_messages, audit.original_chars, audit.retained_chars
                 ));
@@ -936,7 +975,7 @@ impl AppState {
                 self.schedule_completion_notice(format!(
                     "completed: {provider}/{model} in {steps} steps"
                 ));
-                self.output.push_str(&format!(
+                self.append_output(&format!(
                     "\n[completed] {steps} steps, {} input / {} output tokens\n",
                     usage.input_tokens, usage.output_tokens
                 ));
@@ -947,20 +986,18 @@ impl AppState {
             AgentEvent::Failed(error) => {
                 self.pending_completion_bell = self.completion_bell_for(0);
                 self.schedule_completion_notice(format!("failed: {error}"));
-                self.output.push_str(&format!("\n[failed] {error}\n"));
+                self.append_output(&format!("\n[failed] {error}\n"));
                 self.status_error = true;
                 self.status = format!("failed: {error}");
                 self.turn_started_at = None;
             }
             AgentEvent::ProviderSwitched { from, to, reason } => {
-                self.output
-                    .push_str(&format!("\n[switch] {from} → {to}: {reason}\n"));
+                self.append_output(&format!("\n[switch] {from} → {to}: {reason}\n"));
                 self.status_error = false;
                 self.status = format!("switched to {to}");
             }
             AgentEvent::CacheHit { model } => {
-                self.output
-                    .push_str(&format!("\n[cache] hit for {model}\n"));
+                self.append_output(&format!("\n[cache] hit for {model}\n"));
                 self.status_error = false;
                 self.status = "cache hit".into();
             }
@@ -1023,32 +1060,91 @@ impl AppState {
     }
 }
 
+fn append_bounded(text: &mut String, addition: &str, max_bytes: usize) {
+    if max_bytes == 0 {
+        text.clear();
+        return;
+    }
+    let had_marker = text.starts_with(TRUNCATED_MARKER);
+    if had_marker {
+        text.drain(..TRUNCATED_MARKER.len());
+    }
+    text.push_str(addition);
+    if !had_marker && text.len() <= max_bytes {
+        return;
+    }
+
+    let marker_budget = max_bytes.saturating_sub(TRUNCATED_MARKER.len());
+    let marker_start = utf8_suffix_start(text, marker_budget);
+    if max_bytes >= TRUNCATED_MARKER.len() && marker_start < text.len() {
+        let suffix = text.split_off(marker_start);
+        text.clear();
+        text.push_str(TRUNCATED_MARKER);
+        text.push_str(&suffix);
+        return;
+    }
+
+    let suffix = text.split_off(utf8_suffix_start(text, max_bytes));
+    *text = suffix;
+}
+
+fn utf8_suffix_start(text: &str, max_bytes: usize) -> usize {
+    let mut start = text.len().saturating_sub(max_bytes);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    start
+}
+
 /// Run the real conversation UI over channels owned by an agent orchestrator.
 pub async fn run_agent_tui(
     events: mpsc::Receiver<AgentEvent>,
     prompts: PromptSender,
     tui_config: &TuiConfig,
+    runtime_config: &RuntimeConfig,
     git_branch: Option<&str>,
 ) -> Result<()> {
     let _restore = enter_terminal()?;
     let stdout: Stdout = io::stdout();
     let mut terminal =
         Terminal::new(CrosstermBackend::new(stdout)).context("creating Crossterm terminal")?;
-    let (input_thread, input_events) = InputThread::spawn()?;
+    let (mut input_thread, input_events) = InputThread::spawn(runtime_config.input_queue_capacity)?;
     let settings =
         TuiSettings::from(tui_config).with_git_branch(git_branch.map(ToString::to_string));
-    let result = run_loop(&mut terminal, events, prompts, input_events, settings).await;
-    drop(input_thread);
-    result
+    let state = AppState::with_runtime(settings, runtime_config);
+    let result = run_loop(
+        &mut terminal,
+        events,
+        prompts,
+        input_events,
+        state,
+        trigger_completion_notification,
+    )
+    .await;
+    let input_result = input_thread.stop_and_join();
+    match result {
+        Ok(()) => input_result,
+        Err(error) => {
+            let _ = input_result;
+            Err(error)
+        }
+    }
 }
 
 /// Run the P0 mock stream through the production state/event/render pipeline.
 pub async fn run_stream_demo() -> Result<()> {
-    let (agent_sender, agent_events) =
-        mpsc::channel(grey_core::RuntimeConfig::default().event_queue_capacity);
-    let (prompt_sender, prompt_receiver) = mpsc::unbounded_channel();
+    let runtime = RuntimeConfig::default();
+    let (agent_sender, agent_events) = mpsc::channel(runtime.event_queue_capacity);
+    let (prompt_sender, prompt_receiver) = mpsc::channel(runtime.prompt_queue_capacity);
     let demo = tokio::spawn(run_demo_driver(agent_sender, prompt_receiver));
-    let result = run_agent_tui(agent_events, prompt_sender, &TuiConfig::default(), None).await;
+    let result = run_agent_tui(
+        agent_events,
+        prompt_sender,
+        &TuiConfig::default(),
+        &runtime,
+        None,
+    )
+    .await;
     let _ = demo.await;
     result
 }
@@ -1057,10 +1153,10 @@ async fn run_loop<B: Backend>(
     terminal: &mut Terminal<B>,
     mut agent_events: mpsc::Receiver<AgentEvent>,
     prompts: PromptSender,
-    mut input_events: mpsc::UnboundedReceiver<InputMessage>,
-    settings: TuiSettings,
+    mut input_events: mpsc::Receiver<InputMessage>,
+    mut state: AppState,
+    notify: fn(&CompletionSettings, String) -> Result<()>,
 ) -> Result<()> {
-    let mut state = AppState::with_settings(settings);
     let mut agent_channel_open = true;
 
     loop {
@@ -1070,7 +1166,8 @@ async fn run_loop<B: Backend>(
             input = input_events.recv() => {
                 match input.context("terminal input thread stopped")? {
                     InputMessage::Key(key) => {
-                        if dispatch_action(state.reduce_key(key), &prompts)? {
+                        let action = state.reduce_key(key);
+                        if dispatch_action(action, &prompts, &mut state)? {
                             return Ok(());
                         }
                     }
@@ -1087,10 +1184,7 @@ async fn run_loop<B: Backend>(
                         }
                         if let Some(message) = state.take_completion_message() {
                             if state.completion.notify {
-                                if let Err(error) = trigger_completion_notification(
-                                    &state.completion,
-                                    message,
-                                ) {
+                                if let Err(error) = notify(&state.completion, message) {
                                     let _ = writeln!(io::stderr(), "notification failed: {error}");
                                 }
                             }
@@ -1102,15 +1196,23 @@ async fn run_loop<B: Backend>(
                     }
                 }
             }
-        }
-
-        if let Some(message) = state.poll_persistent_notice() {
-            if state.completion.notify {
-                if let Err(error) = trigger_completion_notification(&state.completion, message) {
-                    let _ = writeln!(io::stderr(), "notification failed: {error}");
+            _ = wait_for_persistent_tick(state.next_persistent_tick) => {
+                if let Some(message) = state.poll_persistent_notice() {
+                    if state.completion.notify {
+                        if let Err(error) = notify(&state.completion, message) {
+                            let _ = writeln!(io::stderr(), "notification failed: {error}");
+                        }
+                    }
                 }
             }
         }
+    }
+}
+
+async fn wait_for_persistent_tick(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -1126,16 +1228,27 @@ fn draw_if_dirty<B: Backend>(terminal: &mut Terminal<B>, state: &mut AppState) -
     Ok(true)
 }
 
-fn dispatch_action(action: UiAction, prompts: &PromptSender) -> Result<bool> {
+fn dispatch_action(action: UiAction, prompts: &PromptSender, state: &mut AppState) -> Result<bool> {
     match action {
         UiAction::None => Ok(false),
         UiAction::Quit => Ok(true),
-        UiAction::Submit(prompt) => {
-            prompts
-                .send(prompt)
-                .map_err(|_| anyhow::anyhow!("agent prompt receiver closed"))?;
-            Ok(false)
-        }
+        UiAction::Submit {
+            prompt,
+            rejected_input,
+        } => match prompts.try_send(prompt.clone()) {
+            Ok(()) => {
+                state.note_prompt_submitted(&prompt);
+                Ok(false)
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                state.note_prompt_busy(Some(rejected_input));
+                Ok(false)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                state.note_prompt_busy(Some(rejected_input));
+                Err(anyhow::anyhow!("agent prompt receiver closed"))
+            }
+        },
     }
 }
 
@@ -1351,10 +1464,7 @@ fn centered_rect(width_percent: u16, height_percent: u16, area: Rect) -> Rect {
     }
 }
 
-async fn run_demo_driver(
-    events: mpsc::Sender<AgentEvent>,
-    mut prompts: mpsc::UnboundedReceiver<String>,
-) {
+async fn run_demo_driver(events: mpsc::Sender<AgentEvent>, mut prompts: mpsc::Receiver<String>) {
     if !send_demo_stream(&events, DEMO_REPLY).await {
         return;
     }
@@ -1457,10 +1567,10 @@ struct InputThread {
 }
 
 impl InputThread {
-    fn spawn() -> Result<(Self, mpsc::UnboundedReceiver<InputMessage>)> {
+    fn spawn(capacity: usize) -> Result<(Self, mpsc::Receiver<InputMessage>)> {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
-        let (sender, receiver) = mpsc::unbounded_channel();
+        let (sender, receiver) = mpsc::channel(capacity);
         let handle = std::thread::Builder::new()
             .name("grey-tui-input".into())
             .spawn(move || read_input(thread_stop, sender))
@@ -1473,41 +1583,68 @@ impl InputThread {
             receiver,
         ))
     }
+
+    fn stop_and_join(&mut self) -> Result<()> {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("terminal input thread panicked"))?;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for InputThread {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        let _ = self.stop_and_join();
     }
 }
 
-fn read_input(stop: Arc<AtomicBool>, sender: mpsc::UnboundedSender<InputMessage>) {
+fn read_input(stop: Arc<AtomicBool>, sender: mpsc::Sender<InputMessage>) {
     while !stop.load(Ordering::Acquire) {
         match event::poll(INPUT_POLL_INTERVAL) {
             Ok(false) => {}
             Ok(true) => match event::read() {
                 Ok(Event::Key(key)) => {
-                    if sender.send(InputMessage::Key(key)).is_err() {
+                    if !send_input(&stop, &sender, InputMessage::Key(key)) {
                         return;
                     }
                 }
                 Ok(Event::Resize(_, _)) => {
-                    if sender.send(InputMessage::Resize).is_err() {
+                    if !send_input(&stop, &sender, InputMessage::Resize) {
                         return;
                     }
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    let _ = sender.send(InputMessage::Error(error.to_string()));
+                    let _ = send_input(&stop, &sender, InputMessage::Error(error.to_string()));
                     return;
                 }
             },
             Err(error) => {
-                let _ = sender.send(InputMessage::Error(error.to_string()));
+                let _ = send_input(&stop, &sender, InputMessage::Error(error.to_string()));
                 return;
+            }
+        }
+    }
+}
+
+fn send_input(
+    stop: &AtomicBool,
+    sender: &mpsc::Sender<InputMessage>,
+    mut message: InputMessage,
+) -> bool {
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return false;
+        }
+        match sender.try_send(message) {
+            Ok(()) => return true,
+            Err(mpsc::error::TrySendError::Closed(_)) => return false,
+            Err(mpsc::error::TrySendError::Full(pending)) => {
+                message = pending;
+                std::thread::park_timeout(INPUT_POLL_INTERVAL);
             }
         }
     }
@@ -1535,7 +1672,10 @@ mod tests {
         assert_eq!(state.input(), "hi");
         assert_eq!(
             state.reduce_key(key(KeyCode::Enter)),
-            UiAction::Submit("hi".into())
+            UiAction::Submit {
+                prompt: "hi".into(),
+                rejected_input: "hi".into(),
+            }
         );
         assert_eq!(state.input(), "");
 
@@ -1806,12 +1946,143 @@ mod tests {
         assert!((metrics.fps() - 100.0).abs() < f64::EPSILON);
     }
 
+    #[test]
+    fn bounded_transcript_keeps_latest_utf8_with_one_marker_for_all_events() {
+        let cap = grey_core::RuntimeConfig::default().transcript_max_bytes;
+        let mut state = AppState::default();
+        state.reduce_agent_event(AgentEvent::Delta("甲".repeat(cap / 3 + 1)));
+        let call = ToolCall {
+            id: "call-1".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({}),
+        };
+        state.reduce_agent_event(AgentEvent::ToolFinished(ToolResult::success(
+            &call,
+            "乙".repeat(cap / 3 + 1),
+        )));
+        state.reduce_agent_event(AgentEvent::Failed("最终错误".repeat(cap / 12 + 1)));
+
+        assert!(state.output().len() <= cap);
+        assert!(state.output().is_char_boundary(state.output().len()));
+        assert_eq!(state.output().matches("[cut]").count(), 1);
+        assert!(state.output().ends_with("最终错误\n"));
+    }
+
+    #[tokio::test]
+    async fn bounded_prompt_busy_rejects_second_submission_and_preserves_input() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = AppState::default();
+        for character in "first".chars() {
+            state.reduce_key(key(KeyCode::Char(character)));
+        }
+        let first = state.reduce_key(key(KeyCode::Enter));
+        assert!(!dispatch_action(first, &sender, &mut state).unwrap());
+
+        for character in "retry".chars() {
+            state.reduce_key(key(KeyCode::Char(character)));
+        }
+        let second = state.reduce_key(key(KeyCode::Enter));
+        assert!(!dispatch_action(second, &sender, &mut state).unwrap());
+
+        assert_eq!(state.input(), "retry");
+        assert!(state.status().contains("busy"));
+        assert_eq!(receiver.recv().await.as_deref(), Some("first"));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn bounded_prompt_full_race_restores_rejected_input() {
+        let (sender, _receiver) = mpsc::channel(1);
+        sender.try_send("already queued".into()).unwrap();
+        let mut state = AppState::default();
+
+        assert!(!dispatch_action(
+            UiAction::Submit {
+                prompt: "retry me".into(),
+                rejected_input: "retry me".into(),
+            },
+            &sender,
+            &mut state,
+        )
+        .unwrap());
+
+        assert_eq!(state.input(), "retry me");
+        assert!(state.status().contains("busy"));
+    }
+
+    #[tokio::test]
+    async fn bounded_prompt_rejection_preserves_typed_whitespace() {
+        let (sender, _receiver) = mpsc::channel(1);
+        sender.try_send("already queued".into()).unwrap();
+        let mut state = AppState::default();
+        for character in " retry ".chars() {
+            state.reduce_key(key(KeyCode::Char(character)));
+        }
+
+        let action = state.reduce_key(key(KeyCode::Enter));
+        assert!(!dispatch_action(action, &sender, &mut state).unwrap());
+
+        assert_eq!(state.input(), " retry ");
+    }
+
+    static REMINDER_NOTIFICATIONS: AtomicUsize = AtomicUsize::new(0);
+
+    fn count_notification(_config: &CompletionSettings, _message: String) -> Result<()> {
+        REMINDER_NOTIFICATIONS.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn persistent_reminder_timer_wakes_without_input_or_agent_event() {
+        REMINDER_NOTIFICATIONS.store(0, Ordering::SeqCst);
+        let mut config = TuiConfig::default();
+        config.completion.notify = true;
+        config.completion.persistent = true;
+        let mut state = AppState::with_settings(TuiSettings::from(&config));
+        state.schedule_completion_notice("done".into());
+        state.next_persistent_tick = Some(Instant::now() + Duration::from_millis(5));
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        let (_agent_sender, agent_events) = mpsc::channel(1);
+        let (prompt_sender, _prompt_receiver) = mpsc::channel(1);
+        let (input_sender, input_events) = mpsc::channel(1);
+        let quit = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            input_sender
+                .send(InputMessage::Key(key(KeyCode::Char('q'))))
+                .await
+                .unwrap();
+        });
+
+        run_loop(
+            &mut terminal,
+            agent_events,
+            prompt_sender,
+            input_events,
+            state,
+            count_notification,
+        )
+        .await
+        .unwrap();
+        quit.await.unwrap();
+        assert_eq!(REMINDER_NOTIFICATIONS.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn submit_action_is_forwarded_through_the_prompt_sender() {
-        let (sender, mut receiver) = mpsc::unbounded_channel();
-        assert!(!dispatch_action(UiAction::Submit("inspect".into()), &sender).unwrap());
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = AppState::default();
+        assert!(!dispatch_action(
+            UiAction::Submit {
+                prompt: "inspect".into(),
+                rejected_input: "inspect".into(),
+            },
+            &sender,
+            &mut state,
+        )
+        .unwrap());
         assert_eq!(receiver.recv().await.as_deref(), Some("inspect"));
-        assert!(dispatch_action(UiAction::Quit, &sender).unwrap());
+        assert!(dispatch_action(UiAction::Quit, &sender, &mut state).unwrap());
     }
 
     static RESTORE_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -1829,5 +2100,47 @@ mod tests {
             assert_eq!(RESTORE_CALLS.load(Ordering::SeqCst), 0);
         }
         assert_eq!(RESTORE_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn input_thread_shutdown_sets_stop_and_joins() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let exited = Arc::new(AtomicBool::new(false));
+        let thread_exited = Arc::clone(&exited);
+        let handle = std::thread::spawn(move || {
+            while !thread_stop.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            thread_exited.store(true, Ordering::Release);
+        });
+        let mut input = InputThread {
+            stop,
+            handle: Some(handle),
+        };
+
+        input.stop_and_join().unwrap();
+
+        assert!(exited.load(Ordering::Acquire));
+        assert!(input.handle.is_none());
+    }
+
+    #[test]
+    fn full_input_queue_still_stops_without_waiting_for_receiver_drop() {
+        let (sender, _receiver) = mpsc::channel(1);
+        sender.try_send(InputMessage::Resize).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let (done, finished) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let sent = send_input(&thread_stop, &sender, InputMessage::Resize);
+            done.send(sent).unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(10));
+
+        stop.store(true, Ordering::Release);
+
+        assert!(!finished.recv_timeout(Duration::from_millis(250)).unwrap());
+        handle.join().unwrap();
     }
 }
