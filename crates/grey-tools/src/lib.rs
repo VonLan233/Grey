@@ -1281,6 +1281,34 @@ fn compact_text_tool_output(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn hook_shell_uses_non_login_legacy_boundary() {
+        let spec = hook_command_spec("printf hook", None, 10);
+        assert_eq!(spec.program, std::ffi::OsString::from("/bin/sh"));
+        assert_eq!(
+            spec.args,
+            ["-c", "printf hook"]
+                .into_iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hook_shell_uses_cmd_legacy_boundary() {
+        let spec = hook_command_spec("echo hook", None, 10);
+        assert_eq!(spec.program, std::ffi::OsString::from("cmd.exe"));
+        assert_eq!(
+            spec.args,
+            ["/D", "/S", "/C", "echo hook"]
+                .into_iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn compact_tool_output_marks_truncated_items() {
         let output = compact_tool_output(
@@ -1356,7 +1384,16 @@ fn extract_permission_decision_from_hook_output(output: &str) -> Option<bool> {
 }
 
 async fn run_shell_command(command: &str, input: Option<&str>, timeout_ms: u64) -> Result<String> {
-    run_command_inner("sh", &["-lc", command], input, timeout_ms, None).await
+    run_command_spec(hook_command_spec(command, input, timeout_ms)).await
+}
+
+fn hook_command_spec(command: &str, input: Option<&str>, timeout_ms: u64) -> CommandSpec {
+    let mut spec = command_with_runtime_env(CommandSpec::legacy_shell(command))
+        .timeout(Duration::from_millis(timeout_ms));
+    if let Some(input) = input {
+        spec = spec.stdin(input.as_bytes().to_vec());
+    }
+    spec
 }
 
 async fn execute_command(
@@ -1395,6 +1432,10 @@ async fn run_command_inner(
     if let Some(input) = input {
         spec = spec.stdin(input.as_bytes().to_vec());
     }
+    run_command_spec(spec).await
+}
+
+async fn run_command_spec(spec: CommandSpec) -> Result<String> {
     let output = run_bounded(spec).await?;
     let text = output.combined_lossy();
     if output.status.success() {

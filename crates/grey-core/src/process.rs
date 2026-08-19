@@ -11,11 +11,13 @@ use process_wrap::tokio::ProcessGroup;
 use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 
 pub const DEFAULT_STDIN_LIMIT: usize = 1024 * 1024;
 pub const DEFAULT_STDOUT_LIMIT: usize = 64 * 1024;
 pub const DEFAULT_STDERR_LIMIT: usize = 64 * 1024;
 pub const OUTPUT_TRUNCATED_MARKER: &str = "\n[output truncated by Grey]\n";
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct CommandSpec {
@@ -170,10 +172,12 @@ pub async fn run_bounded(spec: CommandSpec) -> Result<CommandOutput> {
 }
 
 enum Completion {
-    Exited(std::io::Result<ExitStatus>),
     TimedOut,
     Cancelled,
 }
+
+type DrainTask = JoinHandle<std::io::Result<(Vec<u8>, bool)>>;
+type StdinTask = JoinHandle<std::io::Result<()>>;
 
 async fn supervise(
     mut child: Box<dyn ChildWrapper>,
@@ -185,9 +189,9 @@ async fn supervise(
 ) -> Result<CommandOutput> {
     let stdout = child.stdout().take().context("opening command stdout")?;
     let stderr = child.stderr().take().context("opening command stderr")?;
-    let stdout_task = tokio::spawn(drain_bounded(stdout, stdout_limit));
-    let stderr_task = tokio::spawn(drain_bounded(stderr, stderr_limit));
-    let stdin_task = child.stdin().take().map(|mut pipe| {
+    let mut stdout_task = tokio::spawn(drain_bounded(stdout, stdout_limit));
+    let mut stderr_task = tokio::spawn(drain_bounded(stderr, stderr_limit));
+    let mut stdin_task = child.stdin().take().map(|mut pipe| {
         tokio::spawn(async move {
             pipe.write_all(&stdin).await?;
             pipe.shutdown().await
@@ -195,26 +199,50 @@ async fn supervise(
     });
 
     let completion = tokio::select! {
-        status = child.wait() => Completion::Exited(status),
+        output = collect_output(
+            child.as_mut(),
+            &mut stdout_task,
+            &mut stderr_task,
+            &mut stdin_task,
+        ) => return output,
         _ = tokio::time::sleep(timeout) => Completion::TimedOut,
         _ = cancelled => Completion::Cancelled,
     };
 
-    let (status, stop_error) = match completion {
-        Completion::Exited(status) => (status.context("waiting for command")?, None),
-        Completion::TimedOut => (
-            terminate_and_reap(child.as_mut()).await?,
-            Some(anyhow::anyhow!(
-                "command timed out after {}ms",
-                timeout.as_millis()
-            )),
-        ),
-        Completion::Cancelled => (
-            terminate_and_reap(child.as_mut()).await?,
-            Some(anyhow::anyhow!("command cancelled")),
-        ),
+    let stop_error = match completion {
+        Completion::TimedOut => {
+            anyhow::anyhow!("command timed out after {}ms", timeout.as_millis())
+        }
+        Completion::Cancelled => anyhow::anyhow!("command cancelled"),
     };
+    let cleanup = tokio::time::timeout(CLEANUP_TIMEOUT, terminate_and_reap(child.as_mut())).await;
+    abort_io_tasks(&stdout_task, &stderr_task, &stdin_task);
+    match cleanup {
+        Ok(Ok(_)) => Err(stop_error),
+        Ok(Err(error)) => Err(error.context("cleaning up command process tree")),
+        Err(_) => Err(anyhow::anyhow!(
+            "command cleanup timed out after {}ms",
+            CLEANUP_TIMEOUT.as_millis()
+        )),
+    }
+}
 
+async fn collect_output(
+    child: &mut dyn ChildWrapper,
+    stdout_task: &mut DrainTask,
+    stderr_task: &mut DrainTask,
+    stdin_task: &mut Option<StdinTask>,
+) -> Result<CommandOutput> {
+    let status = child.wait().await.context("waiting for command")?;
+    collect_after_status(status, stdout_task, stderr_task, stdin_task).await
+}
+
+async fn collect_after_status(
+    status: ExitStatus,
+    stdout_task: &mut DrainTask,
+    stderr_task: &mut DrainTask,
+    stdin_task: &mut Option<StdinTask>,
+) -> Result<CommandOutput> {
     let (stdout, stdout_truncated) = stdout_task
         .await
         .context("stdout drain task failed")?
@@ -225,12 +253,7 @@ async fn supervise(
         .context("reading command stderr")?;
     if let Some(stdin_task) = stdin_task {
         let stdin_result = stdin_task.await.context("stdin writer task failed")?;
-        if stop_error.is_none() {
-            stdin_result.context("writing command stdin")?;
-        }
-    }
-    if let Some(error) = stop_error {
-        return Err(error);
+        stdin_result.context("writing command stdin")?;
     }
 
     Ok(CommandOutput {
@@ -240,6 +263,18 @@ async fn supervise(
         stdout_truncated,
         stderr_truncated,
     })
+}
+
+fn abort_io_tasks(
+    stdout_task: &DrainTask,
+    stderr_task: &DrainTask,
+    stdin_task: &Option<StdinTask>,
+) {
+    stdout_task.abort();
+    stderr_task.abort();
+    if let Some(stdin_task) = stdin_task {
+        stdin_task.abort();
+    }
 }
 
 async fn terminate_and_reap(child: &mut dyn ChildWrapper) -> Result<ExitStatus> {
@@ -297,6 +332,10 @@ mod tests {
 
     const MODE_ENV: &str = "GREY_PROCESS_TEST_MODE";
     const PID_FILE_ENV: &str = "GREY_PROCESS_TEST_PID_FILE";
+    #[cfg(unix)]
+    const PARENT_ENV: &str = "HOME";
+    #[cfg(windows)]
+    const PARENT_ENV: &str = "USERPROFILE";
 
     fn helper(mode: &str) -> CommandSpec {
         CommandSpec::direct(
@@ -313,8 +352,15 @@ mod tests {
     async fn wait_for_pid_file(path: &std::path::Path) -> (u32, u32) {
         for _ in 0..200 {
             if let Ok(contents) = fs::read_to_string(path) {
-                let mut pids = contents.split_whitespace().map(|pid| pid.parse().unwrap());
-                return (pids.next().unwrap(), pids.next().unwrap());
+                let mut pids = contents.split_whitespace();
+                let parsed = (
+                    pids.next().and_then(|pid| pid.parse().ok()),
+                    pids.next().and_then(|pid| pid.parse().ok()),
+                    pids.next(),
+                );
+                if let (Some(parent), Some(grandchild), None) = parsed {
+                    return (parent, grandchild);
+                }
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -336,6 +382,20 @@ mod tests {
             .args(["/FI", &filter, "/NH"])
             .output()
             .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains(&pid.to_string()))
+    }
+
+    #[cfg(unix)]
+    fn kill_process(pid: u32) {
+        let _ = Command::new("/bin/kill")
+            .args([OsString::from("-KILL"), OsString::from(pid.to_string())])
+            .status();
+    }
+
+    #[cfg(windows)]
+    fn kill_process(pid: u32) {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status();
     }
 
     async fn wait_until_dead(pid: u32) -> bool {
@@ -366,12 +426,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_environment_does_not_inherit_home() {
-        assert!(std::env::var_os("HOME").is_some());
-        let output = run_bounded(helper("print-home")).await.unwrap();
+    async fn default_environment_does_not_inherit_parent_profile() {
+        assert!(std::env::var_os(PARENT_ENV).is_some());
+        let output = run_bounded(helper("print-parent-env")).await.unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
 
-        assert!(stdout.contains("HOME_IS_UNSET"), "stdout was {stdout:?}");
+        assert!(
+            stdout.contains("PARENT_ENV_IS_UNSET"),
+            "stdout was {stdout:?}"
+        );
     }
 
     #[tokio::test]
@@ -436,6 +499,94 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn timeout_covers_pipes_held_by_descendant_after_leader_exit() {
+        let directory = tempdir().unwrap();
+        let pid_file = directory.path().join("orphan-timeout-pids");
+        let completed = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_bounded(
+                helper("orphan-pipes")
+                    .env(PID_FILE_ENV, pid_file.as_os_str())
+                    .timeout(Duration::from_millis(100)),
+            ),
+        )
+        .await;
+        let (parent, grandchild) = wait_for_pid_file(&pid_file).await;
+        if completed.is_err() {
+            kill_process(grandchild);
+            assert!(wait_until_dead(grandchild).await);
+        }
+
+        assert!(
+            completed.is_ok(),
+            "run_bounded ignored its pipe-drain deadline"
+        );
+        let error = completed.unwrap().unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+        assert!(wait_until_dead(parent).await, "leader {parent} survived");
+        assert!(
+            wait_until_dead(grandchild).await,
+            "descendant {grandchild} survived pipe-drain timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_handles_one_drain_finishing_before_the_other() {
+        let directory = tempdir().unwrap();
+        let pid_file = directory.path().join("orphan-stderr-timeout-pids");
+        let completed = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_bounded(
+                helper("orphan-stderr")
+                    .env(PID_FILE_ENV, pid_file.as_os_str())
+                    .timeout(Duration::from_millis(100)),
+            ),
+        )
+        .await;
+        let (_, grandchild) = wait_for_pid_file(&pid_file).await;
+        if completed.is_err() {
+            kill_process(grandchild);
+            assert!(wait_until_dead(grandchild).await);
+        }
+
+        assert!(completed.is_ok(), "run_bounded hung after a partial drain");
+        let error = completed.unwrap().unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+        assert!(
+            wait_until_dead(grandchild).await,
+            "descendant {grandchild} survived partial-drain timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_covers_pipes_held_after_leader_exit() {
+        let directory = tempdir().unwrap();
+        let pid_file = directory.path().join("orphan-cancel-pids");
+        let task = tokio::spawn(run_bounded(
+            helper("orphan-pipes")
+                .env(PID_FILE_ENV, pid_file.as_os_str())
+                .timeout(Duration::from_secs(30)),
+        ));
+        let (parent, grandchild) = wait_for_pid_file(&pid_file).await;
+        assert!(
+            wait_until_dead(parent).await,
+            "leader {parent} did not exit"
+        );
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let descendant_was_reaped = wait_until_dead(grandchild).await;
+        if !descendant_was_reaped {
+            kill_process(grandchild);
+            assert!(wait_until_dead(grandchild).await);
+        }
+        assert!(
+            descendant_was_reaped,
+            "descendant {grandchild} survived caller cancellation after leader exit"
+        );
+    }
+
     #[test]
     fn process_test_helper() {
         let Some(mode) = std::env::var_os(MODE_ENV) else {
@@ -450,11 +601,11 @@ mod tests {
                 stdout.join().unwrap().unwrap();
                 stderr.join().unwrap().unwrap();
             }
-            "print-home" => {
-                if std::env::var_os("HOME").is_none() {
-                    print!("HOME_IS_UNSET");
+            "print-parent-env" => {
+                if std::env::var_os(PARENT_ENV).is_none() {
+                    print!("PARENT_ENV_IS_UNSET");
                 } else {
-                    print!("HOME_WAS_INHERITED");
+                    print!("PARENT_ENV_WAS_INHERITED");
                 }
             }
             "parent" => {
@@ -472,6 +623,41 @@ mod tests {
                 let path = std::env::var_os(PID_FILE_ENV).unwrap();
                 fs::write(path, format!("{} {}", std::process::id(), grandchild.id())).unwrap();
                 grandchild.wait().unwrap();
+            }
+            "orphan-pipes" => {
+                let executable = std::env::current_exe().unwrap();
+                // Intentionally orphan the helper so the supervisor must close inherited pipes.
+                #[allow(clippy::zombie_processes)]
+                let grandchild = Command::new(executable)
+                    .args([
+                        "--exact",
+                        "process::tests::process_test_helper",
+                        "--nocapture",
+                    ])
+                    .env_clear()
+                    .env(MODE_ENV, "grandchild")
+                    .spawn()
+                    .unwrap();
+                let path = std::env::var_os(PID_FILE_ENV).unwrap();
+                fs::write(path, format!("{} {}", std::process::id(), grandchild.id())).unwrap();
+            }
+            "orphan-stderr" => {
+                let executable = std::env::current_exe().unwrap();
+                // Intentionally orphan the helper so only its inherited stderr stays open.
+                #[allow(clippy::zombie_processes)]
+                let grandchild = Command::new(executable)
+                    .args([
+                        "--exact",
+                        "process::tests::process_test_helper",
+                        "--nocapture",
+                    ])
+                    .env_clear()
+                    .env(MODE_ENV, "grandchild")
+                    .stdout(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap();
+                let path = std::env::var_os(PID_FILE_ENV).unwrap();
+                fs::write(path, format!("{} {}", std::process::id(), grandchild.id())).unwrap();
             }
             "grandchild" => thread::sleep(Duration::from_secs(30)),
             unexpected => panic!("unexpected helper mode {unexpected}"),
