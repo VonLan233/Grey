@@ -1480,7 +1480,8 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
     let usage_tracker = agent.usage_tracker();
     let (events_tx, events_rx) = mpsc::unbounded_channel();
     let (prompts_tx, mut prompts_rx) = mpsc::unbounded_channel::<String>();
-    let workspace = workspace.to_path_buf();
+    let workspace_for_worker = workspace.to_path_buf();
+    let workspace_name_for_worker = workspace_for_worker.to_string_lossy().into_owned();
     let no_save = cli.no_save;
     let pre_prompt_hooks = config.hooks.pre_prompt.clone();
     let worker = tokio::spawn(async move {
@@ -1507,6 +1508,8 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
             };
             match result {
                 Ok(outcome) => {
+                    let provider = outcome.provider_id.clone();
+                    let model = outcome.model.clone();
                     let mut current = match session.take() {
                         Some(mut current) => {
                             current.messages.clone_from(&outcome.messages);
@@ -1520,7 +1523,7 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
                                 .chars()
                                 .take(80)
                                 .collect::<String>(),
-                            workspace.to_string_lossy(),
+                            &workspace_name_for_worker,
                             outcome.messages.clone(),
                         ),
                     };
@@ -1544,6 +1547,8 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
                     let _ = events_tx.send(AgentEvent::Completed {
                         usage: outcome.usage,
                         steps: outcome.steps,
+                        provider,
+                        model,
                     });
                 }
                 Err(error) => {
@@ -1552,10 +1557,35 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
             }
         }
     });
-    let ui_result = grey_tui::run_agent_tui(events_rx, prompts_tx).await;
+    let branch = detect_git_branch(&workspace_for_worker);
+    let ui_result =
+        grey_tui::run_agent_tui(events_rx, prompts_tx, &config.tui, branch.as_deref()).await;
     worker.abort();
     let _ = worker.await;
     ui_result
+}
+
+fn detect_git_branch(workspace: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args([
+            "-C",
+            workspace.to_string_lossy().as_ref(),
+            "rev-parse",
+            "--abbrev-ref",
+            "HEAD",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8(output.stdout).ok()?;
+    let branch = branch.trim();
+    if branch.is_empty() || branch == "HEAD" {
+        None
+    } else {
+        Some(branch.to_string())
+    }
 }
 
 async fn apply_pre_prompt_hooks(commands: &[String], prompt: &str) -> Result<String> {

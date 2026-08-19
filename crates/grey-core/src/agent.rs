@@ -56,6 +56,8 @@ pub enum AgentEvent {
     Completed {
         usage: Usage,
         steps: usize,
+        provider: String,
+        model: String,
     },
     Failed(String),
 }

@@ -243,6 +243,184 @@ pub struct LspConfig {
     pub rust_analyzer: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub struct TuiColorOverrides {
+    #[serde(default)]
+    pub border: Option<String>,
+    #[serde(default)]
+    pub accent: Option<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub status_fg: Option<String>,
+    #[serde(default)]
+    pub status_bg: Option<String>,
+    #[serde(default)]
+    pub muted: Option<String>,
+}
+
+fn default_tui_theme() -> String {
+    "default".to_string()
+}
+
+fn default_tui_input_lines() -> u16 {
+    3
+}
+
+fn default_tui_completion_long_running_steps() -> usize {
+    4
+}
+
+fn default_tui_completion_long_running_secs() -> u64 {
+    120
+}
+
+fn default_tui_completion_bell() -> bool {
+    true
+}
+
+fn default_tui_completion_strong() -> bool {
+    false
+}
+
+fn default_tui_completion_notify() -> bool {
+    false
+}
+
+fn default_tui_completion_persistent() -> bool {
+    false
+}
+
+fn default_tui_leader_key() -> String {
+    "\\".to_string()
+}
+
+fn default_tui_help_key() -> String {
+    "k".to_string()
+}
+
+fn default_tui_quit_key() -> String {
+    "ctrl-c".to_string()
+}
+
+fn default_tui_clear_key() -> String {
+    "ctrl-l".to_string()
+}
+
+fn default_tui_scroll_up_key() -> String {
+    "pageup".to_string()
+}
+
+fn default_tui_scroll_down_key() -> String {
+    "pagedown".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TuiThemeConfig {
+    #[serde(default = "default_tui_theme")]
+    pub preset: String,
+    #[serde(default)]
+    pub overrides: TuiColorOverrides,
+}
+
+impl Default for TuiThemeConfig {
+    fn default() -> Self {
+        Self {
+            preset: default_tui_theme(),
+            overrides: TuiColorOverrides::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TuiLayoutConfig {
+    #[serde(default = "default_tui_input_lines")]
+    pub input_lines: u16,
+}
+
+impl Default for TuiLayoutConfig {
+    fn default() -> Self {
+        Self {
+            input_lines: default_tui_input_lines(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TuiCompletionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_tui_completion_long_running_steps")]
+    pub long_running_steps: usize,
+    #[serde(default = "default_tui_completion_long_running_secs")]
+    pub long_running_seconds: u64,
+    #[serde(default = "default_tui_completion_bell")]
+    pub bell: bool,
+    #[serde(default = "default_tui_completion_strong")]
+    pub strong_bell: bool,
+    #[serde(default = "default_tui_completion_notify")]
+    pub notify: bool,
+    #[serde(default = "default_tui_completion_persistent")]
+    pub persistent: bool,
+}
+
+impl Default for TuiCompletionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            long_running_steps: default_tui_completion_long_running_steps(),
+            long_running_seconds: default_tui_completion_long_running_secs(),
+            bell: default_tui_completion_bell(),
+            strong_bell: default_tui_completion_strong(),
+            notify: default_tui_completion_notify(),
+            persistent: default_tui_completion_persistent(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TuiKeysConfig {
+    #[serde(default = "default_tui_leader_key")]
+    pub leader: String,
+    #[serde(default = "default_tui_help_key")]
+    pub help: String,
+    #[serde(default = "default_tui_quit_key")]
+    pub quit: String,
+    #[serde(default = "default_tui_clear_key")]
+    pub clear: String,
+    #[serde(default = "default_tui_scroll_up_key")]
+    pub scroll_up: String,
+    #[serde(default = "default_tui_scroll_down_key")]
+    pub scroll_down: String,
+}
+
+impl Default for TuiKeysConfig {
+    fn default() -> Self {
+        Self {
+            leader: default_tui_leader_key(),
+            help: default_tui_help_key(),
+            quit: default_tui_quit_key(),
+            clear: default_tui_clear_key(),
+            scroll_up: default_tui_scroll_up_key(),
+            scroll_down: default_tui_scroll_down_key(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TuiConfig {
+    pub theme: TuiThemeConfig,
+    pub layout: TuiLayoutConfig,
+    pub completion: TuiCompletionConfig,
+    pub keys: TuiKeysConfig,
+}
+
 // ---------------------------------------------------------------------------
 // Top-level config
 // ---------------------------------------------------------------------------
@@ -270,6 +448,8 @@ pub struct GreyConfig {
     pub hooks: HooksConfig,
     /// External command MCP tools.
     pub mcp_tools: Vec<McpToolConfig>,
+    /// TUI preferences for theme/layout/reminder.
+    pub tui: TuiConfig,
 
     // Legacy fields (kept for backward compat; migrated into `providers`).
     pub provider: String,
@@ -296,6 +476,7 @@ impl Default for GreyConfig {
             usage: UsageConfig::default(),
             hooks: HooksConfig::default(),
             mcp_tools: Vec::new(),
+            tui: TuiConfig::default(),
             provider: "mock".into(),
             model: "grey-default".into(),
             openai: OpenAiConfig {
@@ -447,6 +628,9 @@ fn merge_file(base: GreyConfig, over: GreyConfig, raw: &toml::Value) -> GreyConf
     if !table.contains_key("mcp_tools") {
         merged.mcp_tools = defaults.mcp_tools;
     }
+    if !table.contains_key("tui") {
+        merged.tui = defaults.tui;
+    }
     merged
 }
 
@@ -480,6 +664,16 @@ fn merge(mut base: GreyConfig, over: GreyConfig) -> GreyConfig {
     }
     if !over.mcp_tools.is_empty() {
         base.mcp_tools = over.mcp_tools;
+    }
+    if !over.tui.theme.preset.is_empty()
+        || !over.tui.layout.input_lines.eq(&0)
+        || over.tui.completion.enabled
+    {
+        base.tui = over.tui;
+    } else {
+        base.tui.theme = over.tui.theme;
+        base.tui.layout = over.tui.layout;
+        base.tui.completion = over.tui.completion;
     }
     // Legacy fields
     if !over.provider.is_empty() {
@@ -930,6 +1124,51 @@ ttl_hours = 12
         assert_eq!(cfg.fallback.providers, vec!["mock"]);
         assert_eq!(cfg.context.max_tokens, 65536);
         assert!(cfg.cache.enabled);
+    }
+
+    #[test]
+    fn parses_tui_config_section() {
+        let toml_str = r##"
+[tui]
+theme = { preset = "slate", overrides = { border = "#1f2937", accent = "#60a5fa" } }
+
+[tui.layout]
+input_lines = 6
+
+[tui.completion]
+enabled = false
+long_running_steps = 8
+long_running_seconds = 45
+bell = true
+strong_bell = true
+notify = true
+persistent = true
+    [tui.keys]
+leader = "\\"
+help = "k"
+quit = "ctrl-c"
+clear = "ctrl-l"
+scroll_up = "pageup"
+scroll_down = "pagedown"
+"##;
+        let cfg: GreyConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.tui.theme.preset, "slate");
+        assert_eq!(cfg.tui.theme.overrides.border.as_deref(), Some("#1f2937"));
+        assert_eq!(cfg.tui.theme.overrides.accent.as_deref(), Some("#60a5fa"));
+        assert_eq!(cfg.tui.layout.input_lines, 6);
+        assert!(!cfg.tui.completion.enabled);
+        assert_eq!(cfg.tui.completion.long_running_steps, 8);
+        assert_eq!(cfg.tui.completion.long_running_seconds, 45);
+        assert!(cfg.tui.completion.bell);
+        assert!(cfg.tui.completion.strong_bell);
+        assert!(cfg.tui.completion.notify);
+        assert!(cfg.tui.completion.persistent);
+        assert_eq!(cfg.tui.keys.leader, "\\");
+        assert_eq!(cfg.tui.keys.help, "k");
+        assert_eq!(cfg.tui.keys.quit, "ctrl-c");
+        assert_eq!(cfg.tui.keys.clear, "ctrl-l");
+        assert_eq!(cfg.tui.keys.scroll_up, "pageup");
+        assert_eq!(cfg.tui.keys.scroll_down, "pagedown");
     }
 
     #[test]

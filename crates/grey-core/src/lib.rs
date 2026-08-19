@@ -19,7 +19,8 @@ pub use cache::{CacheStats, CachedResponse, RequestCache};
 pub use config::{
     AnthropicConfig, CacheConfig, ContextConfig, FallbackConfig, GreyConfig, HooksConfig,
     LspConfig, McpToolConfig, ModelEntry, OpenAiConfig, ProviderEntry, RouteRule, TaskKind,
-    UsageConfig,
+    TuiColorOverrides, TuiCompletionConfig, TuiConfig, TuiKeysConfig, TuiLayoutConfig,
+    TuiThemeConfig, UsageConfig,
 };
 pub use context::{ContextAudit, ContextManager};
 pub use provider::{

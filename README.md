@@ -14,7 +14,7 @@ Grey 已完成 P0 技术验证，并具备 P1 的首个可用纵向闭环：同�
 上下文预算、请求缓存和 usage 持久化；MCP 与 Hook 也已接入（Prompt Hook、工具前后
 Hook、MCP Command Tool）；P3 已补齐多 Agent 编排与会话化记忆持久化。
 LSP 工具现已支持 `lsp_*` 结果的路径级语义视图注入会话（并按 tool/path 去重），
-WASM 插件、图片、桌面提醒与发布打包仍在 P5–P7。
+P5 已进入交付：TUI 支持布局高度/主题配置与基础完成提醒；WASM 插件、图片与发布打包仍在 P6–P7。
 
 ## 已实现
 
@@ -36,6 +36,7 @@ WASM 插件、图片、桌面提醒与发布打包仍在 P5–P7。
 - 每会话 token/cost usage 记录，跨 CLI 调用累积并由 `usage show/summary` 查询
 - MCP 命令工具与 Hook：`pre_prompt`、`pre_tool_call`、`post_tool_call`
 - 多 Agent 编排：`grey orchestrate` 并行运行子 agent，支持 `--session`/`--continue` 与结果持久化
+- TUI 外观与提醒：`[tui]` 布局高度、主题与长任务完成提醒可配置（可控制终端鸣铃、强鸣铃）
 
 完整路线图见[阶段性开发文档](docs/阶段性开发文档.md)，架构背景见[项目计划书](docs/项目计划书.md)。
 
@@ -140,7 +141,14 @@ pre_prompt = ["cat"]
 name = "ls"
 command = "ls"
 args = [".", "-la"]
+
+[tui]
+layout = { input_lines = 6 }
+theme = { preset = "slate", overrides = { border = "#1f2937", accent = "#60a5fa", prompt = "yellow", status_fg = "black", status_bg = "#60a5fa" } }
+completion = { enabled = true, long_running_steps = 4, long_running_seconds = 120, bell = true, strong_bell = true, notify = true, persistent = true }
+keys = { leader = "\\", help = "k", quit = "ctrl-c", clear = "ctrl-l", scroll_up = "pageup", scroll_down = "pagedown" }
 ```
+状态栏会展示当前任务、模型（provider/model）、分支、输入/输出 token、错误状态，并支持 `<leader>k` 打开快捷键帮助（默认 leader 为 `\\`）。
 
 旧版配置仍兼容，但会输出迁移提示：
 

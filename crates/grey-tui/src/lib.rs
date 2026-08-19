@@ -6,11 +6,12 @@
 //! I/O out of the behavior tests. [`run_stream_demo`] retains the P0 streaming
 //! benchmark while exercising the same event path as a real agent.
 
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -21,12 +22,13 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use grey_core::AgentEvent;
+use grey_core::{AgentEvent, TuiCompletionConfig, TuiConfig, TuiKeysConfig, TuiLayoutConfig};
+use notify_rust::Notification;
 use ratatui::{
     backend::{Backend, CrosstermBackend},
-    layout::{Constraint, Layout},
+    layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Wrap},
     Frame, Terminal,
 };
@@ -36,6 +38,365 @@ use unicode_width::UnicodeWidthStr;
 const DEMO_REPLY: &str = "Grey 是一个轻量、高性能、可扩展的代码 Agent Harness。\n\n这是 Spike A 的模拟流式输出：消息按小块持续流入 TUI 并增量渲染，状态栏实时显示帧耗时与渲染频率。输入内容后回车会触发一轮新的模拟回复，Esc、Ctrl-C 或空输入时按 q 退出。";
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(80);
 const SCROLL_PAGE_LINES: u16 = 5;
+const PERSISTENT_REMINDER_TICK: Duration = Duration::from_millis(1800);
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CompletionBell {
+    Soft,
+    Strong,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct KeyBinding {
+    code: KeyCode,
+    modifiers: KeyModifiers,
+}
+
+impl KeyBinding {
+    fn matches(&self, event: KeyEvent) -> bool {
+        self.code == event.code && self.modifiers == event.modifiers
+    }
+
+    fn label(&self) -> String {
+        if self.modifiers.contains(KeyModifiers::CONTROL) {
+            if self.code == KeyCode::Char(' ') {
+                "ctrl-space".into()
+            } else {
+                format!(
+                    "ctrl-{}",
+                    key_code_char(self.code).unwrap_or('?').to_ascii_lowercase()
+                )
+            }
+        } else {
+            key_code_char(self.code)
+                .map(|c| format!("{c}"))
+                .unwrap_or_else(|| format!("{:?}", self.code).to_lowercase())
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RenderTheme {
+    border: Color,
+    accent: Color,
+    prompt: Color,
+    status_fg: Color,
+    status_bg: Color,
+    muted: Color,
+}
+
+#[derive(Debug, Clone)]
+struct TuiTheme {
+    colors: RenderTheme,
+}
+
+impl TuiTheme {
+    fn from_config(config: &grey_core::TuiThemeConfig) -> Self {
+        let mut theme = match config.preset.as_str() {
+            "slate" => RenderTheme {
+                border: Color::Blue,
+                accent: Color::LightBlue,
+                prompt: Color::LightBlue,
+                status_fg: Color::White,
+                status_bg: Color::Blue,
+                muted: Color::DarkGray,
+            },
+            "sunset" => RenderTheme {
+                border: Color::DarkGray,
+                accent: Color::LightYellow,
+                prompt: Color::Yellow,
+                status_fg: Color::Black,
+                status_bg: Color::LightYellow,
+                muted: Color::Gray,
+            },
+            "mono" => RenderTheme {
+                border: Color::White,
+                accent: Color::White,
+                prompt: Color::White,
+                status_fg: Color::Black,
+                status_bg: Color::White,
+                muted: Color::DarkGray,
+            },
+            _ => RenderTheme {
+                border: Color::Blue,
+                accent: Color::Green,
+                prompt: Color::Green,
+                status_fg: Color::Yellow,
+                status_bg: Color::Blue,
+                muted: Color::DarkGray,
+            },
+        };
+        apply_theme_override(&mut theme, &config.overrides);
+        Self { colors: theme }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TuiSettings {
+    theme: TuiTheme,
+    layout: TuiLayoutConfig,
+    completion: TuiCompletionConfig,
+    keys: TuiKeyBindings,
+    git_branch: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TuiKeyBindings {
+    leader: KeyBinding,
+    help: KeyBinding,
+    quit: KeyBinding,
+    clear: KeyBinding,
+    scroll_up: KeyBinding,
+    scroll_down: KeyBinding,
+}
+
+impl From<&TuiConfig> for TuiSettings {
+    fn from(config: &TuiConfig) -> Self {
+        Self {
+            theme: TuiTheme::from_config(&config.theme),
+            layout: TuiLayoutConfig {
+                input_lines: config.layout.input_lines.max(1),
+            },
+            completion: config.completion.clone(),
+            keys: TuiKeyBindings::from_config(&config.keys),
+            git_branch: None,
+        }
+    }
+}
+
+impl TuiSettings {
+    fn with_git_branch(mut self, git_branch: Option<String>) -> Self {
+        self.git_branch = git_branch;
+        self
+    }
+
+    fn branch_label(&self) -> Option<&str> {
+        self.git_branch.as_deref()
+    }
+}
+
+impl TuiKeyBindings {
+    fn from_config(config: &TuiKeysConfig) -> Self {
+        Self {
+            leader: parse_keybinding(&config.leader).unwrap_or_else(default_leader_key),
+            help: parse_keybinding(&config.help).unwrap_or_else(default_help_key),
+            quit: parse_keybinding(&config.quit).unwrap_or_else(default_quit_key),
+            clear: parse_keybinding(&config.clear).unwrap_or_else(default_clear_key),
+            scroll_up: parse_keybinding(&config.scroll_up).unwrap_or_else(default_scroll_up_key),
+            scroll_down: parse_keybinding(&config.scroll_down)
+                .unwrap_or_else(default_scroll_down_key),
+        }
+    }
+
+    fn labels(&self) -> KeyBindingLabels {
+        KeyBindingLabels {
+            leader: self.leader.label(),
+            help: self.help.label(),
+            quit: self.quit.label(),
+            clear: self.clear.label(),
+            scroll_up: self.scroll_up.label(),
+            scroll_down: self.scroll_down.label(),
+        }
+    }
+}
+
+struct KeyBindingLabels {
+    leader: String,
+    help: String,
+    quit: String,
+    clear: String,
+    scroll_up: String,
+    scroll_down: String,
+}
+
+fn parse_keybinding(input: &str) -> Option<KeyBinding> {
+    let value = input.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value.eq_ignore_ascii_case("esc") {
+        return Some(KeyBinding {
+            code: KeyCode::Esc,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+    if value.eq_ignore_ascii_case("space") {
+        return Some(KeyBinding {
+            code: KeyCode::Char(' '),
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+    if value.eq_ignore_ascii_case("pageup") {
+        return Some(KeyBinding {
+            code: KeyCode::PageUp,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+    if value.eq_ignore_ascii_case("pagedown") {
+        return Some(KeyBinding {
+            code: KeyCode::PageDown,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+    if value.eq_ignore_ascii_case("home") {
+        return Some(KeyBinding {
+            code: KeyCode::Home,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+    if value.eq_ignore_ascii_case("end") {
+        return Some(KeyBinding {
+            code: KeyCode::End,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+    if let Some(rest) = value.strip_prefix("ctrl-") {
+        let control_char = if rest.eq_ignore_ascii_case("space") {
+            ' '
+        } else {
+            let mut chars = rest.chars();
+            let ch = chars.next()?;
+            if chars.next().is_some() {
+                return None;
+            }
+            ch
+        };
+        return Some(KeyBinding {
+            code: KeyCode::Char(control_char),
+            modifiers: KeyModifiers::CONTROL,
+        });
+    }
+    let mut chars = value.chars();
+    let ch = chars.next()?;
+    if chars.next().is_none() {
+        return Some(KeyBinding {
+            code: KeyCode::Char(ch),
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+    None
+}
+
+fn default_leader_key() -> KeyBinding {
+    KeyBinding {
+        code: KeyCode::Char('\\'),
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+fn default_help_key() -> KeyBinding {
+    KeyBinding {
+        code: KeyCode::Char('k'),
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+fn default_quit_key() -> KeyBinding {
+    KeyBinding {
+        code: KeyCode::Char('c'),
+        modifiers: KeyModifiers::CONTROL,
+    }
+}
+
+fn default_clear_key() -> KeyBinding {
+    KeyBinding {
+        code: KeyCode::Char('l'),
+        modifiers: KeyModifiers::CONTROL,
+    }
+}
+
+fn default_scroll_up_key() -> KeyBinding {
+    KeyBinding {
+        code: KeyCode::PageUp,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+fn default_scroll_down_key() -> KeyBinding {
+    KeyBinding {
+        code: KeyCode::PageDown,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+fn key_code_char(code: KeyCode) -> Option<char> {
+    match code {
+        KeyCode::Char(ch) => Some(ch),
+        _ => None,
+    }
+}
+
+impl Default for TuiSettings {
+    fn default() -> Self {
+        Self::from(&TuiConfig::default())
+    }
+}
+
+fn parse_color(input: &str) -> Option<Color> {
+    let value = input.trim().to_lowercase();
+    if let Some(hex) = value.strip_prefix('#') {
+        if hex.len() != 6 {
+            return None;
+        }
+        let value = u32::from_str_radix(hex, 16).ok()?;
+        let r = u8::try_from((value >> 16) & 0xff).ok()?;
+        let g = u8::try_from((value >> 8) & 0xff).ok()?;
+        let b = u8::try_from(value & 0xff).ok()?;
+        return Some(Color::Rgb(r, g, b));
+    }
+    match value.as_str() {
+        "black" => Some(Color::Black),
+        "darkgray" => Some(Color::DarkGray),
+        "gray" | "grey" => Some(Color::Gray),
+        "red" => Some(Color::Red),
+        "lightred" => Some(Color::LightRed),
+        "green" => Some(Color::Green),
+        "lightgreen" => Some(Color::LightGreen),
+        "yellow" => Some(Color::Yellow),
+        "lightyellow" => Some(Color::LightYellow),
+        "blue" => Some(Color::Blue),
+        "lightblue" => Some(Color::LightBlue),
+        "magenta" => Some(Color::Magenta),
+        "lightmagenta" => Some(Color::LightMagenta),
+        "cyan" => Some(Color::Cyan),
+        "lightcyan" => Some(Color::LightCyan),
+        "white" => Some(Color::White),
+        _ => None,
+    }
+}
+
+fn apply_theme_override(theme: &mut RenderTheme, overrides: &grey_core::TuiColorOverrides) {
+    if let Some(value) = &overrides.border {
+        if let Some(color) = parse_color(value) {
+            theme.border = color;
+        }
+    }
+    if let Some(value) = &overrides.accent {
+        if let Some(color) = parse_color(value) {
+            theme.accent = color;
+        }
+    }
+    if let Some(value) = &overrides.prompt {
+        if let Some(color) = parse_color(value) {
+            theme.prompt = color;
+        }
+    }
+    if let Some(value) = &overrides.status_fg {
+        if let Some(color) = parse_color(value) {
+            theme.status_fg = color;
+        }
+    }
+    if let Some(value) = &overrides.status_bg {
+        if let Some(color) = parse_color(value) {
+            theme.status_bg = color;
+        }
+    }
+    if let Some(value) = &overrides.muted {
+        if let Some(color) = parse_color(value) {
+            theme.muted = color;
+        }
+    }
+}
 
 /// Prompts submitted by the TUI are sent to the owner of the agent loop.
 pub type PromptSender = mpsc::UnboundedSender<String>;
@@ -46,6 +407,37 @@ pub enum UiAction {
     None,
     Submit(String),
     Quit,
+}
+
+#[derive(Debug, Clone)]
+struct CompletionSettings {
+    enabled: bool,
+    long_running_steps: usize,
+    long_running_seconds: u64,
+    bell: bool,
+    strong_bell: bool,
+    notify: bool,
+    persistent: bool,
+}
+
+impl From<TuiCompletionConfig> for CompletionSettings {
+    fn from(config: TuiCompletionConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            long_running_steps: config.long_running_steps,
+            long_running_seconds: config.long_running_seconds,
+            bell: config.bell,
+            strong_bell: config.strong_bell,
+            notify: config.notify,
+            persistent: config.persistent,
+        }
+    }
+}
+
+impl Default for CompletionSettings {
+    fn default() -> Self {
+        Self::from(TuiCompletionConfig::default())
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -190,11 +582,27 @@ pub struct AppState {
     output: String,
     input: InputBuffer,
     status: String,
+    current_task: Option<String>,
+    current_provider: Option<String>,
+    current_model: Option<String>,
+    branch: Option<String>,
+    status_error: bool,
+    total_input_tokens: u64,
+    total_output_tokens: u64,
     scroll: u16,
     max_scroll: u16,
     follow_output: bool,
     dirty: bool,
     frame_stats: FrameStats,
+    settings: TuiSettings,
+    turn_started_at: Option<Instant>,
+    pending_completion_bell: Option<CompletionBell>,
+    pending_completion_message: Option<String>,
+    persistent_completion_message: Option<String>,
+    next_persistent_tick: Option<Instant>,
+    completion: CompletionSettings,
+    show_help: bool,
+    leader_armed: bool,
 }
 
 impl Default for AppState {
@@ -203,11 +611,41 @@ impl Default for AppState {
             output: String::new(),
             input: InputBuffer::default(),
             status: "ready".into(),
+            current_task: None,
+            current_provider: None,
+            current_model: None,
+            branch: None,
+            status_error: false,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
             scroll: 0,
             max_scroll: 0,
             follow_output: true,
             dirty: true,
             frame_stats: FrameStats::default(),
+            settings: TuiSettings::default(),
+            turn_started_at: None,
+            pending_completion_bell: None,
+            pending_completion_message: None,
+            persistent_completion_message: None,
+            next_persistent_tick: None,
+            completion: CompletionSettings::default(),
+            show_help: false,
+            leader_armed: false,
+        }
+    }
+}
+
+impl AppState {
+    fn with_settings(settings: TuiSettings) -> Self {
+        let branch = settings.branch_label().map(str::to_string);
+        let completion = CompletionSettings::from(settings.completion.clone());
+        Self {
+            settings: settings.clone(),
+            branch,
+            status_error: false,
+            completion,
+            ..AppState::default()
         }
     }
 }
@@ -223,6 +661,67 @@ impl AppState {
 
     pub fn status(&self) -> &str {
         &self.status
+    }
+
+    fn status_has_error(&self) -> bool {
+        self.status_error
+    }
+
+    fn total_usage(&self) -> (u64, u64) {
+        (self.total_input_tokens, self.total_output_tokens)
+    }
+
+    fn model_info(&self) -> Option<(&str, &str)> {
+        self.current_provider
+            .as_deref()
+            .zip(self.current_model.as_deref())
+    }
+
+    fn current_task_label(&self) -> &str {
+        self.current_task.as_deref().unwrap_or("-")
+    }
+
+    fn branch_label(&self) -> &str {
+        self.branch.as_deref().unwrap_or("-")
+    }
+
+    fn take_completion_bell(&mut self) -> Option<CompletionBell> {
+        self.pending_completion_bell.take()
+    }
+
+    fn take_completion_message(&mut self) -> Option<String> {
+        self.pending_completion_message.take()
+    }
+
+    fn clear_completion_notice(&mut self) {
+        self.pending_completion_message = None;
+        self.persistent_completion_message = None;
+        self.next_persistent_tick = None;
+    }
+
+    fn completion_notice(&self) -> Option<&str> {
+        self.persistent_completion_message.as_deref()
+    }
+
+    fn schedule_completion_notice(&mut self, message: String) {
+        self.pending_completion_message =
+            (self.completion.notify || self.completion.persistent).then_some(message.clone());
+        if self.completion.persistent {
+            self.persistent_completion_message = Some(message);
+            self.next_persistent_tick = Some(Instant::now() + PERSISTENT_REMINDER_TICK);
+        } else {
+            self.next_persistent_tick = None;
+        }
+    }
+
+    fn poll_persistent_notice(&mut self) -> Option<String> {
+        let message = self.persistent_completion_message.clone()?;
+        let now = Instant::now();
+        if self.next_persistent_tick.is_some_and(|tick| now < tick) {
+            return None;
+        }
+        self.next_persistent_tick = Some(now + PERSISTENT_REMINDER_TICK);
+        Some(message)
     }
 
     pub fn scroll(&self) -> u16 {
@@ -251,12 +750,92 @@ impl AppState {
         if key.kind == KeyEventKind::Release {
             return UiAction::None;
         }
-        if key.code == KeyCode::Esc
-            || key.code == KeyCode::Char('q')
-                && key.modifiers.is_empty()
-                && self.input.text.is_empty()
-            || matches!(key.code, KeyCode::Char('c' | 'C'))
-                && key.modifiers.contains(KeyModifiers::CONTROL)
+        if self.show_help {
+            if self.settings.keys.quit.matches(key) {
+                self.show_help = false;
+                self.dirty = true;
+                return UiAction::Quit;
+            }
+            if key.code == KeyCode::Esc
+                || key.code == KeyCode::Char('q') && key.modifiers.is_empty()
+            {
+                self.show_help = false;
+                self.dirty = true;
+            }
+            return UiAction::None;
+        }
+
+        if self.settings.keys.quit.matches(key) {
+            self.clear_completion_notice();
+            self.leader_armed = false;
+            return UiAction::Quit;
+        }
+
+        if self.settings.keys.clear.matches(key) {
+            self.clear_completion_notice();
+            self.output.clear();
+            self.pending_completion_bell = None;
+            self.status = "output cleared".into();
+            self.scroll = 0;
+            self.max_scroll = 0;
+            self.status_error = false;
+            self.dirty = true;
+            return UiAction::None;
+        }
+
+        if self.settings.keys.scroll_up.matches(key) {
+            let previous = self.scroll;
+            self.scroll = previous.saturating_sub(SCROLL_PAGE_LINES);
+            let changed = self.scroll != previous;
+            if changed {
+                self.follow_output = false;
+            }
+            self.dirty |= changed;
+            return UiAction::None;
+        }
+
+        if self.settings.keys.scroll_down.matches(key) {
+            self.scroll = self
+                .scroll
+                .saturating_add(SCROLL_PAGE_LINES)
+                .min(self.max_scroll);
+            self.follow_output = self.scroll == self.max_scroll;
+            self.dirty = true;
+            return UiAction::None;
+        }
+
+        if self.settings.keys.leader.matches(key)
+            && self.input.text.is_empty()
+            && self.input.cursor_chars == 0
+        {
+            self.leader_armed = true;
+            self.status = "leader".into();
+            self.dirty = true;
+            return UiAction::None;
+        }
+
+        if self.leader_armed {
+            self.leader_armed = false;
+            if self.settings.keys.help.matches(key) {
+                self.show_help = true;
+                self.status = "help".into();
+                self.dirty = true;
+                return UiAction::None;
+            }
+            self.status = "unknown leader key".into();
+            self.dirty = true;
+            return UiAction::None;
+        }
+
+        if key.code == KeyCode::Esc && self.input.text.is_empty() {
+            return UiAction::Quit;
+        }
+        if key.code == KeyCode::Char('q') && key.modifiers.is_empty() && self.input.text.is_empty()
+        {
+            return UiAction::Quit;
+        }
+        if matches!(key.code, KeyCode::Char('c' | 'C'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
         {
             return UiAction::Quit;
         }
@@ -272,23 +851,6 @@ impl AppState {
             KeyCode::Right => self.input.move_right(),
             KeyCode::Home => self.input.move_home(),
             KeyCode::End => self.input.move_end(),
-            KeyCode::PageUp => {
-                let previous = self.scroll;
-                self.scroll = previous.saturating_sub(SCROLL_PAGE_LINES);
-                let changed = self.scroll != previous;
-                if changed {
-                    self.follow_output = false;
-                }
-                changed
-            }
-            KeyCode::PageDown => {
-                self.scroll = self
-                    .scroll
-                    .saturating_add(SCROLL_PAGE_LINES)
-                    .min(self.max_scroll);
-                self.follow_output = self.scroll == self.max_scroll;
-                true
-            }
             KeyCode::Enter => {
                 let prompt = self.input.take_trimmed();
                 self.dirty = true;
@@ -301,7 +863,15 @@ impl AppState {
                 self.output.push_str("> ");
                 self.output.push_str(&prompt);
                 self.output.push_str("\n\n");
+                self.current_task = Some(prompt.chars().take(60).collect());
                 self.follow_output = true;
+                self.turn_started_at = Some(Instant::now());
+                self.status_error = false;
+                self.pending_completion_bell = None;
+                self.current_provider = None;
+                self.current_model = None;
+                self.leader_armed = false;
+                self.clear_completion_notice();
                 self.status = "prompt submitted".into();
                 return UiAction::Submit(prompt);
             }
@@ -316,6 +886,7 @@ impl AppState {
         match event {
             AgentEvent::Delta(delta) => {
                 self.output.push_str(&delta);
+                self.status_error = false;
                 self.status = "streaming".into();
             }
             AgentEvent::ToolStarted(call) => {
@@ -323,6 +894,7 @@ impl AppState {
                     "\n[tool:start] {} {}\n",
                     call.name, call.arguments
                 ));
+                self.status_error = false;
                 self.status = format!("running {}", call.name);
             }
             AgentEvent::ToolFinished(result) => {
@@ -331,11 +903,13 @@ impl AppState {
                     "[tool:{outcome}] {}\n{}\n",
                     result.name, result.output
                 ));
+                self.status_error = false;
                 self.status = format!("{} {outcome}", result.name);
             }
             AgentEvent::Retry { attempt, error } => {
                 self.output
                     .push_str(&format!("\n[retry {attempt}] {error}\n"));
+                self.status_error = false;
                 self.status = format!("retry {attempt}: {error}");
             }
             AgentEvent::ContextTrimmed(audit) => {
@@ -343,31 +917,80 @@ impl AppState {
                     "\n[context] dropped {} messages ({} -> {} chars)\n",
                     audit.dropped_messages, audit.original_chars, audit.retained_chars
                 ));
+                self.status_error = false;
                 self.status = format!("context trimmed: {} dropped", audit.dropped_messages);
             }
-            AgentEvent::Completed { usage, steps } => {
+            AgentEvent::Completed {
+                usage,
+                steps,
+                provider,
+                model,
+            } => {
+                self.current_provider = Some(provider.clone());
+                self.current_model = Some(model.clone());
+                self.total_input_tokens =
+                    self.total_input_tokens.saturating_add(usage.input_tokens);
+                self.total_output_tokens =
+                    self.total_output_tokens.saturating_add(usage.output_tokens);
+                self.pending_completion_bell = self.completion_bell_for(steps);
+                self.schedule_completion_notice(format!(
+                    "completed: {provider}/{model} in {steps} steps"
+                ));
                 self.output.push_str(&format!(
                     "\n[completed] {steps} steps, {} input / {} output tokens\n",
                     usage.input_tokens, usage.output_tokens
                 ));
+                self.status_error = false;
                 self.status = format!("completed in {steps} steps");
+                self.turn_started_at = None;
             }
             AgentEvent::Failed(error) => {
+                self.pending_completion_bell = self.completion_bell_for(0);
+                self.schedule_completion_notice(format!("failed: {error}"));
                 self.output.push_str(&format!("\n[failed] {error}\n"));
+                self.status_error = true;
                 self.status = format!("failed: {error}");
+                self.turn_started_at = None;
             }
             AgentEvent::ProviderSwitched { from, to, reason } => {
                 self.output
                     .push_str(&format!("\n[switch] {from} → {to}: {reason}\n"));
+                self.status_error = false;
                 self.status = format!("switched to {to}");
             }
             AgentEvent::CacheHit { model } => {
                 self.output
                     .push_str(&format!("\n[cache] hit for {model}\n"));
+                self.status_error = false;
                 self.status = "cache hit".into();
             }
         }
         self.dirty = true;
+    }
+
+    fn completion_bell_for(&self, steps: usize) -> Option<CompletionBell> {
+        if !self.completion.enabled {
+            return None;
+        }
+        let by_steps = steps >= self.completion.long_running_steps;
+        let by_time = self
+            .completion
+            .long_running_seconds
+            .gt(&0)
+            .then_some(())
+            .filter(|_| {
+                self.turn_started_at
+                    .is_some_and(|t| t.elapsed().as_secs() >= self.completion.long_running_seconds)
+            })
+            .is_some();
+        if !(by_steps || by_time) {
+            return None;
+        }
+        if self.completion.strong_bell {
+            Some(CompletionBell::Strong)
+        } else {
+            Some(CompletionBell::Soft)
+        }
     }
 
     /// Recompute the maximum scroll from the exact wrapped paragraph height.
@@ -404,13 +1027,17 @@ impl AppState {
 pub async fn run_agent_tui(
     events: mpsc::UnboundedReceiver<AgentEvent>,
     prompts: PromptSender,
+    tui_config: &TuiConfig,
+    git_branch: Option<&str>,
 ) -> Result<()> {
     let _restore = enter_terminal()?;
     let stdout: Stdout = io::stdout();
     let mut terminal =
         Terminal::new(CrosstermBackend::new(stdout)).context("creating Crossterm terminal")?;
     let (input_thread, input_events) = InputThread::spawn()?;
-    let result = run_loop(&mut terminal, events, prompts, input_events).await;
+    let settings =
+        TuiSettings::from(tui_config).with_git_branch(git_branch.map(ToString::to_string));
+    let result = run_loop(&mut terminal, events, prompts, input_events, settings).await;
     drop(input_thread);
     result
 }
@@ -420,7 +1047,7 @@ pub async fn run_stream_demo() -> Result<()> {
     let (agent_sender, agent_events) = mpsc::unbounded_channel();
     let (prompt_sender, prompt_receiver) = mpsc::unbounded_channel();
     let demo = tokio::spawn(run_demo_driver(agent_sender, prompt_receiver));
-    let result = run_agent_tui(agent_events, prompt_sender).await;
+    let result = run_agent_tui(agent_events, prompt_sender, &TuiConfig::default(), None).await;
     let _ = demo.await;
     result
 }
@@ -430,8 +1057,9 @@ async fn run_loop<B: Backend>(
     mut agent_events: mpsc::UnboundedReceiver<AgentEvent>,
     prompts: PromptSender,
     mut input_events: mpsc::UnboundedReceiver<InputMessage>,
+    settings: TuiSettings,
 ) -> Result<()> {
-    let mut state = AppState::default();
+    let mut state = AppState::with_settings(settings);
     let mut agent_channel_open = true;
 
     loop {
@@ -451,11 +1079,34 @@ async fn run_loop<B: Backend>(
             }
             event = agent_events.recv(), if agent_channel_open => {
                 match event {
-                    Some(event) => state.reduce_agent_event(event),
+                    Some(event) => {
+                        state.reduce_agent_event(event);
+                        while let Some(bell) = state.take_completion_bell() {
+                            trigger_completion_bell(&state.completion, bell)?;
+                        }
+                        if let Some(message) = state.take_completion_message() {
+                            if state.completion.notify {
+                                if let Err(error) = trigger_completion_notification(
+                                    &state.completion,
+                                    message,
+                                ) {
+                                    let _ = writeln!(io::stderr(), "notification failed: {error}");
+                                }
+                            }
+                        }
+                    }
                     None => {
                         agent_channel_open = false;
                         state.note_runtime_closed();
                     }
+                }
+            }
+        }
+
+        if let Some(message) = state.poll_persistent_notice() {
+            if state.completion.notify {
+                if let Err(error) = trigger_completion_notification(&state.completion, message) {
+                    let _ = writeln!(io::stderr(), "notification failed: {error}");
                 }
             }
         }
@@ -487,15 +1138,48 @@ fn dispatch_action(action: UiAction, prompts: &PromptSender) -> Result<bool> {
     }
 }
 
+fn trigger_completion_bell(config: &CompletionSettings, bell: CompletionBell) -> Result<()> {
+    if !config.bell {
+        return Ok(());
+    }
+    let repetitions = match bell {
+        CompletionBell::Soft => 1,
+        CompletionBell::Strong => 4,
+    };
+    for _ in 0..repetitions {
+        let mut stdout = io::stdout();
+        stdout.write_all(b"\x07")?;
+        stdout.flush()?;
+        if matches!(bell, CompletionBell::Strong) {
+            thread::sleep(Duration::from_millis(80));
+        }
+    }
+    Ok(())
+}
+
+fn trigger_completion_notification(_config: &CompletionSettings, message: String) -> Result<()> {
+    Notification::new()
+        .summary("Grey")
+        .body(&message)
+        .show()
+        .map(|_| ())
+        .map_err(|error| anyhow::anyhow!(error))
+}
+
 fn render(frame: &mut Frame<'_>, state: &mut AppState) {
+    let theme = state.settings.theme.colors.clone();
+    let input_lines = state.settings.layout.input_lines.max(1);
     let chunks = Layout::vertical([
         Constraint::Min(0),
-        Constraint::Length(3),
+        Constraint::Length(input_lines),
         Constraint::Length(1),
     ])
     .split(frame.area());
 
-    let conversation_block = Block::default().borders(Borders::ALL).title(" Grey ");
+    let conversation_block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Grey ")
+        .border_style(Style::default().fg(theme.border));
     let conversation_inner = conversation_block.inner(chunks[0]);
     state.update_viewport(conversation_inner.width, conversation_inner.height);
     let conversation = Paragraph::new(state.output.as_str())
@@ -504,12 +1188,16 @@ fn render(frame: &mut Frame<'_>, state: &mut AppState) {
         .scroll((state.scroll, 0));
     frame.render_widget(conversation, chunks[0]);
 
-    let input_block = Block::default().borders(Borders::ALL).title(" input ");
+    let input_block = Block::default()
+        .borders(Borders::ALL)
+        .title(" input ")
+        .border_style(Style::default().fg(theme.border))
+        .style(Style::default().fg(theme.accent));
     let input_inner = input_block.inner(chunks[1]);
     let prompt = Span::styled(
         "> ",
         Style::default()
-            .fg(Color::Green)
+            .fg(theme.prompt)
             .add_modifier(Modifier::BOLD),
     );
     let input = Paragraph::new(Line::from(vec![
@@ -529,17 +1217,29 @@ fn render(frame: &mut Frame<'_>, state: &mut AppState) {
         frame.set_cursor_position((cursor_x, input_inner.y));
     }
 
+    render_status_line(frame, state, &theme, chunks[2]);
+    if state.show_help {
+        render_help_overlay(frame, state, &theme);
+    }
+}
+
+fn render_status_line(frame: &mut Frame<'_>, state: &AppState, theme: &RenderTheme, area: Rect) {
     let stats = state.frame_stats();
+    let labels = state.settings.keys.labels();
+    let (total_input_tokens, total_output_tokens) = state.total_usage();
+    let (provider_label, model_label) = state
+        .model_info()
+        .map_or(("-", "-"), |(provider, model)| (provider, model));
     let status = Line::from(vec![
         Span::styled(
             " GREY ",
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Blue)
+                .fg(theme.status_fg)
+                .bg(theme.status_bg)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(
-            " {:5.1}ms {:4.0}fps frames {} scroll {}/{} ",
+            " {:5.1}ms {:4.0}fps frames:{} scroll {}/{} ",
             stats.ema_frame_ms(),
             stats.fps(),
             stats.frames(),
@@ -547,15 +1247,107 @@ fn render(frame: &mut Frame<'_>, state: &mut AppState) {
             state.max_scroll,
         )),
         Span::styled(
-            format!(" {} ", state.status),
-            Style::default().fg(Color::Yellow),
+            format!(
+                " task:{} model:{provider_label}/{model_label} branch:{} i:{} o:{} ",
+                state.current_task_label(),
+                state.branch_label(),
+                total_input_tokens,
+                total_output_tokens
+            ),
+            Style::default().fg(theme.status_fg),
         ),
+        if state.status_has_error() {
+            Span::styled(
+                " [ERR] ",
+                Style::default()
+                    .fg(Color::LightRed)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(" [OK] ", Style::default().fg(Color::Green))
+        },
         Span::styled(
-            " Esc/Ctrl-C 退出 · 空输入 q 退出 · Enter 发送 · PgUp/PgDn 滚动 ",
-            Style::default().fg(Color::DarkGray),
+            format!(" {} ", state.status),
+            Style::default().fg(theme.status_fg),
+        ),
+        if state.completion_notice().is_some() {
+            Span::styled(
+                " [HOLD] ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::raw("")
+        },
+        Span::styled(
+            format!(
+                " {}+{}:help  {}:quit  {}:clear  {}:up  {}:down ",
+                labels.leader,
+                labels.help,
+                labels.quit,
+                labels.clear,
+                labels.scroll_up,
+                labels.scroll_down
+            ),
+            Style::default().fg(theme.muted),
         ),
     ]);
-    frame.render_widget(Paragraph::new(status), chunks[2]);
+    frame.render_widget(Paragraph::new(status), area);
+}
+
+fn render_help_overlay(frame: &mut Frame<'_>, state: &AppState, theme: &RenderTheme) {
+    let area = centered_rect(60, 16, frame.area());
+    let labels = state.settings.keys.labels();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Help ")
+        .style(Style::default().fg(theme.accent))
+        .border_style(Style::default().fg(theme.border));
+    let body = Text::from(vec![
+        Line::from("快捷键"),
+        Line::from(""),
+        Line::from(format!(
+            " {} {}  显示/关闭快捷键帮助",
+            labels.leader, labels.help
+        )),
+        Line::from(" Enter     发送输入"),
+        Line::from(format!(" {}        退出", labels.quit)),
+        Line::from(format!(" {}        清空输出", labels.clear)),
+        Line::from(format!(
+            " {} / {}  滚动输出",
+            labels.scroll_up, labels.scroll_down
+        )),
+        Line::from(""),
+        Line::from("状态栏含义"),
+        Line::from(" task: 当前任务名".to_string()),
+        Line::from(" model: 当前模型 (provider/model)".to_string()),
+        Line::from(" branch: 当前仓库分支".to_string()),
+        Line::from(" i/o: 累积输入输出 token".to_string()),
+        Line::from(" [ERR]/[OK]: 最近事件状态"),
+        Line::from("[HOLD]: 完成提醒等待回执".to_string()),
+    ]);
+    frame.render_widget(
+        Paragraph::new(body).block(block).wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn centered_rect(width_percent: u16, height_percent: u16, area: Rect) -> Rect {
+    let width = area.width.saturating_mul(width_percent).div_ceil(100);
+    let height = area.height.saturating_mul(height_percent).div_ceil(100);
+    let x = area
+        .x
+        .saturating_add((area.width.saturating_sub(width)).saturating_div(2));
+    let y = area
+        .y
+        .saturating_add((area.height.saturating_sub(height)).saturating_div(2));
+    Rect {
+        x,
+        y,
+        width,
+        height,
+    }
 }
 
 async fn run_demo_driver(
@@ -584,6 +1376,8 @@ fn finish_demo_turn(events: &mpsc::UnboundedSender<AgentEvent>) -> bool {
         .send(AgentEvent::Completed {
             usage: grey_core::Usage::default(),
             steps: 1,
+            provider: "mock".into(),
+            model: "mock".into(),
         })
         .is_ok()
 }
@@ -822,6 +1616,8 @@ mod tests {
                 output_tokens: 11,
             },
             steps: 2,
+            provider: "provider".into(),
+            model: "model".into(),
         });
         state.reduce_agent_event(AgentEvent::Failed("fatal".into()));
 
@@ -879,6 +1675,109 @@ mod tests {
             row.contains("line-0"),
             "scroll offset was not rendered: {row:?}"
         );
+    }
+
+    #[test]
+    fn tui_settings_apply_tui_config_layout_and_completion() {
+        let mut config = TuiConfig::default();
+        config.theme.preset = "slate".into();
+        config.theme.overrides.border = Some("#1f2937".into());
+        config.theme.overrides.prompt = Some("red".into());
+        config.layout.input_lines = 6;
+        config.completion.enabled = false;
+        config.completion.long_running_steps = 2;
+        config.completion.long_running_seconds = 45;
+
+        let settings = TuiSettings::from(&config);
+        assert_eq!(settings.layout.input_lines, 6);
+        assert!(!settings.completion.enabled);
+        assert_eq!(settings.completion.long_running_steps, 2);
+        assert_eq!(settings.completion.long_running_seconds, 45);
+        assert_eq!(settings.theme.colors.border, Color::Rgb(31, 41, 55));
+        assert_eq!(settings.theme.colors.prompt, Color::Red);
+
+        let mut state = AppState::with_settings(settings);
+        state.turn_started_at = Some(Instant::now());
+        state.reduce_agent_event(AgentEvent::Completed {
+            usage: grey_core::Usage::default(),
+            steps: 3,
+            provider: "provider".into(),
+            model: "model".into(),
+        });
+        assert_eq!(state.take_completion_bell(), None);
+    }
+
+    #[test]
+    fn completion_reminder_respects_steps_threshold() {
+        let mut config = TuiConfig::default();
+        config.completion.enabled = true;
+        config.completion.strong_bell = false;
+        config.completion.long_running_steps = 2;
+
+        let mut state = AppState::with_settings(TuiSettings::from(&config));
+        state.turn_started_at = Some(Instant::now());
+        state.reduce_agent_event(AgentEvent::Completed {
+            usage: grey_core::Usage::default(),
+            steps: 3,
+            provider: "provider".into(),
+            model: "model".into(),
+        });
+        assert_eq!(state.take_completion_bell(), Some(CompletionBell::Soft));
+    }
+
+    #[test]
+    fn completion_reminder_ignored_without_threshold_hit() {
+        let mut config = TuiConfig::default();
+        config.completion.enabled = true;
+        config.completion.long_running_steps = 99999;
+        config.completion.long_running_seconds = 0;
+
+        let mut state = AppState::with_settings(TuiSettings::from(&config));
+        state.turn_started_at = Some(Instant::now() - Duration::from_secs(2));
+        state.reduce_agent_event(AgentEvent::Failed("oops".into()));
+        assert_eq!(state.take_completion_bell(), None);
+    }
+
+    #[test]
+    fn completion_notice_persistence_controls_hold_and_repeat_interval() {
+        let mut config = TuiConfig::default();
+        config.completion.notify = true;
+        config.completion.persistent = true;
+        let mut state = AppState::with_settings(TuiSettings::from(&config));
+        state.schedule_completion_notice("done".into());
+        assert!(state.completion_notice().is_some());
+
+        assert!(state.poll_persistent_notice().is_none());
+
+        state.next_persistent_tick = Some(Instant::now() - Duration::from_millis(1));
+        assert_eq!(state.poll_persistent_notice(), Some("done".to_string()));
+        assert_eq!(state.poll_persistent_notice(), None);
+    }
+
+    #[test]
+    fn completion_notice_is_cleared_on_new_turn() {
+        let mut config = TuiConfig::default();
+        config.completion.notify = true;
+        config.completion.persistent = true;
+        let mut state = AppState::with_settings(TuiSettings::from(&config));
+        state.schedule_completion_notice("done".into());
+        assert!(state.completion_notice().is_some());
+
+        state.clear_completion_notice();
+        assert!(state.completion_notice().is_none());
+        assert!(state.poll_persistent_notice().is_none());
+    }
+
+    #[test]
+    fn parse_keybinding_supports_special_keys() {
+        let ctrl_c = parse_keybinding("ctrl-c").expect("ctrl-c");
+        assert!(ctrl_c.matches(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+
+        let page_up = parse_keybinding("pageup").expect("pageup");
+        assert!(page_up.matches(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)));
+
+        let leader_backslash = parse_keybinding("\\").expect("leader");
+        assert!(leader_backslash.matches(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::NONE)));
     }
 
     #[test]
