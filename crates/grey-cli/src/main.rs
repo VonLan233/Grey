@@ -2318,16 +2318,16 @@ fn run_sessions(action: SessionAction) -> Result<()> {
 }
 
 fn run_plugins(action: PluginAction) -> Result<()> {
-    let config_path = config::default_config_path();
-    let mut config = config::load()?;
+    let config_path = grey_core::raw_config::mutation_target()?;
 
     match action {
         PluginAction::List => {
-            if config.plugins.is_empty() {
+            let plugins = read_raw_plugins(&config_path)?;
+            if plugins.is_empty() {
                 println!("(no plugins configured)");
                 return Ok(());
             }
-            for plugin in &config.plugins {
+            for plugin in &plugins {
                 let kind = format_plugin_kind(plugin.kind);
                 println!(
                     "{}\t{}\t{}\t{}",
@@ -2344,12 +2344,7 @@ fn run_plugins(action: PluginAction) -> Result<()> {
             Ok(())
         }
         PluginAction::Show { id } => {
-            let plugin = config
-                .plugins
-                .iter()
-                .find(|plugin| plugin.id == id)
-                .with_context(|| format!("plugin not found: {id}"))?;
-            println!("{}", serde_json::to_string_pretty(plugin)?);
+            show_raw_plugin(&config_path, &id)?;
             Ok(())
         }
         PluginAction::Add {
@@ -2368,78 +2363,56 @@ fn run_plugins(action: PluginAction) -> Result<()> {
             if kind == PluginKind::Hook && hook_event.is_none() {
                 bail!("--hook-event is required for hook plugins");
             }
-
-            if let Some(plugin) = config.plugins.iter_mut().find(|plugin| plugin.id == id) {
-                if let Some(command) = command {
-                    plugin.command = command;
-                } else if plugin.command.is_empty() {
-                    bail!("--command is required for plugin entry");
-                }
-                plugin.name = name;
-                plugin.description = description;
-                plugin.kind = kind;
-                plugin.hook_event = hook_event;
-                plugin.version = version;
-                plugin.args = args;
-                plugin.timeout_ms = timeout_ms;
-                plugin.enabled = enabled;
-                if kind != PluginKind::Hook {
-                    plugin.hook_event = None;
-                }
-                println!("updated plugin {id}");
-            } else {
-                let command = command
-                    .with_context(|| format!("--command is required when adding plugin {id}"))?;
-                config.plugins.push(PluginConfig {
-                    id,
-                    name,
+            let mut updated = false;
+            let output_id = id.clone();
+            grey_core::raw_config::edit_file(&config_path, |doc| {
+                let existing_command = grey_core::raw_config::plugin_command(doc, &id)?;
+                updated = existing_command.is_some();
+                let plugin = PluginConfig {
+                    id: id.clone(),
+                    name: name.clone(),
                     kind,
                     enabled,
-                    description,
-                    command,
-                    args,
+                    description: description.clone(),
+                    command: command.clone().or(existing_command).with_context(|| {
+                        format!("--command is required when adding plugin {id}")
+                    })?,
+                    args: args.clone(),
                     timeout_ms,
-                    version,
+                    version: version.clone(),
                     hook_event: if kind == PluginKind::Hook {
-                        hook_event
+                        hook_event.clone()
                     } else {
                         None
                     },
-                });
+                };
+                grey_core::raw_config::upsert_plugin(doc, &plugin)
+            })?;
+            if updated {
+                println!("updated plugin {output_id}");
+            } else {
                 println!("added plugin");
             }
-            write_plugins_config(&config_path, &config)?;
             Ok(())
         }
         PluginAction::Remove { id } => {
-            let original_len = config.plugins.len();
-            config.plugins.retain(|plugin| plugin.id != id);
-            if config.plugins.len() == original_len {
-                bail!("plugin not found: {id}");
-            }
-            write_plugins_config(&config_path, &config)?;
+            grey_core::raw_config::edit_file(&config_path, |doc| {
+                grey_core::raw_config::remove_plugin(doc, &id)
+            })?;
             println!("removed plugin {id}");
             Ok(())
         }
         PluginAction::Enable { id } => {
-            let plugin = config
-                .plugins
-                .iter_mut()
-                .find(|plugin| plugin.id == id)
-                .with_context(|| format!("plugin not found: {id}"))?;
-            plugin.enabled = true;
-            write_plugins_config(&config_path, &config)?;
+            grey_core::raw_config::edit_file(&config_path, |doc| {
+                grey_core::raw_config::set_enabled(doc, "plugins", &id, true)
+            })?;
             println!("enabled plugin {id}");
             Ok(())
         }
         PluginAction::Disable { id } => {
-            let plugin = config
-                .plugins
-                .iter_mut()
-                .find(|plugin| plugin.id == id)
-                .with_context(|| format!("plugin not found: {id}"))?;
-            plugin.enabled = false;
-            write_plugins_config(&config_path, &config)?;
+            grey_core::raw_config::edit_file(&config_path, |doc| {
+                grey_core::raw_config::set_enabled(doc, "plugins", &id, false)
+            })?;
             println!("disabled plugin {id}");
             Ok(())
         }

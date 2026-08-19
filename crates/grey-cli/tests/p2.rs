@@ -842,3 +842,188 @@ fn orchestrate_rejects_invalid_agent_spec() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("invalid --agent spec"));
 }
+
+#[test]
+fn plugin_config_edit_preserves_comments_placeholders_and_unknown_fields() {
+    let env = temp_home();
+    let path = env.home.path().join("explicit.toml");
+    let original = r#"# keep
+[[plugins]]
+id = "old"
+command = "printf"
+args = ["${PLUGIN_TOKEN}"]
+extra = "keep"
+"#;
+    std::fs::write(&path, original).unwrap();
+
+    let output = env
+        .command()
+        .env("GREY_CONFIG", &path)
+        .env("PLUGIN_TOKEN", "expanded-only-at-runtime")
+        .args(["plugins", "disable", "old"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let edited = std::fs::read_to_string(&path).unwrap();
+    assert!(edited.contains("# keep"));
+    assert!(edited.contains("${PLUGIN_TOKEN}"));
+    assert!(edited.contains("extra = \"keep\""));
+    assert!(edited.contains("enabled = false"));
+}
+
+#[test]
+fn plugin_config_edit_prefers_explicit_then_project_target() {
+    let env = temp_home();
+    let explicit = env.home.path().join("explicit.toml");
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("grey.toml"), "# project\n").unwrap();
+
+    let explicit_output = env
+        .command()
+        .current_dir(project.path())
+        .env("GREY_CONFIG", &explicit)
+        .args(["plugins", "add", "explicit", "--command", "printf"])
+        .output()
+        .unwrap();
+    assert!(
+        explicit_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&explicit_output.stderr)
+    );
+    assert!(std::fs::read_to_string(&explicit)
+        .unwrap()
+        .contains("id = \"explicit\""));
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("grey.toml")).unwrap(),
+        "# project\n"
+    );
+
+    let project_output = env
+        .command()
+        .current_dir(project.path())
+        .args(["plugins", "add", "project", "--command", "printf"])
+        .output()
+        .unwrap();
+    assert!(
+        project_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&project_output.stderr)
+    );
+    let project_config = std::fs::read_to_string(project.path().join("grey.toml")).unwrap();
+    assert!(project_config.contains("id = \"project\""));
+}
+
+#[cfg(unix)]
+#[test]
+fn plugin_config_edit_rejects_symlink_target() {
+    use std::os::unix::fs::symlink;
+
+    let env = temp_home();
+    let target = env.home.path().join("target.toml");
+    let link = env.home.path().join("config-link.toml");
+    std::fs::write(&target, "# target\n").unwrap();
+    symlink(&target, &link).unwrap();
+
+    let output = env
+        .command()
+        .env("GREY_CONFIG", &link)
+        .args(["plugins", "add", "blocked", "--command", "printf"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("symlink"));
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "# target\n");
+}
+
+#[test]
+fn plugin_config_concurrent_edits_do_not_lose_entries() {
+    let env = temp_home();
+    let path = env.home.path().join("concurrent.toml");
+    std::fs::write(&path, "# concurrent\n").unwrap();
+
+    let mut first = env
+        .command()
+        .env("GREY_CONFIG", &path)
+        .args(["plugins", "add", "first", "--command", "printf"])
+        .spawn()
+        .unwrap();
+    let mut second = env
+        .command()
+        .env("GREY_CONFIG", &path)
+        .args(["plugins", "add", "second", "--command", "printf"])
+        .spawn()
+        .unwrap();
+    assert!(first.wait().unwrap().success());
+    assert!(second.wait().unwrap().success());
+
+    let edited = std::fs::read_to_string(&path).unwrap();
+    assert!(edited.contains("id = \"first\""));
+    assert!(edited.contains("id = \"second\""));
+}
+
+#[test]
+fn plugin_config_show_recursively_redacts_secret_fields() {
+    let env = temp_home();
+    let path = env.home.path().join("secrets.toml");
+    std::fs::write(
+        &path,
+        r#"[[plugins]]
+id = "secret-plugin"
+command = "printf"
+api_key = "api-value"
+token = "token-value"
+secret = "secret-value"
+authorization = "authorization-value"
+password = "password-value"
+nested = { token = "nested-token" }
+"#,
+    )
+    .unwrap();
+
+    let output = env
+        .command()
+        .env("GREY_CONFIG", &path)
+        .args(["plugins", "show", "secret-plugin"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for secret in [
+        "api-value",
+        "token-value",
+        "secret-value",
+        "authorization-value",
+        "password-value",
+        "nested-token",
+    ] {
+        assert!(!stdout.contains(secret), "secret leaked: {secret}");
+    }
+    assert_eq!(stdout.matches("***").count(), 6);
+}
+
+#[test]
+fn plugin_config_raw_editor_preserves_text_and_redacts_json() {
+    let original =
+        "# keep\n[[plugins]]\nid = \"old\"\nargs = [\"${PLUGIN_TOKEN}\"]\nextra = \"keep\"\n";
+    let edited = grey_core::raw_config::edit_text(original, |doc| {
+        grey_core::raw_config::set_enabled(doc, "plugins", "old", false)
+    })
+    .unwrap();
+    assert!(edited.contains("# keep"));
+    assert!(edited.contains("${PLUGIN_TOKEN}"));
+    assert!(edited.contains("extra = \"keep\""));
+    assert!(edited.contains("enabled = false"));
+
+    let mut value = serde_json::json!({"nested": {"authorization": "hidden"}});
+    grey_core::raw_config::redact(&mut value);
+    assert_eq!(value["nested"]["authorization"], "***");
+}

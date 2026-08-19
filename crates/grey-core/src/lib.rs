@@ -8,6 +8,7 @@ pub mod cache;
 pub mod config;
 pub mod context;
 pub mod provider;
+pub mod raw_config;
 pub mod session;
 pub mod summary;
 pub mod token;

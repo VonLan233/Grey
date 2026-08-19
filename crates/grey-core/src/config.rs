@@ -11,7 +11,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 /// Secret-ish fields are masked in `config show` output.
-const SECRET_FIELDS: &[&str] = &["api_key", "token", "secret"];
+const SECRET_FIELDS: &[&str] = &["api_key", "token", "secret", "authorization", "password"];
 
 // ---------------------------------------------------------------------------
 // P2: dynamic provider registry
@@ -597,6 +597,10 @@ pub fn default_config_path() -> PathBuf {
     if let Some(path) = env::var_os("GREY_CONFIG") {
         return PathBuf::from(path);
     }
+    let local = PathBuf::from("grey.toml");
+    if local.exists() {
+        return local;
+    }
     match env::var_os("HOME") {
         Some(home) => PathBuf::from(home).join(".config/grey/grey.toml"),
         None => PathBuf::from("grey.toml"),
@@ -989,7 +993,8 @@ pub fn write_default_config(path: &Path) -> Result<()> {
 }
 
 pub fn is_secret_field(name: &str) -> bool {
-    SECRET_FIELDS.iter().any(|s| name.contains(s))
+    let name = name.to_ascii_lowercase();
+    SECRET_FIELDS.iter().any(|secret| name.contains(secret))
 }
 
 #[cfg(test)]
