@@ -73,7 +73,9 @@ use anyhow::{bail, Result};
 use futures_util::StreamExt;
 use grey_core::{GreyConfig, Provider, ProviderFailure, ProviderFailureKind};
 
+// Final UTF-8 byte ceiling for the sanitized preview, including its truncation marker.
 const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
+const ERROR_BODY_TRUNCATION_MARKER: &str = " … [truncated]";
 pub(crate) const MAX_TOOL_CALLS: usize = 128;
 pub(crate) const MAX_TOOL_DATA_BYTES: usize = 4 * 1024 * 1024;
 
@@ -123,56 +125,78 @@ pub(crate) async fn bounded_http_error(
                 body.extend_from_slice(&chunk);
             }
             Err(error) => {
-                let preview = String::from_utf8_lossy(&body);
+                let preview = bounded_error_preview(&body, true);
+                let message = format!(
+                    "{provider} response body transport failed after {status}. Partial response: {preview}"
+                );
+                let source = format!(
+                    "reading {provider} error response body after {status} failed; partial response: {preview}; cause: {error}"
+                );
                 return ProviderFailure::with_source(
-                    kind,
-                    http_failure_message(
-                        provider,
-                        status,
-                        &format!("partial response: {preview}"),
-                        false,
-                    ),
-                    error,
+                    ProviderFailureKind::Transport,
+                    message,
+                    source,
                 );
             }
         }
     }
-    let preview = String::from_utf8_lossy(&body);
-    ProviderFailure::new(
-        kind,
-        http_failure_message(provider, status, &preview, truncated),
-    )
+    let preview = bounded_error_preview(&body, truncated);
+    ProviderFailure::new(kind, http_failure_message(provider, status, &preview))
 }
 
-fn http_failure_message(
-    provider: &str,
-    status: reqwest::StatusCode,
-    preview: &str,
-    truncated: bool,
-) -> String {
-    let suffix = if truncated { "… [truncated]" } else { "" };
+fn bounded_error_preview(body: &[u8], body_was_truncated: bool) -> String {
+    let lossy = String::from_utf8_lossy(body);
+    let sanitized = grey_core::redact_provider_secrets(&lossy);
+    if !body_was_truncated && sanitized.len() <= MAX_ERROR_BODY_BYTES {
+        return sanitized;
+    }
+
+    let content_limit = MAX_ERROR_BODY_BYTES - ERROR_BODY_TRUNCATION_MARKER.len();
+    let mut end = sanitized.len().min(content_limit);
+    while !sanitized.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut preview = String::with_capacity(MAX_ERROR_BODY_BYTES);
+    preview.push_str(&sanitized[..end]);
+    preview.push_str(ERROR_BODY_TRUNCATION_MARKER);
+    preview
+}
+
+fn http_failure_message(provider: &str, status: reqwest::StatusCode, preview: &str) -> String {
     match status.as_u16() {
         401 => format!(
-            "{provider} authentication failed (HTTP 401). Check its API key, or run `grey auth login openai` for ChatGPT OAuth. Response: {preview}{suffix}"
+            "{provider} authentication failed (HTTP 401). Check its API key, or run `grey auth login openai` for ChatGPT OAuth. Response: {preview}"
         ),
         403 => format!(
-            "{provider} authorization failed (HTTP 403). Check the API key scope and account/project permissions; for ChatGPT OAuth, run `grey auth login openai`. Response: {preview}{suffix}"
+            "{provider} authorization failed (HTTP 403). Check the API key scope and account/project permissions; for ChatGPT OAuth, run `grey auth login openai`. Response: {preview}"
         ),
-        _ => format!("{provider} returned {status}: {preview}{suffix}"),
+        _ => format!("{provider} returned {status}: {preview}"),
     }
 }
 
 #[cfg(test)]
 mod failure_tests {
+    use std::error::Error;
+
     use grey_core::ProviderFailureKind;
 
-    use super::{bounded_http_error, send_http, test_support::serve_one_response};
+    use super::{
+        bounded_http_error, send_http, test_support::serve_one_response, MAX_ERROR_BODY_BYTES,
+    };
 
-    async fn http_failure(status: &'static str, body: &str) -> grey_core::ProviderFailure {
-        let (base_url, server) = serve_one_response(body.as_bytes().to_vec(), None, status).await;
+    async fn http_failure_bytes(
+        status: &'static str,
+        body: Vec<u8>,
+        declared_length: Option<usize>,
+    ) -> grey_core::ProviderFailure {
+        let (base_url, server) = serve_one_response(body, declared_length, status).await;
         let response = reqwest::Client::new().get(base_url).send().await.unwrap();
         server.await.unwrap();
         bounded_http_error(response, "test provider").await
+    }
+
+    async fn http_failure(status: &'static str, body: &str) -> grey_core::ProviderFailure {
+        http_failure_bytes(status, body.as_bytes().to_vec(), None).await
     }
 
     #[tokio::test]
@@ -223,6 +247,58 @@ mod failure_tests {
         assert!(!diagnostic.contains(secret));
         assert!(diagnostic.contains("***"));
         assert!(diagnostic.contains("truncated"));
+    }
+
+    #[tokio::test]
+    async fn truncated_http_error_body_is_transport_with_redacted_partial_diagnostics() {
+        let secret = "partial-secret-must-not-appear";
+        let body = format!(r#"{{"detail":"Bearer {secret}"}}"#).into_bytes();
+        let failure =
+            http_failure_bytes("401 Unauthorized", body.clone(), Some(body.len() + 64)).await;
+        let display = failure.to_string();
+        let source = failure.source().unwrap().to_string();
+
+        assert_eq!(failure.kind(), ProviderFailureKind::Transport);
+        for diagnostic in [&display, &source] {
+            assert!(diagnostic.contains("401"));
+            assert!(diagnostic.to_ascii_lowercase().contains("partial"));
+            assert!(diagnostic.contains("***"));
+            assert!(!diagnostic.contains(secret));
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_expansion_keeps_final_preview_within_byte_limit() {
+        let failure = http_failure_bytes(
+            "500 Internal Server Error",
+            vec![0xff; MAX_ERROR_BODY_BYTES],
+            None,
+        )
+        .await;
+        let display = failure.to_string();
+        let preview = display
+            .split_once(": ")
+            .expect("HTTP diagnostic should contain a preview")
+            .1;
+
+        assert!(preview.len() <= MAX_ERROR_BODY_BYTES);
+        assert!(preview.ends_with("… [truncated]"));
+    }
+
+    #[tokio::test]
+    async fn redaction_expansion_keeps_final_preview_within_byte_limit() {
+        let body = "token=z ".repeat(2_000);
+        assert!(body.len() < MAX_ERROR_BODY_BYTES);
+        let failure = http_failure("500 Internal Server Error", &body).await;
+        let display = failure.to_string();
+        let preview = display
+            .split_once(": ")
+            .expect("HTTP diagnostic should contain a preview")
+            .1;
+
+        assert!(preview.len() <= MAX_ERROR_BODY_BYTES);
+        assert!(preview.ends_with("… [truncated]"));
+        assert!(!preview.contains("token=z"));
     }
 }
 

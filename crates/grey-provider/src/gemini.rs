@@ -160,11 +160,14 @@ impl GeminiStreamState {
         let value: Value = match serde_json::from_str(payload) {
             Ok(v) => v,
             Err(e) => {
-                return vec![ProviderEvent::Error(ProviderFailure::with_source(
-                    ProviderFailureKind::Protocol,
-                    "invalid Gemini JSON",
-                    e,
-                ))];
+                return self
+                    .fail_failure(ProviderFailure::with_source(
+                        ProviderFailureKind::Protocol,
+                        "invalid Gemini JSON",
+                        e,
+                    ))
+                    .into_iter()
+                    .collect();
             }
         };
 
@@ -349,6 +352,7 @@ mod tests {
         let events = state.consume("not-json");
         assert!(matches!(events.as_slice(), [ProviderEvent::Error(failure)]
             if failure.kind() == grey_core::ProviderFailureKind::Protocol));
+        assert!(state.consume("still-not-json").is_empty());
     }
 
     #[test]

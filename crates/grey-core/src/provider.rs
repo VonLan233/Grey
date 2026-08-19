@@ -244,12 +244,62 @@ impl Error for ProviderFailure {
 
 pub fn redact_provider_secrets(input: &str) -> String {
     if let Ok(mut value) = serde_json::from_str::<Value>(input) {
-        crate::raw_config::redact(&mut value);
+        redact_provider_json(&mut value);
         return serde_json::to_string(&value).unwrap_or_else(|_| "***".to_string());
     }
 
+    redact_provider_text(input)
+}
+
+fn redact_provider_json(value: &mut Value) {
+    match value {
+        Value::Array(values) => values.iter_mut().for_each(redact_provider_json),
+        Value::Object(values) => values.iter_mut().for_each(|(name, value)| {
+            if is_provider_secret_key(name) {
+                *value = Value::String("***".into());
+            } else {
+                redact_provider_json(value);
+            }
+        }),
+        Value::String(value) => *value = redact_provider_text(value),
+        _ => {}
+    }
+}
+
+fn is_provider_secret_key(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization"
+            | "api_key"
+            | "api-key"
+            | "apikey"
+            | "x-api-key"
+            | "x-goog-api-key"
+            | "token"
+            | "access_token"
+            | "access-token"
+            | "accesstoken"
+            | "secret"
+            | "password"
+    )
+}
+
+fn redact_provider_text(input: &str) -> String {
     let mut redacted = input.to_string();
-    for key in ["authorization", "api_key", "api-key", "apikey", "token"] {
+    for key in [
+        "authorization",
+        "x-goog-api-key",
+        "x-api-key",
+        "api_key",
+        "api-key",
+        "apikey",
+        "access_token",
+        "access-token",
+        "accesstoken",
+        "token",
+        "secret",
+        "password",
+    ] {
         redacted = redact_assignments(&redacted, key);
     }
     redact_bearer_tokens(&redacted)
@@ -265,6 +315,17 @@ fn redact_assignments(input: &str, key: &str) -> String {
             return output;
         };
         let key_end = relative_key_start + key.len();
+        if remaining[..relative_key_start]
+            .chars()
+            .next_back()
+            .is_some_and(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+            })
+        {
+            output.push_str(&remaining[..key_end]);
+            remaining = &remaining[key_end..];
+            continue;
+        }
         let suffix = &remaining[key_end..];
         let separator_offset = suffix
             .char_indices()
@@ -318,7 +379,12 @@ fn redact_assignments(input: &str, key: &str) -> String {
         };
 
         output.push_str(&remaining[..secret_start]);
-        output.push_str("***");
+        let secret = &remaining[secret_start..secret_end];
+        if !secret.is_empty() && secret.bytes().all(|byte| byte == b'*') {
+            output.push_str(secret);
+        } else {
+            output.push_str("***");
+        }
         remaining = &remaining[secret_end..];
     }
 }
@@ -341,7 +407,12 @@ fn redact_bearer_tokens(input: &str) -> String {
             .map(|index| secret_start + index)
             .unwrap_or(remaining.len());
         output.push_str(&remaining[..secret_start]);
-        output.push_str("***");
+        let secret = &remaining[secret_start..secret_end];
+        if !secret.is_empty() && secret.bytes().all(|byte| byte == b'*') {
+            output.push_str(secret);
+        } else {
+            output.push_str("***");
+        }
         remaining = &remaining[secret_end..];
     }
 }
@@ -441,5 +512,37 @@ mod tests {
         assert!(!diagnostic.contains("message-secret"));
         assert!(!diagnostic.contains("source-secret"));
         assert!(!diagnostic.contains("other-secret"));
+    }
+
+    #[test]
+    fn provider_failure_redacts_json_secrets_without_hiding_diagnostics() {
+        let json = r#"{"Authorization":"authorization-secret","api_key":"underscore-secret","api-key":"hyphen-secret","nested":[{"ApIkEy":"compact-secret"},{"TOKEN":"token-secret"},{"detail":"Bearer bearer-secret"}],"input_tokens":17,"token_count":9,"args":["visible-argument"]}"#;
+        let failure = ProviderFailure::with_source(ProviderFailureKind::Protocol, json, json);
+        let display = failure.to_string();
+        let debug = format!("{failure:?}");
+        let source = failure.source().unwrap().to_string();
+
+        for diagnostic in [&display, &debug, &source] {
+            for secret in [
+                "authorization-secret",
+                "underscore-secret",
+                "hyphen-secret",
+                "compact-secret",
+                "token-secret",
+                "bearer-secret",
+            ] {
+                assert!(
+                    !diagnostic.contains(secret),
+                    "leaked {secret}: {diagnostic}"
+                );
+            }
+            assert!(diagnostic.contains("***"));
+            assert!(diagnostic.contains("input_tokens"));
+            assert!(diagnostic.contains("17"));
+            assert!(diagnostic.contains("token_count"));
+            assert!(diagnostic.contains('9'));
+            assert!(diagnostic.contains("args"));
+            assert!(diagnostic.contains("visible-argument"));
+        }
     }
 }
