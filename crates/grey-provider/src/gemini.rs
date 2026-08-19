@@ -146,7 +146,7 @@ struct GeminiStreamState {
     next_call_id: u64,
     tool_calls: usize,
     text_bytes: usize,
-    tool_argument_bytes: usize,
+    tool_data_bytes: usize,
     response_max_bytes: usize,
 }
 
@@ -157,7 +157,7 @@ impl GeminiStreamState {
             next_call_id: 0,
             tool_calls: 0,
             text_bytes: 0,
-            tool_argument_bytes: 0,
+            tool_data_bytes: 0,
             response_max_bytes,
         }
     }
@@ -230,21 +230,27 @@ impl GeminiStreamState {
                                     }
                                     let args = fc.get("args").cloned().unwrap_or_else(|| json!({}));
                                     let serialized = args.to_string();
-                                    let Some(next) = checked_utf8_bytes(
-                                        self.tool_argument_bytes,
-                                        &serialized,
-                                        self.response_max_bytes,
-                                    ) else {
-                                        return self
-                                            .fail("Gemini tool arguments exceed configured byte limit".into())
-                                            .into_iter()
-                                            .collect();
-                                    };
-                                    self.tool_argument_bytes = next;
+                                    let next_call_id = self.next_call_id + 1;
+                                    let id = format!("gemini-call-{name}--{next_call_id}");
+                                    let mut next = self.tool_data_bytes;
+                                    for value in [&id, name, &serialized] {
+                                        let Some(checked) = checked_utf8_bytes(
+                                            next,
+                                            value,
+                                            self.response_max_bytes,
+                                        ) else {
+                                            return self
+                                                .fail("Gemini tool call exceeds configured byte limit".into())
+                                                .into_iter()
+                                                .collect();
+                                        };
+                                        next = checked;
+                                    }
+                                    self.tool_data_bytes = next;
                                     self.tool_calls += 1;
-                                    self.next_call_id += 1;
+                                    self.next_call_id = next_call_id;
                                     events.push(ProviderEvent::ToolCall(ToolCall {
-                                        id: format!("gemini-call-{name}--{}", self.next_call_id),
+                                        id,
                                         name: name.to_string(),
                                         arguments: args,
                                     }));
@@ -511,6 +517,21 @@ mod tests {
             if failure.kind() == ProviderFailureKind::Protocol)
         );
         assert!(tool.consume(payload).is_empty());
+    }
+
+    #[test]
+    fn limit_rejects_gemini_tool_metadata_before_retaining_it() {
+        let mut state = GeminiStreamState::with_limit(2);
+        let payload = r#"{"candidates":[{"content":{"parts":[{"functionCall":{"name":"oversized-name","args":{}}}]}}]}"#;
+
+        assert!(
+            matches!(state.consume(payload).as_slice(), [ProviderEvent::Error(failure)]
+            if failure.kind() == ProviderFailureKind::Protocol)
+        );
+        assert_eq!(state.tool_calls, 0);
+        assert_eq!(state.next_call_id, 0);
+        assert_eq!(state.tool_data_bytes, 0);
+        assert!(state.consume(payload).is_empty());
     }
 
     #[tokio::test]

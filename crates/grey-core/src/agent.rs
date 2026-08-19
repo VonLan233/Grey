@@ -518,7 +518,7 @@ impl Agent {
             let mut calls = Vec::new();
             let mut usage = None;
             let mut visible_output = false;
-            let mut tool_argument_bytes = 0;
+            let mut tool_data_bytes = 0;
 
             while let Some(event) = stream.next().await {
                 match event {
@@ -540,24 +540,14 @@ impl Agent {
                             })?;
                     }
                     ProviderEvent::ToolCall(call) => {
-                        let arguments =
-                            serde_json::to_string(&call.arguments).map_err(|error| {
-                                AttemptFailure::protocol_with_source(
-                                    "provider tool arguments are not serializable",
-                                    error,
-                                    visible_output,
-                                )
-                            })?;
-                        tool_argument_bytes = checked_utf8_bytes(
-                            tool_argument_bytes,
-                            &arguments,
+                        tool_data_bytes = checked_tool_call_bytes(
+                            tool_data_bytes,
+                            &call,
                             self.options.response_max_bytes,
                         )
-                        .ok_or_else(|| {
-                            AttemptFailure::protocol(
-                                "provider tool arguments exceed configured byte limit",
-                                visible_output,
-                            )
+                        .map_err(|failure| AttemptFailure {
+                            failure,
+                            visible_output,
                         })?;
                         visible_output = true;
                         calls.push(call);
@@ -803,21 +793,33 @@ fn validate_response_limit(
     }
     let mut bytes = 0;
     for call in calls {
-        let arguments = serde_json::to_string(&call.arguments).map_err(|error| {
-            ProviderFailure::with_source(
-                ProviderFailureKind::Protocol,
-                "provider tool arguments are not serializable",
-                error,
-            )
-        })?;
-        bytes = checked_utf8_bytes(bytes, &arguments, response_max_bytes).ok_or_else(|| {
+        bytes = checked_tool_call_bytes(bytes, call, response_max_bytes)?;
+    }
+    Ok(())
+}
+
+fn checked_tool_call_bytes(
+    current: usize,
+    call: &ToolCall,
+    response_max_bytes: usize,
+) -> std::result::Result<usize, ProviderFailure> {
+    let arguments = serde_json::to_string(&call.arguments).map_err(|error| {
+        ProviderFailure::with_source(
+            ProviderFailureKind::Protocol,
+            "provider tool arguments are not serializable",
+            error,
+        )
+    })?;
+    let mut bytes = current;
+    for value in [&call.id, &call.name, &arguments] {
+        bytes = checked_utf8_bytes(bytes, value, response_max_bytes).ok_or_else(|| {
             ProviderFailure::new(
                 ProviderFailureKind::Protocol,
-                "provider tool arguments exceed configured byte limit",
+                "provider tool call exceeds configured byte limit",
             )
         })?;
     }
-    Ok(())
+    Ok(bytes)
 }
 
 struct AttemptFailure {
@@ -1192,6 +1194,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bounded_agent_tool_metadata_fails_as_protocol() {
+        let provider = Arc::new(ScriptedProvider {
+            turns: Mutex::new(VecDeque::from([
+                vec![
+                    ProviderEvent::ToolCall(ToolCall {
+                        id: "oversized-id".into(),
+                        name: "x".into(),
+                        arguments: serde_json::json!({}),
+                    }),
+                    ProviderEvent::Done(Usage::default()),
+                ],
+                vec![ProviderEvent::Done(Usage::default())],
+            ])),
+            requests: Mutex::new(Vec::new()),
+        });
+        let mut options = AgentOptions::new("model");
+        options.retries = 0;
+        options.response_max_bytes = 2;
+        let agent = Agent::new(
+            provider,
+            Arc::new(ScriptedTools),
+            ContextManager::default(),
+            options,
+        );
+
+        let error = agent.run_new("system", "hello", None).await.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ProviderFailure>().unwrap().kind(),
+            ProviderFailureKind::Protocol
+        );
+    }
+
+    #[tokio::test]
     async fn bounded_outcome_retains_only_context_prepared_history() {
         let provider = Arc::new(ScriptedProvider {
             turns: Mutex::new(VecDeque::from([
@@ -1327,6 +1362,59 @@ mod tests {
         });
         let mut options = AgentOptions::new("model");
         options.response_max_bytes = 3;
+        let agent = Agent::new(
+            provider,
+            Arc::new(ScriptedTools),
+            ContextManager::default(),
+            options,
+        )
+        .with_cache(cache);
+
+        let error = agent.run_new("system", "hello", None).await.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ProviderFailure>().unwrap().kind(),
+            ProviderFailureKind::Protocol
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_cache_tool_metadata_is_rejected_by_shared_response_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(
+            RequestCache::open(
+                &dir.path().join("cache.db"),
+                crate::cache::RequestCacheConfig::default(),
+            )
+            .unwrap(),
+        );
+        let messages = vec![
+            ChatMessage::new(Role::System, "system"),
+            ChatMessage::new(Role::User, "hello"),
+        ];
+        cache
+            .put(
+                "model",
+                &messages,
+                &CachedResponse {
+                    text: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "oversized-id".into(),
+                        name: "x".into(),
+                        arguments: serde_json::json!({}),
+                    }],
+                    usage: Usage::default(),
+                    cached_at: 0,
+                },
+            )
+            .unwrap();
+        let provider = Arc::new(ScriptedProvider {
+            turns: Mutex::new(VecDeque::from([vec![
+                ProviderEvent::Done(Usage::default()),
+            ]])),
+            requests: Mutex::new(Vec::new()),
+        });
+        let mut options = AgentOptions::new("model");
+        options.response_max_bytes = 2;
         let agent = Agent::new(
             provider,
             Arc::new(ScriptedTools),

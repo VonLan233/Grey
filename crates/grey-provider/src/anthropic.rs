@@ -377,7 +377,7 @@ impl AnthropicStreamState {
                 .into_iter()
                 .collect();
         };
-        if !self.seen_blocks.insert(index) {
+        if self.seen_blocks.contains(&index) {
             return self
                 .fail(format!(
                     "Anthropic content block index {index} started more than once"
@@ -391,6 +391,26 @@ impl AnthropicStreamState {
                 .into_iter()
                 .collect();
         };
+        if block.get("type").and_then(Value::as_str) == Some("tool_use")
+            && self.calls.len() >= crate::MAX_TOOL_CALLS
+        {
+            return self
+                .fail(format!(
+                    "Anthropic stream exceeds {} tool calls",
+                    crate::MAX_TOOL_CALLS
+                ))
+                .into_iter()
+                .collect();
+        }
+        if self.seen_blocks.len() >= crate::MAX_TOOL_CALLS {
+            return self
+                .fail(format!(
+                    "Anthropic stream exceeds {} content blocks",
+                    crate::MAX_TOOL_CALLS
+                ))
+                .into_iter()
+                .collect();
+        }
         match block.get("type").and_then(Value::as_str) {
             Some("text") => {
                 let Some(text) = block.get("text").and_then(Value::as_str) else {
@@ -399,8 +419,9 @@ impl AnthropicStreamState {
                         .into_iter()
                         .collect();
                 };
-                self.active_blocks.insert(index);
                 if text.is_empty() {
+                    self.seen_blocks.insert(index);
+                    self.active_blocks.insert(index);
                     Vec::new()
                 } else {
                     let Some(next) =
@@ -411,6 +432,8 @@ impl AnthropicStreamState {
                             .into_iter()
                             .collect();
                     };
+                    self.seen_blocks.insert(index);
+                    self.active_blocks.insert(index);
                     self.text_bytes = next;
                     vec![ProviderEvent::Delta(text.to_string())]
                 }
@@ -428,27 +451,20 @@ impl AnthropicStreamState {
                         .into_iter()
                         .collect();
                 };
-                if self.calls.len() >= crate::MAX_TOOL_CALLS {
-                    return self
-                        .fail(format!(
-                            "Anthropic stream exceeds {} tool calls",
-                            crate::MAX_TOOL_CALLS
-                        ))
-                        .into_iter()
-                        .collect();
-                }
                 let initial_input = block.get("input").cloned().unwrap_or_else(|| json!({}));
                 let initial_json = initial_input.to_string();
-                let Some(next) = checked_utf8_bytes(
-                    self.tool_data_bytes,
-                    &initial_json,
-                    self.response_max_bytes,
-                ) else {
-                    return self
-                        .fail("Anthropic tool arguments exceed configured byte limit")
-                        .into_iter()
-                        .collect();
-                };
+                let mut next = self.tool_data_bytes;
+                for value in [id, name, &initial_json] {
+                    let Some(checked) = checked_utf8_bytes(next, value, self.response_max_bytes)
+                    else {
+                        return self
+                            .fail("Anthropic tool call exceeds configured byte limit")
+                            .into_iter()
+                            .collect();
+                    };
+                    next = checked;
+                }
+                self.seen_blocks.insert(index);
                 self.tool_data_bytes = next;
                 self.calls.insert(
                     index,
@@ -463,6 +479,7 @@ impl AnthropicStreamState {
                 Vec::new()
             }
             Some(_) => {
+                self.seen_blocks.insert(index);
                 self.active_blocks.insert(index);
                 Vec::new()
             }
@@ -795,6 +812,58 @@ mod tests {
         assert!(tool
             .consume(&json!({"type":"message_stop"}).to_string())
             .is_empty());
+    }
+
+    #[test]
+    fn limit_rejects_anthropic_tool_metadata_before_retaining_it() {
+        let start = json!({"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}).to_string();
+        let mut state = AnthropicStreamState::with_limit(2);
+        assert!(state.consume(&start).is_empty());
+        let payload = json!({"type":"content_block_start","index":0,"content_block":{
+            "type":"tool_use","id":"oversized-id","name":"x","input":{}
+        }})
+        .to_string();
+
+        assert!(
+            matches!(state.consume(&payload).as_slice(), [ProviderEvent::Error(failure)]
+            if failure.kind() == ProviderFailureKind::Protocol)
+        );
+        assert!(state.calls.is_empty());
+        assert!(state.seen_blocks.is_empty());
+        assert!(state.active_blocks.is_empty());
+        assert_eq!(state.tool_data_bytes, 0);
+        assert!(state
+            .consume(&json!({"type":"message_stop"}).to_string())
+            .is_empty());
+    }
+
+    #[test]
+    fn limit_rejects_unbounded_empty_and_unknown_anthropic_blocks_once() {
+        let start = json!({"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}).to_string();
+        for block in [json!({"type":"text","text":""}), json!({"type":"unknown"})] {
+            let mut state = AnthropicStreamState::default();
+            assert!(state.consume(&start).is_empty());
+            for index in 0..crate::MAX_TOOL_CALLS {
+                let start_block = json!({
+                    "type":"content_block_start","index":index,"content_block":block
+                })
+                .to_string();
+                assert!(state.consume(&start_block).is_empty());
+                let stop_block = json!({"type":"content_block_stop","index":index}).to_string();
+                assert!(state.consume(&stop_block).is_empty());
+            }
+            let overflow = json!({
+                "type":"content_block_start",
+                "index":crate::MAX_TOOL_CALLS,
+                "content_block":block
+            })
+            .to_string();
+            assert!(
+                matches!(state.consume(&overflow).as_slice(), [ProviderEvent::Error(failure)]
+                if failure.kind() == ProviderFailureKind::Protocol)
+            );
+            assert!(state.consume(&overflow).is_empty());
+        }
     }
 
     #[test]

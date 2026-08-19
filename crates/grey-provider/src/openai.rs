@@ -377,21 +377,26 @@ impl OpenAiStreamState {
                         .into_iter()
                         .collect();
                 }
-                if let Some(arguments) = delta.function.arguments.as_deref() {
-                    let Some(next) = checked_utf8_bytes(
-                        self.tool_data_bytes,
-                        arguments,
-                        self.response_max_bytes,
-                    ) else {
+                let mut next = self.tool_data_bytes;
+                for value in [
+                    delta.id.as_deref(),
+                    delta.function.name.as_deref(),
+                    delta.function.arguments.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    let Some(checked) = checked_utf8_bytes(next, value, self.response_max_bytes)
+                    else {
                         return self
                             .fail(ProviderFailure::new(
                                 ProviderFailureKind::Protocol,
-                                "OpenAI tool arguments exceed configured byte limit",
+                                "OpenAI tool call exceeds configured byte limit",
                             ))
                             .into_iter()
                             .collect();
                     };
-                    self.tool_data_bytes = next;
+                    next = checked;
                 }
                 let call = self.calls.entry(delta.index).or_default();
                 if let Some(id) = delta.id {
@@ -403,6 +408,7 @@ impl OpenAiStreamState {
                 if let Some(arguments) = delta.function.arguments {
                     call.arguments.push_str(&arguments);
                 }
+                self.tool_data_bytes = next;
             }
         }
         if let Some(usage) = chunk.usage {
@@ -656,6 +662,23 @@ mod tests {
             if failure.kind() == ProviderFailureKind::Protocol)
         );
         assert!(tool.consume("[DONE]").is_empty());
+    }
+
+    #[test]
+    fn limit_rejects_openai_tool_metadata_before_retaining_it() {
+        let mut state = OpenAiStreamState::with_limit(2);
+        let payload = json!({"choices":[{"delta":{"tool_calls":[{
+            "index":0,"id":"oversized-id","function":{"name":"x","arguments":"{}"}
+        }]}}]})
+        .to_string();
+
+        assert!(
+            matches!(state.consume(&payload).as_slice(), [ProviderEvent::Error(failure)]
+            if failure.kind() == ProviderFailureKind::Protocol)
+        );
+        assert!(state.calls.is_empty());
+        assert_eq!(state.tool_data_bytes, 0);
+        assert!(state.consume("[DONE]").is_empty());
     }
 
     #[tokio::test]
