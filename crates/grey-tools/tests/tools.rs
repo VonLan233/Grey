@@ -1,10 +1,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use grey_core::{McpToolConfig, ToolCall, ToolExecutor};
+use grey_core::{McpToolConfig, PluginConfig, PluginKind, ToolCall, ToolExecutor};
 use grey_tools::{
-    AlwaysApprove, BuiltinTools, CombinedTools, DenySideEffects, HookedTools, LspTools, McpTools,
-    BUILTIN_TOOL_NAMES,
+    AlwaysApprove, BuiltinTools, CombinedTools, DenySideEffects, HookedApprover, HookedTools,
+    LspTools, McpTools, PluginTools, BUILTIN_TOOL_NAMES,
 };
 
 fn call(name: &str, arguments: serde_json::Value) -> ToolCall {
@@ -94,6 +94,58 @@ async fn denied_side_effect_never_changes_file() {
     let path = directory.path().join("code.rs");
     std::fs::write(&path, "old").unwrap();
     let tools = BuiltinTools::new(directory.path(), Arc::new(DenySideEffects)).unwrap();
+    let result = tools
+        .execute(&call(
+            "edit_file",
+            serde_json::json!({
+                "path": "code.rs",
+                "old_string": "old",
+                "new_string": "new"
+            }),
+        ))
+        .await;
+    assert!(!result.success);
+    assert!(result.output.contains("denied"));
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "old");
+}
+
+#[tokio::test]
+async fn permission_decision_hook_can_block_when_inner_approves() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("code.rs");
+    std::fs::write(&path, "old").unwrap();
+    let approver = Arc::new(HookedApprover::new(
+        Arc::new(AlwaysApprove),
+        vec!["printf '{\"approved\": false}'".into()],
+    ));
+    let tools = BuiltinTools::new(directory.path(), approver).unwrap();
+
+    let result = tools
+        .execute(&call(
+            "edit_file",
+            serde_json::json!({
+                "path": "code.rs",
+                "old_string": "old",
+                "new_string": "new"
+            }),
+        ))
+        .await;
+    assert!(!result.success);
+    assert!(result.output.contains("denied"));
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "old");
+}
+
+#[tokio::test]
+async fn permission_decision_hook_false_plain_output_defaults_to_denied() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("code.rs");
+    std::fs::write(&path, "old").unwrap();
+    let approver = Arc::new(HookedApprover::new(
+        Arc::new(AlwaysApprove),
+        vec!["printf false".into()],
+    ));
+    let tools = BuiltinTools::new(directory.path(), approver).unwrap();
+
     let result = tools
         .execute(&call(
             "edit_file",
@@ -242,6 +294,56 @@ async fn post_tool_hook_error_marks_tool_failed_after_tool_success() {
     assert!(result
         .output
         .contains("post_tool_call hook failed for tool read_file"));
+}
+
+#[tokio::test]
+async fn plugin_tool_executes_command_in_workspace() {
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("plugin_marker"), "").unwrap();
+    let tools = PluginTools::new(
+        workspace.path(),
+        vec![PluginConfig {
+            id: "mark".into(),
+            kind: PluginKind::Tool,
+            enabled: true,
+            command: "printf".into(),
+            args: vec![r#"{"success":true,"output":"ok"}"#.into()],
+            ..Default::default()
+        }],
+        Arc::new(AlwaysApprove),
+    );
+
+    let result = tools
+        .execute(&call(
+            "mark",
+            serde_json::json!({
+                "path": "plugin_marker",
+            }),
+        ))
+        .await;
+    assert!(result.success, "{}", result.output);
+    assert_eq!(result.output, "ok");
+}
+
+#[tokio::test]
+async fn plugin_tool_unknown_name_fails() {
+    let workspace = tempfile::tempdir().unwrap();
+    let tools = PluginTools::new(
+        workspace.path(),
+        vec![PluginConfig {
+            id: "mark".into(),
+            kind: PluginKind::Tool,
+            enabled: true,
+            command: "printf".into(),
+            args: vec![r#"{"success":true}"#.into()],
+            ..Default::default()
+        }],
+        Arc::new(AlwaysApprove),
+    );
+
+    let result = tools.execute(&call("missing", serde_json::json!({}))).await;
+    assert!(!result.success);
+    assert!(result.output.contains("unknown plugin tool"));
 }
 
 #[tokio::test]

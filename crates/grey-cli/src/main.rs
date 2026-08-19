@@ -11,12 +11,13 @@ use clap::{Parser, Subcommand, ValueEnum};
 use futures_util::future::join_all;
 use grey_core::{
     config, Agent, AgentEvent, AgentOptions, AgentOutcome, CharApproxCounter, ChatMessage,
-    ChatRequest, ContextManager, GreyConfig, Provider, Role, Session, SessionStore, SummaryEngine,
-    ToolExecutor,
+    ChatRequest, ContextManager, GreyConfig, PluginConfig, PluginKind, Provider, Role, Session,
+    SessionStore, SummaryEngine, ToolExecutor,
 };
 use grey_provider::router::ProviderRouter;
 use grey_tools::{
-    AlwaysApprove, Approver, BuiltinTools, DenySideEffects, LspTools, McpTools, StdioApprover,
+    AlwaysApprove, Approver, BuiltinTools, DenySideEffects, HookedApprover, LspTools, McpTools,
+    PluginTools, StdioApprover,
 };
 use grey_tools::{CombinedTools, HookedTools};
 use serde::{Deserialize, Serialize};
@@ -164,6 +165,11 @@ enum Command {
         #[command(subcommand)]
         action: ProviderAction,
     },
+    /// Plugin and extension management (P6).
+    Plugins {
+        #[command(subcommand)]
+        action: PluginAction,
+    },
     /// Request cache management.
     Cache {
         #[command(subcommand)]
@@ -183,6 +189,28 @@ enum Command {
         /// Share selected context fields with every sub-agent (`task`, `summary`).
         #[arg(long, value_enum)]
         share_context: Vec<OrchestrateShareContext>,
+    },
+    /// Repeat a prompt for a bounded number of iterations.
+    Loop {
+        /// Base prompt for each iteration.
+        prompt: String,
+        /// Maximum number of iterations to run.
+        #[arg(long, default_value_t = 3)]
+        iterations: usize,
+        /// Stop early when a response contains this token.
+        #[arg(long)]
+        until: Option<String>,
+    },
+    /// Iterative Goal mode: keep refining toward an explicit acceptance token.
+    Goal {
+        /// Goal statement to pursue.
+        goal: String,
+        /// Maximum number of refinement iterations.
+        #[arg(long, default_value_t = 5)]
+        iterations: usize,
+        /// Consider the goal complete when a response contains this token.
+        #[arg(long, value_name = "TOKEN", default_value = "DONE")]
+        done_when: String,
     },
 }
 
@@ -220,6 +248,14 @@ enum ProviderAction {
 }
 
 #[derive(Subcommand, Clone)]
+enum PluginAction {
+    /// List configured plugins.
+    List,
+    /// Show plugin details by id.
+    Show { id: String },
+}
+
+#[derive(Subcommand, Clone)]
 enum CacheAction {
     /// Remove all cached responses.
     Clear,
@@ -251,6 +287,20 @@ struct HeadlessUsage {
     input_tokens: u64,
     output_tokens: u64,
     cost_usd: f64,
+    cached: bool,
+    provider: String,
+    model: String,
+}
+
+#[derive(Serialize)]
+struct RepeaterOutput {
+    prompt: String,
+    iterations: usize,
+    completed: bool,
+    response: String,
+    session_id: Option<String>,
+    usage: HeadlessUsage,
+    steps: usize,
     cached: bool,
     provider: String,
     model: String,
@@ -389,6 +439,10 @@ async fn run_command(cli: &Cli, command: Command) -> Result<()> {
         Command::Config { action } => run_config(action),
         Command::Sessions { action } => run_sessions(action),
         Command::Providers { action } => run_providers(action),
+        Command::Plugins { action } => {
+            let config = config::load()?;
+            run_plugins(&config, action)
+        }
         Command::Cache { action } => run_cache(action),
         Command::Usage { action } => run_usage(action),
         Command::Orchestrate {
@@ -396,6 +450,16 @@ async fn run_command(cli: &Cli, command: Command) -> Result<()> {
             agent,
             share_context,
         } => run_orchestrate(cli, prompt, agent, share_context).await,
+        Command::Loop {
+            prompt,
+            iterations,
+            until,
+        } => run_repeater(cli, RepeaterMode::Loop, prompt, iterations, until).await,
+        Command::Goal {
+            goal,
+            iterations,
+            done_when,
+        } => run_repeater(cli, RepeaterMode::Goal, goal, iterations, Some(done_when)).await,
     }
 }
 
@@ -508,6 +572,245 @@ async fn run_orchestrate(
     }
     if let Some(session_id) = &session_id {
         eprintln!("[session {session_id}]");
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum RepeaterMode {
+    Loop,
+    Goal,
+}
+
+async fn run_repeater(
+    cli: &Cli,
+    mode: RepeaterMode,
+    prompt: String,
+    iterations: usize,
+    stop_when: Option<String>,
+) -> Result<()> {
+    if iterations == 0 {
+        bail!("iterations must be greater than zero");
+    }
+    let config = config::load()?;
+    let workspace = resolve_workspace(cli.workspace.as_deref())?;
+    let workspace_text = workspace.to_string_lossy();
+    let (agent, store, existing) = build_agent_and_session(cli, &config, &workspace, false)?;
+    let usage_tracker = agent.usage_tracker();
+    let pre_message_hooks = hook_chain_with_plugins(
+        &config.hooks.pre_message_send,
+        &config.plugins,
+        "pre_message_send",
+    );
+    let pre_prompt_hooks =
+        hook_chain_with_plugins(&config.hooks.pre_prompt, &config.plugins, "pre_prompt");
+    let completion_hooks =
+        hook_chain_with_plugins(&config.hooks.completion, &config.plugins, "completion");
+    let session_start_hooks = hook_chain_with_plugins(
+        &config.hooks.session_start,
+        &config.plugins,
+        "session_start",
+    );
+    let session_end_hooks =
+        hook_chain_with_plugins(&config.hooks.session_end, &config.plugins, "session_end");
+
+    let stop_token = stop_when.as_deref().unwrap_or("DONE");
+
+    let session_start_payload = serde_json::json!({
+        "event": "session_start",
+        "workspace": workspace_text,
+        "provider": agent.provider_id(),
+        "model": agent.model(),
+        "mode": match mode {
+            RepeaterMode::Loop => "loop",
+            RepeaterMode::Goal => "goal",
+        },
+    });
+    run_hook_chain(&session_start_hooks, &session_start_payload).await?;
+
+    let mut session = existing;
+    let mut last_outcome: Option<AgentOutcome> = None;
+    let mut loop_usage = grey_core::Usage::default();
+    let mut prompt_count = 0usize;
+    let mut stopped = false;
+    let mut last_error: Option<String> = None;
+
+    for iteration in 0..iterations {
+        prompt_count += 1;
+        let iteration_prompt = match mode {
+            RepeaterMode::Loop => prompt.clone(),
+            RepeaterMode::Goal => {
+                if iteration == 0 {
+                    prompt.clone()
+                } else {
+                    let previous = last_outcome
+                        .as_ref()
+                        .map(|outcome| outcome.response.as_str())
+                        .unwrap_or("");
+                    format!(
+                        "{prompt}\n\nCurrent attempt: {previous}\n\n请继续改进，并在满足目标后返回包含 {stop_token} 的简短结论。"
+                    )
+                }
+            }
+        };
+        let next_prompt =
+            apply_pre_message_send_hooks(&pre_message_hooks, &iteration_prompt).await?;
+        let next_prompt = apply_pre_prompt_hooks(&pre_prompt_hooks, &next_prompt).await?;
+
+        let result = if let Some(session) = &session {
+            agent
+                .continue_messages(session.messages.clone(), next_prompt.as_str(), None)
+                .await
+        } else {
+            agent
+                .run_new(SYSTEM_PROMPT, next_prompt.as_str(), None)
+                .await
+        };
+
+        match result {
+            Ok(outcome) => {
+                let completion = completion_hook_payload(
+                    true,
+                    &next_prompt,
+                    Some(&outcome),
+                    None,
+                    &workspace_text,
+                );
+                if let Err(error) = run_hook_chain(&completion_hooks, &completion).await {
+                    last_error = Some(format!("completion hook failed: {error}"));
+                }
+
+                loop_usage.add_assign(&outcome.usage);
+
+                let mut current = if let Some(mut previous) = session {
+                    previous.messages.clone_from(&outcome.messages);
+                    previous
+                } else {
+                    let title = next_prompt
+                        .lines()
+                        .next()
+                        .unwrap_or(&next_prompt)
+                        .chars()
+                        .take(80)
+                        .collect::<String>();
+                    Session::new(title, workspace_text.as_ref(), outcome.messages.clone())
+                };
+
+                if let Some(store) = &store {
+                    if let Err(error) = store.save(&mut current) {
+                        last_error = Some(format!("saving session: {error:#}"));
+                    }
+                    if let Err(error) = persist_usage(store, &current.id, usage_tracker.as_deref())
+                    {
+                        last_error = Some(format!("saving usage: {error:#}"));
+                    }
+                }
+
+                if let Some(last_error) = last_error.clone() {
+                    return Err(anyhow::anyhow!(last_error));
+                }
+
+                let should_stop = stop_when
+                    .as_deref()
+                    .is_some_and(|token| outcome.response.contains(token));
+                session = Some(current);
+                last_outcome = Some(outcome);
+                if should_stop {
+                    stopped = true;
+                    break;
+                }
+            }
+            Err(error) => {
+                let completion = completion_hook_payload(
+                    false,
+                    &next_prompt,
+                    None,
+                    Some(&error.to_string()),
+                    &workspace_text,
+                );
+                if let Err(hook_error) = run_hook_chain(&completion_hooks, &completion).await {
+                    return Err(anyhow::anyhow!(format!(
+                        "completion failed: {error}, hook error: {hook_error}"
+                    )));
+                }
+                return Err(error);
+            }
+        }
+    }
+
+    let outcome = last_outcome
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no iterations executed"))?;
+    let session_end_payload = serde_json::json!({
+        "event": "session_end",
+        "workspace": workspace_text,
+        "prompts_processed": prompt_count,
+        "success": last_error.is_none(),
+        "error": last_error.unwrap_or_default(),
+        "provider": outcome.provider_id,
+        "model": outcome.model,
+        "iterations": iterations,
+        "stopped": stopped,
+    });
+    if let Some(error) = run_hook_chain(&session_end_hooks, &session_end_payload)
+        .await
+        .err()
+    {
+        eprintln!("session_end hook failed: {error}");
+    }
+
+    let session_id = session.as_ref().map(|session| session.id.clone());
+    let tracked_cost = session_id
+        .as_deref()
+        .and_then(|id| {
+            usage_tracker
+                .as_ref()
+                .and_then(|tracker| tracker.session_usage(id))
+        })
+        .map(|usage| usage.total_cost_usd)
+        .or_else(|| {
+            usage_tracker
+                .as_ref()
+                .and_then(|tracker| tracker.session_usage("default"))
+                .map(|usage| usage.total_cost_usd)
+        })
+        .unwrap_or(0.0);
+    match cli.format {
+        OutputFormat::Text => {
+            println!("iterations: {prompt_count}");
+            if stopped {
+                println!("status: stopped by marker");
+            }
+            if !outcome.response.ends_with('\n') {
+                println!();
+            }
+            println!("{}", outcome.response);
+            if let Some(id) = &session_id {
+                eprintln!("[session {id}]");
+            }
+        }
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string(&RepeaterOutput {
+                prompt,
+                iterations: prompt_count,
+                completed: stopped,
+                response: outcome.response.clone(),
+                session_id,
+                usage: HeadlessUsage {
+                    input_tokens: loop_usage.input_tokens,
+                    output_tokens: loop_usage.output_tokens,
+                    cost_usd: tracked_cost,
+                    cached: outcome.cached,
+                    provider: outcome.provider_id.clone(),
+                    model: outcome.model.clone(),
+                },
+                steps: outcome.steps,
+                cached: outcome.cached,
+                provider: outcome.provider_id.clone(),
+                model: outcome.model.clone(),
+            })?
+        ),
     }
     Ok(())
 }
@@ -1149,18 +1452,102 @@ async fn run_headless(
     workspace: &Path,
     prompt: &str,
 ) -> Result<()> {
-    let prompt = apply_pre_prompt_hooks(&config.hooks.pre_prompt, prompt).await?;
+    let session_start_hooks = hook_chain_with_plugins(
+        &config.hooks.session_start,
+        &config.plugins,
+        "session_start",
+    );
+    let pre_message_hooks = hook_chain_with_plugins(
+        &config.hooks.pre_message_send,
+        &config.plugins,
+        "pre_message_send",
+    );
+    let pre_prompt_hooks =
+        hook_chain_with_plugins(&config.hooks.pre_prompt, &config.plugins, "pre_prompt");
+    let completion_hooks =
+        hook_chain_with_plugins(&config.hooks.completion, &config.plugins, "completion");
+    let session_end_hooks =
+        hook_chain_with_plugins(&config.hooks.session_end, &config.plugins, "session_end");
     let (agent, store, existing) = build_agent_and_session(cli, config, workspace, false)?;
     let usage_tracker = agent.usage_tracker();
-    let outcome = if cli.format == OutputFormat::Text {
-        run_with_text_events(&agent, existing.as_ref(), &prompt).await?
+    let active_provider = agent.provider_id().to_string();
+    let active_model = agent.model().to_string();
+    run_hook_chain(
+        &session_start_hooks,
+        &serde_json::json!({
+            "event": "session_start",
+            "workspace": workspace.to_string_lossy(),
+            "provider": &active_provider,
+            "model": &active_model,
+        }),
+    )
+    .await?;
+
+    let prompt = apply_pre_message_send_hooks(&pre_message_hooks, prompt).await?;
+    let prompt = apply_pre_prompt_hooks(&pre_prompt_hooks, &prompt).await?;
+    let run_result = if cli.format == OutputFormat::Text {
+        run_with_text_events(&agent, existing.as_ref(), &prompt).await
     } else {
-        run_with_cancellation(&agent, existing.as_ref(), &prompt, None).await?
+        run_with_cancellation(&agent, existing.as_ref(), &prompt, None).await
     };
+    let result = match run_result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let completion_payload = completion_hook_payload(
+                false,
+                &prompt,
+                None,
+                Some(&error.to_string()),
+                &workspace.to_string_lossy(),
+            );
+            if let Err(hook_error) = run_hook_chain(&completion_hooks, &completion_payload).await {
+                eprintln!("completion hook failed: {hook_error}");
+            }
+            let session_end = serde_json::json!({
+                "event": "session_end",
+                "workspace": workspace.to_string_lossy(),
+                "success": false,
+                "provider": active_provider,
+                "model": active_model,
+                "steps": 0,
+                "cached": false,
+                "error": error.to_string(),
+            });
+            if let Err(hook_error) = run_hook_chain(&session_end_hooks, &session_end).await {
+                eprintln!("session_end hook failed: {hook_error}");
+            }
+            return Err(error);
+        }
+    };
+
+    let completion_payload = completion_hook_payload(
+        true,
+        &prompt,
+        Some(&result),
+        None,
+        &workspace.to_string_lossy(),
+    );
+    if let Err(error) = run_hook_chain(&completion_hooks, &completion_payload).await {
+        eprintln!("completion hook failed: {error}");
+    }
+    let completion_result = serde_json::json!({
+        "event": "session_end",
+        "workspace": workspace.to_string_lossy(),
+        "success": true,
+        "provider": result.provider_id,
+        "model": result.model,
+        "steps": result.steps,
+        "cached": result.cached,
+        "error": Value::Null,
+    });
+    if let Err(error) = run_hook_chain(&session_end_hooks, &completion_result).await {
+        eprintln!("session_end hook failed: {error}");
+    }
+
     let session_id = persist_outcome(
         store.as_ref(),
         existing,
-        &outcome,
+        &result,
         &prompt,
         workspace,
         cli.no_save,
@@ -1179,7 +1566,7 @@ async fn run_headless(
 
     match cli.format {
         OutputFormat::Text => {
-            if !outcome.response.ends_with('\n') {
+            if !result.response.ends_with('\n') {
                 println!();
             }
             if let Some(id) = &session_id {
@@ -1189,20 +1576,20 @@ async fn run_headless(
         OutputFormat::Json => println!(
             "{}",
             serde_json::to_string(&HeadlessOutput {
-                response: outcome.response,
+                response: result.response,
                 session_id,
                 usage: HeadlessUsage {
-                    input_tokens: outcome.usage.input_tokens,
-                    output_tokens: outcome.usage.output_tokens,
+                    input_tokens: result.usage.input_tokens,
+                    output_tokens: result.usage.output_tokens,
                     cost_usd: tracked_cost,
-                    cached: outcome.cached,
-                    provider: outcome.provider_id.clone(),
-                    model: outcome.model.clone(),
+                    cached: result.cached,
+                    provider: result.provider_id.clone(),
+                    model: result.model.clone(),
                 },
-                steps: outcome.steps,
-                cached: outcome.cached,
-                provider: outcome.provider_id.clone(),
-                model: outcome.model.clone(),
+                steps: result.steps,
+                cached: result.cached,
+                provider: result.provider_id.clone(),
+                model: result.model.clone(),
             })?
         ),
     }
@@ -1252,7 +1639,11 @@ fn build_agent_and_session(
     } else {
         Arc::new(StdioApprover)
     };
-    let builtin = Arc::new(BuiltinTools::new(workspace, approver)?);
+    let approver = Arc::new(HookedApprover::new(
+        approver,
+        config.hooks.permission_decision.clone(),
+    ));
+    let builtin = Arc::new(BuiltinTools::new(workspace, approver.clone())?);
     let mut executors: Vec<Arc<dyn ToolExecutor>> = vec![builtin];
     let lsp_binary = config.lsp.rust_analyzer.clone();
     if !lsp_binary.trim().is_empty() {
@@ -1261,6 +1652,10 @@ fn build_agent_and_session(
     let mcp = McpTools::new(config.mcp_tools.clone());
     if !mcp.is_empty() {
         executors.push(Arc::new(mcp));
+    }
+    let plugin_tools = PluginTools::new(workspace, config.plugins.clone(), approver.clone());
+    if !plugin_tools.is_empty() {
+        executors.push(Arc::new(plugin_tools));
     }
     let duplicated = duplicate_tool_names(&executors);
     if !duplicated.is_empty() {
@@ -1476,17 +1871,53 @@ fn persist_usage(
 }
 
 async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()> {
+    let session_start_hooks = hook_chain_with_plugins(
+        &config.hooks.session_start,
+        &config.plugins,
+        "session_start",
+    );
+    let pre_prompt_hooks =
+        hook_chain_with_plugins(&config.hooks.pre_prompt, &config.plugins, "pre_prompt");
+    let pre_message_send_hooks = hook_chain_with_plugins(
+        &config.hooks.pre_message_send,
+        &config.plugins,
+        "pre_message_send",
+    );
+    let completion_hooks =
+        hook_chain_with_plugins(&config.hooks.completion, &config.plugins, "completion");
+    let session_end_hooks =
+        hook_chain_with_plugins(&config.hooks.session_end, &config.plugins, "session_end");
     let (agent, store, existing) = build_agent_and_session(cli, config, workspace, true)?;
     let usage_tracker = agent.usage_tracker();
+
+    let session_start_payload = serde_json::json!({
+        "event": "session_start",
+        "workspace": workspace.to_string_lossy(),
+        "provider": agent.provider_id(),
+        "model": agent.model(),
+    });
+    run_hook_chain(&session_start_hooks, &session_start_payload).await?;
+
     let (events_tx, events_rx) = mpsc::unbounded_channel();
     let (prompts_tx, mut prompts_rx) = mpsc::unbounded_channel::<String>();
     let workspace_for_worker = workspace.to_path_buf();
     let workspace_name_for_worker = workspace_for_worker.to_string_lossy().into_owned();
     let no_save = cli.no_save;
-    let pre_prompt_hooks = config.hooks.pre_prompt.clone();
+    let mut hook_session_provider = agent.provider_id().to_string();
+    let mut hook_session_model = agent.model().to_string();
     let worker = tokio::spawn(async move {
         let mut session = existing;
+        let mut prompt_count = 0usize;
+        let mut last_error: Option<String> = None;
         while let Some(prompt) = prompts_rx.recv().await {
+            let prompt = match apply_pre_message_send_hooks(&pre_message_send_hooks, &prompt).await
+            {
+                Ok(prompt) => prompt,
+                Err(error) => {
+                    let _ = events_tx.send(AgentEvent::Failed(format!("{error:#}")));
+                    continue;
+                }
+            };
             let prompt = match apply_pre_prompt_hooks(&pre_prompt_hooks, &prompt).await {
                 Ok(prompt) => prompt,
                 Err(error) => {
@@ -1508,6 +1939,8 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
             };
             match result {
                 Ok(outcome) => {
+                    prompt_count = prompt_count.saturating_add(1);
+                    last_error = None;
                     let provider = outcome.provider_id.clone();
                     let model = outcome.model.clone();
                     let mut current = match session.take() {
@@ -1544,6 +1977,20 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
                         }
                     }
                     session = Some(current);
+                    hook_session_provider = outcome.provider_id.clone();
+                    hook_session_model = outcome.model.clone();
+                    let payload = completion_hook_payload(
+                        true,
+                        &prompt,
+                        Some(&outcome),
+                        None,
+                        &workspace_name_for_worker,
+                    );
+                    if let Err(error) = run_hook_chain(&completion_hooks, &payload).await {
+                        let _ = events_tx.send(AgentEvent::Failed(format!(
+                            "completion hook failed: {error:#}"
+                        )));
+                    }
                     let _ = events_tx.send(AgentEvent::Completed {
                         usage: outcome.usage,
                         steps: outcome.steps,
@@ -1552,9 +1999,37 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
                     });
                 }
                 Err(error) => {
+                    last_error = Some(error.to_string());
+                    let payload = completion_hook_payload(
+                        false,
+                        &prompt,
+                        None,
+                        Some(&error.to_string()),
+                        &workspace_name_for_worker,
+                    );
+                    if let Err(error) = run_hook_chain(&completion_hooks, &payload).await {
+                        let _ = events_tx.send(AgentEvent::Failed(format!(
+                            "completion hook failed: {error:#}"
+                        )));
+                    }
                     let _ = events_tx.send(AgentEvent::Failed(format!("{error:#}")));
                 }
             }
+        }
+
+        let payload = serde_json::json!({
+            "event": "session_end",
+            "workspace": workspace_name_for_worker,
+            "prompts_processed": prompt_count,
+            "success": last_error.is_none(),
+            "error": last_error.unwrap_or_default(),
+            "provider": hook_session_provider,
+            "model": hook_session_model,
+        });
+        if let Err(error) = run_hook_chain(&session_end_hooks, &payload).await {
+            let _ = events_tx.send(AgentEvent::Failed(format!(
+                "session_end hook failed: {error:#}"
+            )));
         }
     });
     let branch = detect_git_branch(&workspace_for_worker);
@@ -1588,14 +2063,53 @@ fn detect_git_branch(workspace: &Path) -> Option<String> {
     }
 }
 
+fn completion_hook_payload<'a>(
+    success: bool,
+    prompt: &'a str,
+    outcome: Option<&'a AgentOutcome>,
+    error: Option<&'a str>,
+    workspace: &'a str,
+) -> Value {
+    let mut payload = serde_json::json!({
+        "event": "completion",
+        "success": success,
+        "prompt": prompt,
+        "workspace": workspace,
+    });
+    if let Some(error) = error {
+        payload["error"] = Value::String(error.to_string());
+    } else {
+        payload["error"] = Value::Null;
+    }
+    if let Some(outcome) = outcome {
+        payload["provider"] = Value::String(outcome.provider_id.clone());
+        payload["model"] = Value::String(outcome.model.clone());
+        payload["steps"] = Value::from(outcome.steps);
+        payload["cached"] = Value::Bool(outcome.cached);
+        payload["usage"] = serde_json::json!({
+            "input_tokens": outcome.usage.input_tokens,
+            "output_tokens": outcome.usage.output_tokens,
+        });
+    }
+    payload
+}
+
+async fn apply_pre_message_send_hooks(commands: &[String], prompt: &str) -> Result<String> {
+    apply_prompt_hooks(commands, "pre_message_send", prompt).await
+}
+
 async fn apply_pre_prompt_hooks(commands: &[String], prompt: &str) -> Result<String> {
+    apply_prompt_hooks(commands, "pre_prompt", prompt).await
+}
+
+async fn apply_prompt_hooks(commands: &[String], event: &str, prompt: &str) -> Result<String> {
     if commands.is_empty() {
         return Ok(prompt.to_string());
     }
     let mut current = prompt.to_string();
     for command in commands {
         let payload = json!({
-            "event": "pre_prompt",
+            "event": event,
             "prompt": current,
         })
         .to_string();
@@ -1618,6 +2132,51 @@ fn extract_prompt_from_hook_output(output: &str) -> Option<String> {
         }
     }
     Some(trimmed.to_string())
+}
+
+fn hook_chain_with_plugins(base: &[String], plugins: &[PluginConfig], event: &str) -> Vec<String> {
+    let mut commands = base.to_vec();
+    commands.extend(plugin_hook_commands(plugins, event));
+    commands
+}
+
+fn plugin_hook_commands(plugins: &[PluginConfig], event: &str) -> Vec<String> {
+    plugins
+        .iter()
+        .filter(|plugin| {
+            plugin.enabled
+                && matches!(plugin.kind, PluginKind::Hook)
+                && plugin
+                    .hook_event
+                    .as_deref()
+                    .is_some_and(|hook_event| hook_event == event)
+        })
+        .map(|plugin| {
+            let mut command = Vec::with_capacity(1 + plugin.args.len());
+            command.push(shell_single_quote(&plugin.command));
+            command.extend(plugin.args.iter().map(|arg| shell_single_quote(arg)));
+            command.join(" ")
+        })
+        .collect()
+}
+
+fn shell_single_quote(value: &str) -> String {
+    if value.is_empty() {
+        "''".to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
+}
+
+async fn run_hook_chain(commands: &[String], payload: &Value) -> Result<()> {
+    if commands.is_empty() {
+        return Ok(());
+    }
+    let payload = payload.to_string();
+    for command in commands {
+        run_shell_command(command, Some(&payload), DEFAULT_HOOK_TIMEOUT_MS).await?;
+    }
+    Ok(())
 }
 
 async fn run_shell_command(command: &str, input: Option<&str>, timeout_ms: u64) -> Result<String> {
@@ -1700,6 +2259,40 @@ fn run_sessions(action: SessionAction) -> Result<()> {
                 .load(&id)?
                 .with_context(|| format!("session not found: {id}"))?;
             println!("{}", serde_json::to_string_pretty(&session)?);
+        }
+    }
+    Ok(())
+}
+
+fn run_plugins(config: &GreyConfig, action: PluginAction) -> Result<()> {
+    match action {
+        PluginAction::List => {
+            if config.plugins.is_empty() {
+                println!("(no plugins configured)");
+                return Ok(());
+            }
+            for plugin in &config.plugins {
+                let kind = format!("{:?}", plugin.kind).to_lowercase();
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    plugin.id,
+                    kind,
+                    if plugin.enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    },
+                    plugin.description.as_deref().unwrap_or("")
+                );
+            }
+        }
+        PluginAction::Show { id } => {
+            let plugin = config
+                .plugins
+                .iter()
+                .find(|plugin| plugin.id == id)
+                .with_context(|| format!("plugin not found: {id}"))?;
+            println!("{}", serde_json::to_string_pretty(plugin)?);
         }
     }
     Ok(())

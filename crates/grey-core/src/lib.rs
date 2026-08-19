@@ -18,9 +18,9 @@ pub use agent::{Agent, AgentEvent, AgentOptions, AgentOutcome, ProviderCandidate
 pub use cache::{CacheStats, CachedResponse, RequestCache};
 pub use config::{
     AnthropicConfig, CacheConfig, ContextConfig, FallbackConfig, GreyConfig, HooksConfig,
-    LspConfig, McpToolConfig, ModelEntry, OpenAiConfig, ProviderEntry, RouteRule, TaskKind,
-    TuiColorOverrides, TuiCompletionConfig, TuiConfig, TuiKeysConfig, TuiLayoutConfig,
-    TuiThemeConfig, UsageConfig,
+    LspConfig, McpToolConfig, ModelEntry, OpenAiConfig, PluginConfig, PluginKind, ProviderEntry,
+    RouteRule, TaskKind, TuiColorOverrides, TuiCompletionConfig, TuiConfig, TuiKeysConfig,
+    TuiLayoutConfig, TuiThemeConfig, UsageConfig,
 };
 pub use context::{ContextAudit, ContextManager};
 pub use provider::{

@@ -205,6 +205,10 @@ impl Agent {
         &self.provider_id
     }
 
+    pub fn model(&self) -> &str {
+        &self.options.model
+    }
+
     pub async fn run_new(
         &self,
         system_prompt: impl Into<String>,

@@ -14,7 +14,7 @@ Grey 已完成 P0 技术验证，并具备 P1 的首个可用纵向闭环：同�
 上下文预算、请求缓存和 usage 持久化；MCP 与 Hook 也已接入（Prompt Hook、工具前后
 Hook、MCP Command Tool）；P3 已补齐多 Agent 编排与会话化记忆持久化。
 LSP 工具现已支持 `lsp_*` 结果的路径级语义视图注入会话（并按 tool/path 去重），
-P5 已进入交付：TUI 支持布局高度/主题配置与基础完成提醒；WASM 插件、图片与发布打包仍在 P6–P7。
+P5 已进入交付：TUI 支持布局高度/主题配置与基础完成提醒；P6 已进入实现（Hook 生命周期、`loop/goal`、插件工具/Hook），WASM 插件、图片与发布打包仍在后续。
 
 ## 已实现
 
@@ -35,6 +35,7 @@ P5 已进入交付：TUI 支持布局高度/主题配置与基础完成提醒；
 - SQLite 请求缓存（TTL/LRU/provider 隔离）与 `--no-cache` 控制
 - 每会话 token/cost usage 记录，跨 CLI 调用累积并由 `usage show/summary` 查询
 - MCP 命令工具与 Hook：`pre_prompt`、`pre_tool_call`、`post_tool_call`
+- P6 扩展能力：`grey plugins`、`[[plugins]]`（tool/hook）、`grey loop`、`grey goal`、以及 Hook 全链路事件
 - 多 Agent 编排：`grey orchestrate` 并行运行子 agent，支持 `--session`/`--continue` 与结果持久化
 - TUI 外观与提醒：`[tui]` 布局高度、主题与长任务完成提醒可配置（可控制终端鸣铃、强鸣铃）
 
@@ -136,6 +137,11 @@ cost_per_1m_output = { "local/qwen2.5:7b" = 0.60 }
 
 [hooks]
 pre_prompt = ["cat"]
+pre_message_send = []
+session_start = []
+session_end = []
+permission_decision = []
+completion = []
 
 [[mcp_tools]]
 name = "ls"
@@ -218,8 +224,16 @@ grey --read-only "找出 bug，但不要修改"
 所有文件工具只能访问 `--workspace` 指定的规范化目录，`..`、绝对路径和符号链接逃逸会被拒绝。
 `edit_file` 只修改现有文件，且 `old_string` 必须恰好匹配一次。
 
-Hook 约定：`pre_prompt` 在每次用户输入 Agent 前执行，可用于改写 prompt；`pre_tool_call` /
-`post_tool_call` 在每次工具调用前后执行，`pre_tool_call` 失败会阻断对应工具执行。
+Hook 约定：
+- `session_start`：会话开始时执行一次。
+- `pre_message_send`：每次消息发送前执行，可改写 `prompt`，返回 JSON `{"prompt":"..."}`
+  或纯文本时按原样替换。
+- `pre_prompt`：兼容历史行为，每次消息处理前再次触发。
+- `pre_tool_call` / `post_tool_call`：工具调用前后执行；`pre_tool_call` 失败会阻断对应工具执行。
+- `permission_decision`：权限决策钩子，在 `edit_file`/`bash` 等有副作用工具执行前给出最终批准（可返回
+  `{"approved":false}`）。
+- `completion`：每次交互成功或失败后执行。
+- `session_end`：会话结束时执行一次（TUI 与 headless）。
 
 ## 会话
 

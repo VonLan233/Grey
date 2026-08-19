@@ -10,7 +10,9 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use globset::{Glob, GlobMatcher};
-use grey_core::{McpToolConfig, ToolCall, ToolDefinition, ToolExecutor, ToolResult, ToolRisk};
+use grey_core::{
+    McpToolConfig, PluginConfig, ToolCall, ToolDefinition, ToolExecutor, ToolResult, ToolRisk,
+};
 use ignore::WalkBuilder;
 use regex::Regex;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -512,6 +514,62 @@ impl Approver for StdioApprover {
 }
 
 #[derive(Clone)]
+pub struct HookedApprover {
+    inner: Arc<dyn Approver>,
+    permission_decision_hooks: Vec<String>,
+}
+
+impl HookedApprover {
+    pub fn new(inner: Arc<dyn Approver>, permission_decision_hooks: Vec<String>) -> Self {
+        Self {
+            inner,
+            permission_decision_hooks,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[serde(deny_unknown_fields)]
+struct PermissionHookOutput {
+    approved: Option<bool>,
+    allow: Option<bool>,
+}
+
+#[async_trait]
+impl Approver for HookedApprover {
+    async fn approve(&self, call: &ToolCall, risk: ToolRisk) -> bool {
+        let mut approved = self.inner.approve(call, risk).await;
+        if self.permission_decision_hooks.is_empty() {
+            return approved;
+        }
+
+        let payload = json!({
+            "event": "permission_decision",
+            "tool": {
+                "id": call.id,
+                "name": call.name,
+                "arguments": call.arguments,
+            },
+            "risk": format!("{risk:?}")
+        })
+        .to_string();
+
+        for command in &self.permission_decision_hooks {
+            let output =
+                match run_shell_command(command, Some(&payload), DEFAULT_HOOK_TIMEOUT).await {
+                    Ok(output) => output,
+                    Err(_) => return false,
+                };
+            if let Some(next) = extract_permission_decision_from_hook_output(&output) {
+                approved = approved && next;
+            }
+        }
+        approved
+    }
+}
+
+#[derive(Clone)]
 pub struct CombinedTools {
     executors: Vec<Arc<dyn ToolExecutor>>,
 }
@@ -621,6 +679,137 @@ impl McpTools {
 
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PluginTool {
+    id: String,
+    name: String,
+    command: String,
+    args: Vec<String>,
+    description: String,
+    timeout_ms: Option<u64>,
+    risk: ToolRisk,
+}
+
+#[derive(Clone)]
+pub struct PluginTools {
+    workspace: PathBuf,
+    approver: Arc<dyn Approver>,
+    tools: Vec<PluginTool>,
+}
+
+impl PluginTools {
+    pub fn new(
+        workspace: &Path,
+        configured: Vec<PluginConfig>,
+        approver: Arc<dyn Approver>,
+    ) -> Self {
+        let workspace = workspace.to_path_buf();
+        let tools = configured
+            .into_iter()
+            .filter(|plugin| {
+                plugin.enabled
+                    && matches!(plugin.kind, grey_core::PluginKind::Tool)
+                    && !plugin.id.trim().is_empty()
+                    && !plugin.command.trim().is_empty()
+            })
+            .map(|plugin| {
+                let name = plugin
+                    .name
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| plugin.id.clone());
+                PluginTool {
+                    id: plugin.id,
+                    name,
+                    command: plugin.command,
+                    args: plugin.args,
+                    description: plugin
+                        .description
+                        .unwrap_or_else(|| "Plugin tool".to_string()),
+                    timeout_ms: plugin.timeout_ms,
+                    risk: ToolRisk::Execute,
+                }
+            })
+            .collect();
+        Self {
+            workspace,
+            approver,
+            tools,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tools.is_empty()
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for PluginTools {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        self.tools
+            .iter()
+            .map(|tool| ToolDefinition {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": true,
+                }),
+                risk: tool.risk,
+            })
+            .collect()
+    }
+
+    async fn execute(&self, call: &ToolCall) -> ToolResult {
+        let Some(tool) = self.tools.iter().find(|tool| tool.name == call.name) else {
+            return ToolResult::failure(call, format!("unknown plugin tool {}", call.name));
+        };
+
+        if !self.approver.approve(call, tool.risk).await {
+            return ToolResult::failure(call, "plugin tool denied by approval policy");
+        }
+
+        let request = json!({
+            "event": "plugin_call",
+            "plugin_id": &tool.id,
+            "tool": call.name,
+            "id": call.id,
+            "arguments": call.arguments,
+        })
+        .to_string();
+
+        let raw = match execute_command_in_dir(
+            &tool.command,
+            &tool.args,
+            Some(&request),
+            tool.timeout_ms.unwrap_or(DEFAULT_TOOL_TIMEOUT),
+            &self.workspace,
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                return ToolResult::failure(
+                    call,
+                    format!("plugin {} command failed: {}", tool.name, error),
+                )
+            }
+        };
+
+        let parsed = serde_json::from_str::<McpResponse>(&raw).unwrap_or_else(|_| McpResponse {
+            success: None,
+            output: Some(raw.clone()),
+            error: None,
+        });
+
+        if parsed.success.unwrap_or(true) {
+            ToolResult::success(call, truncate_output(parsed.output.unwrap_or(raw)))
+        } else {
+            ToolResult::failure(call, parsed.error.unwrap_or(raw))
+        }
     }
 }
 
@@ -1164,8 +1353,30 @@ async fn run_hook_chain(commands: &[String], event: &str, call: &ToolCall) -> Re
     Ok(())
 }
 
+fn extract_permission_decision_from_hook_output(output: &str) -> Option<bool> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if matches!(trimmed, "true" | "TRUE" | "false" | "FALSE") {
+        return Some(trimmed.eq_ignore_ascii_case("true"));
+    }
+    let mut approved = match serde_json::from_str::<PermissionHookOutput>(trimmed) {
+        Ok(hook_output) => hook_output.approved.or(hook_output.allow),
+        Err(_) => None,
+    };
+    if approved.is_none() {
+        if trimmed == "approved=false" || trimmed == "allow=false" {
+            approved = Some(false);
+        } else if trimmed == "approved=true" || trimmed == "allow=true" {
+            approved = Some(true);
+        }
+    }
+    approved
+}
+
 async fn run_shell_command(command: &str, input: Option<&str>, timeout_ms: u64) -> Result<String> {
-    run_command_inner("sh", &["-lc", command], input, timeout_ms).await
+    run_command_inner("sh", &["-lc", command], input, timeout_ms, None).await
 }
 
 async fn execute_command(
@@ -1175,7 +1386,18 @@ async fn execute_command(
     timeout_ms: u64,
 ) -> Result<String> {
     let args = args.iter().map(String::as_str).collect::<Vec<_>>();
-    run_command_inner(command, &args, input, timeout_ms).await
+    run_command_inner(command, &args, input, timeout_ms, None).await
+}
+
+async fn execute_command_in_dir(
+    command: &str,
+    args: &[String],
+    input: Option<&str>,
+    timeout_ms: u64,
+    workspace: &Path,
+) -> Result<String> {
+    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    run_command_inner(command, &args, input, timeout_ms, Some(workspace)).await
 }
 
 async fn run_command_inner(
@@ -1183,8 +1405,12 @@ async fn run_command_inner(
     args: &[&str],
     input: Option<&str>,
     timeout_ms: u64,
+    workspace: Option<&Path>,
 ) -> Result<String> {
     let mut command = Command::new(command);
+    if let Some(workspace) = workspace {
+        command.current_dir(workspace);
+    }
     command
         .args(args)
         .stdout(Stdio::piped())

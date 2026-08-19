@@ -50,9 +50,52 @@ pub struct HooksConfig {
     #[serde(default)]
     pub pre_prompt: Vec<String>,
     #[serde(default)]
+    pub pre_message_send: Vec<String>,
+    #[serde(default)]
+    pub session_start: Vec<String>,
+    #[serde(default)]
+    pub session_end: Vec<String>,
+    #[serde(default)]
+    pub permission_decision: Vec<String>,
+    #[serde(default)]
     pub pre_tool_call: Vec<String>,
     #[serde(default)]
     pub post_tool_call: Vec<String>,
+    #[serde(default)]
+    pub completion: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PluginKind {
+    #[default]
+    Tool,
+    Provider,
+    Hook,
+    Theme,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PluginConfig {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub kind: PluginKind,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub hook_event: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -450,6 +493,8 @@ pub struct GreyConfig {
     pub mcp_tools: Vec<McpToolConfig>,
     /// TUI preferences for theme/layout/reminder.
     pub tui: TuiConfig,
+    /// Plugin registry for P6 extension points.
+    pub plugins: Vec<PluginConfig>,
 
     // Legacy fields (kept for backward compat; migrated into `providers`).
     pub provider: String,
@@ -476,6 +521,7 @@ impl Default for GreyConfig {
             usage: UsageConfig::default(),
             hooks: HooksConfig::default(),
             mcp_tools: Vec::new(),
+            plugins: Vec::new(),
             tui: TuiConfig::default(),
             provider: "mock".into(),
             model: "grey-default".into(),
@@ -628,6 +674,9 @@ fn merge_file(base: GreyConfig, over: GreyConfig, raw: &toml::Value) -> GreyConf
     if !table.contains_key("mcp_tools") {
         merged.mcp_tools = defaults.mcp_tools;
     }
+    if !table.contains_key("plugins") {
+        merged.plugins = defaults.plugins;
+    }
     if !table.contains_key("tui") {
         merged.tui = defaults.tui;
     }
@@ -656,14 +705,23 @@ fn merge(mut base: GreyConfig, over: GreyConfig) -> GreyConfig {
     base.context = over.context;
     base.cache = over.cache;
     base.usage = over.usage;
-    if !over.hooks.pre_prompt.is_empty()
+    let has_hook_override = !over.hooks.pre_prompt.is_empty()
+        || !over.hooks.pre_message_send.is_empty()
+        || !over.hooks.session_start.is_empty()
+        || !over.hooks.session_end.is_empty()
+        || !over.hooks.permission_decision.is_empty()
         || !over.hooks.pre_tool_call.is_empty()
         || !over.hooks.post_tool_call.is_empty()
-    {
+        || !over.hooks.completion.is_empty();
+
+    if has_hook_override {
         base.hooks = over.hooks;
     }
     if !over.mcp_tools.is_empty() {
         base.mcp_tools = over.mcp_tools;
+    }
+    if !over.plugins.is_empty() {
+        base.plugins = over.plugins;
     }
     if !over.tui.theme.preset.is_empty()
         || !over.tui.layout.input_lines.eq(&0)
@@ -872,16 +930,40 @@ fn apply_env(cfg: &mut GreyConfig) -> Result<()> {
     for hook in cfg.hooks.pre_prompt.iter_mut() {
         *hook = expand_env_refs(hook)?;
     }
+    for hook in cfg.hooks.pre_message_send.iter_mut() {
+        *hook = expand_env_refs(hook)?;
+    }
+    for hook in cfg.hooks.session_start.iter_mut() {
+        *hook = expand_env_refs(hook)?;
+    }
+    for hook in cfg.hooks.session_end.iter_mut() {
+        *hook = expand_env_refs(hook)?;
+    }
+    for hook in cfg.hooks.permission_decision.iter_mut() {
+        *hook = expand_env_refs(hook)?;
+    }
     for hook in cfg.hooks.pre_tool_call.iter_mut() {
         *hook = expand_env_refs(hook)?;
     }
     for hook in cfg.hooks.post_tool_call.iter_mut() {
         *hook = expand_env_refs(hook)?;
     }
+    for hook in cfg.hooks.completion.iter_mut() {
+        *hook = expand_env_refs(hook)?;
+    }
     for tool in cfg.mcp_tools.iter_mut() {
         tool.command = expand_env_refs(&tool.command)?;
         for arg in tool.args.iter_mut() {
             *arg = expand_env_refs(arg)?;
+        }
+    }
+    for plugin in cfg.plugins.iter_mut() {
+        plugin.command = expand_env_refs(&plugin.command)?;
+        for arg in plugin.args.iter_mut() {
+            *arg = expand_env_refs(arg)?;
+        }
+        if let Some(event) = &plugin.hook_event {
+            plugin.hook_event = Some(expand_env_refs(event)?);
         }
     }
     Ok(())
@@ -1172,6 +1254,76 @@ scroll_down = "pagedown"
     }
 
     #[test]
+    fn parses_plugins_and_expands_refs() {
+        let toml_str = r#"
+[[plugins]]
+id = "word_count"
+kind = "tool"
+name = "Word Count"
+command = "${GREY_TEST_PLUGIN_CMD}"
+args = ["${GREY_TEST_PLUGIN_ARG}"]
+enabled = true
+description = "Count words"
+timeout_ms = 5000
+
+[[plugins]]
+id = "hook-pre"
+kind = "hook"
+name = "Pre prompt plugin"
+command = "echo hook"
+hook_event = "pre_prompt"
+"#;
+        let previous_cmd = env::var_os("GREY_TEST_PLUGIN_CMD");
+        let previous_arg = env::var_os("GREY_TEST_PLUGIN_ARG");
+        unsafe {
+            env::set_var("GREY_TEST_PLUGIN_CMD", "printf");
+            env::set_var("GREY_TEST_PLUGIN_ARG", "x");
+        }
+        let mut cfg: GreyConfig = toml::from_str(toml_str).unwrap();
+        apply_env(&mut cfg).unwrap();
+        unsafe {
+            match previous_cmd {
+                Some(value) => env::set_var("GREY_TEST_PLUGIN_CMD", value),
+                None => env::remove_var("GREY_TEST_PLUGIN_CMD"),
+            }
+            match previous_arg {
+                Some(value) => env::set_var("GREY_TEST_PLUGIN_ARG", value),
+                None => env::remove_var("GREY_TEST_PLUGIN_ARG"),
+            }
+        }
+        assert_eq!(cfg.plugins.len(), 2);
+        assert_eq!(cfg.plugins[0].id, "word_count");
+        assert_eq!(cfg.plugins[0].command, "printf");
+        assert_eq!(cfg.plugins[0].args, vec!["x".to_string()]);
+        assert!(cfg.plugins[0].enabled);
+        assert_eq!(
+            cfg.plugins[0].kind,
+            PluginKind::Tool,
+            "tool plugin kind should parse"
+        );
+    }
+
+    #[test]
+    fn parses_hook_and_provider_plugin_kinds() {
+        let toml_str = r#"
+[[plugins]]
+id = "hook-test"
+kind = "hook"
+command = "echo"
+hook_event = "pre_prompt"
+
+[[plugins]]
+id = "custom-provider"
+kind = "provider"
+command = "provider-proxy"
+"#;
+        let cfg: GreyConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.plugins.len(), 2);
+        assert_eq!(cfg.plugins[0].kind, PluginKind::Hook);
+        assert_eq!(cfg.plugins[1].kind, PluginKind::Provider);
+    }
+
+    #[test]
     fn redacted_masks_provider_api_keys() {
         let mut cfg = GreyConfig::default();
         cfg.providers.push(ProviderEntry {
@@ -1205,8 +1357,34 @@ description = "echo test tool"
 "#;
         let cfg: GreyConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.hooks.pre_prompt, vec!["echo before prompt".to_string()]);
+        assert!(cfg.hooks.pre_message_send.is_empty());
+        assert!(cfg.hooks.session_start.is_empty());
+        assert!(cfg.hooks.session_end.is_empty());
+        assert!(cfg.hooks.permission_decision.is_empty());
         assert_eq!(cfg.mcp_tools.len(), 1);
         assert_eq!(cfg.mcp_tools[0].name, "echoer");
+    }
+
+    #[test]
+    fn parses_extended_hook_events() {
+        let toml_str = r#"
+[hooks]
+pre_message_send = ["printf 'msg'"]
+pre_prompt = ["printf 'pre'"]
+post_tool_call = ["printf 'post'"]
+session_start = ["printf 'start'"]
+session_end = ["printf 'end'"]
+permission_decision = ["printf 'decision'"]
+completion = ["printf 'complete'"]
+"#;
+        let cfg: GreyConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.hooks.pre_message_send, vec!["printf 'msg'"]);
+        assert_eq!(cfg.hooks.pre_prompt, vec!["printf 'pre'"]);
+        assert_eq!(cfg.hooks.post_tool_call, vec!["printf 'post'"]);
+        assert_eq!(cfg.hooks.session_start, vec!["printf 'start'"]);
+        assert_eq!(cfg.hooks.session_end, vec!["printf 'end'"]);
+        assert_eq!(cfg.hooks.permission_decision, vec!["printf 'decision'"]);
+        assert_eq!(cfg.hooks.completion, vec!["printf 'complete'"]);
     }
 
     #[test]

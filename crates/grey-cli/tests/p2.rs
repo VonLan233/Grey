@@ -304,6 +304,170 @@ pre_prompt = ["printf 'from hook pre prompt'"]
 }
 
 #[test]
+fn pre_message_send_hook_rewrites_prompt_before_agent_request() {
+    let env = temp_home();
+    let config_dir = env.home.path().join(".config/grey");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("grey.toml"),
+        r#"[hooks]
+pre_message_send = ["printf '{\"prompt\":\"from hook pre message\"}'"]
+"#,
+    )
+    .unwrap();
+    let output = env
+        .command()
+        .args(["--no-save", "--format", "json", "should be replaced"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(value["response"]
+        .as_str()
+        .unwrap()
+        .contains("from hook pre message"));
+}
+
+#[test]
+fn session_start_completion_and_end_hooks_run_in_headless_mode() {
+    let env = temp_home();
+    let config_dir = env.home.path().join(".config/grey");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let start_marker = env.home.path().join("session_start.marker");
+    let completion_marker = env.home.path().join("session_completion.marker");
+    let end_marker = env.home.path().join("session_end.marker");
+    std::fs::write(&start_marker, "").unwrap();
+    std::fs::write(&completion_marker, "").unwrap();
+    std::fs::write(&end_marker, "").unwrap();
+    std::fs::write(
+        config_dir.join("grey.toml"),
+        r#"[hooks]
+session_start = ["printf start > \"$GREY_SESSION_START_MARKER\""]
+completion = ["printf completion > \"$GREY_SESSION_COMPLETION_MARKER\""]
+session_end = ["printf end > \"$GREY_SESSION_END_MARKER\""]
+"#,
+    )
+    .unwrap();
+    let output = env
+        .command()
+        .env("GREY_SESSION_START_MARKER", &start_marker)
+        .env("GREY_SESSION_COMPLETION_MARKER", &completion_marker)
+        .env("GREY_SESSION_END_MARKER", &end_marker)
+        .args(["--no-save", "--format", "json", "hello hooks"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(value["response"].as_str().is_some());
+    assert_eq!(std::fs::read_to_string(start_marker).unwrap(), "start");
+    assert_eq!(
+        std::fs::read_to_string(completion_marker).unwrap(),
+        "completion"
+    );
+    assert_eq!(std::fs::read_to_string(end_marker).unwrap(), "end");
+}
+
+#[test]
+fn plugin_pre_prompt_hook_rewrites_prompt() {
+    let env = temp_home();
+    let config_dir = env.home.path().join(".config/grey");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("grey.toml"),
+        r#"
+[[plugins]]
+id = "rewrite-prompt"
+kind = "hook"
+command = "printf"
+args = ["from plugin hook"]
+enabled = true
+hook_event = "pre_prompt"
+"#,
+    )
+    .unwrap();
+
+    let output = env
+        .command()
+        .args(["--no-save", "--format", "json", "placeholder"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(value["response"]
+        .as_str()
+        .unwrap()
+        .contains("from plugin hook"));
+}
+
+#[test]
+fn loop_mode_runs_and_reports_iteration_count() {
+    let env = temp_home();
+    let output = env
+        .command()
+        .args([
+            "--no-save",
+            "--format",
+            "json",
+            "loop",
+            "check this task",
+            "--iterations",
+            "2",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["prompt"].as_str().unwrap(), "check this task");
+    assert_eq!(value["iterations"].as_u64().unwrap(), 2);
+    assert!(value["response"].as_str().unwrap().contains("（mock"));
+}
+
+#[test]
+fn goal_mode_outputs_json_and_respects_no_stop_token_by_default() {
+    let env = temp_home();
+    let output = env
+        .command()
+        .args([
+            "--no-save",
+            "--format",
+            "json",
+            "goal",
+            "fix the issue",
+            "--iterations",
+            "1",
+            "--done-when",
+            "DONE",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["prompt"].as_str().unwrap(), "fix the issue");
+    assert_eq!(value["iterations"].as_u64().unwrap(), 1);
+    assert!(value["response"].as_str().unwrap().contains("（mock"));
+}
+
+#[test]
 fn orchestrate_runs_default_subagents_and_returns_json() {
     let env = temp_home();
     let output = env
