@@ -235,6 +235,21 @@ Hook 约定：
 - `completion`：每次交互成功或失败后执行。
 - `session_end`：会话结束时执行一次（TUI 与 headless）。
 
+插件管理：
+
+```bash
+grey plugins list
+grey plugins add rewrite-hook --kind hook --command printf --arg from_hook --hook-event pre_prompt
+grey plugins show rewrite-hook
+grey plugins disable rewrite-hook
+grey plugins enable rewrite-hook
+grey plugins remove rewrite-hook
+grey plugins add tool-check --kind tool --command printf --arg hello
+```
+
+`add`/`remove` 会将变更落盘到 `GREY_CONFIG`（或默认 `~/.config/grey/grey.toml`）对应的
+`[[plugins]]` 配置。
+
 ## 会话
 
 会话默认保存在 `~/.local/share/grey/sessions.db`，测试或便携环境可用

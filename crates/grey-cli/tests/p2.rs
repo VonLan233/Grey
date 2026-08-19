@@ -412,6 +412,157 @@ hook_event = "pre_prompt"
 }
 
 #[test]
+fn plugins_add_list_show_remove_workflow() {
+    let env = temp_home();
+    let output = env
+        .command()
+        .args([
+            "plugins",
+            "add",
+            "p-runner",
+            "--kind",
+            "tool",
+            "--command",
+            "printf",
+            "--arg",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "added plugin"
+    );
+
+    let show = env
+        .command()
+        .args(["plugins", "show", "p-runner"])
+        .output()
+        .unwrap();
+    assert!(
+        show.status.success(),
+        "{}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let show_value: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
+    assert_eq!(show_value["id"].as_str().unwrap(), "p-runner");
+    assert_eq!(show_value["kind"].as_str().unwrap(), "tool");
+
+    let list = env.command().args(["plugins", "list"]).output().unwrap();
+    assert!(
+        list.status.success(),
+        "{}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let list_output = String::from_utf8_lossy(&list.stdout);
+    assert!(list_output.contains("p-runner"));
+    assert!(list_output.contains("tool"));
+
+    let remove = env
+        .command()
+        .args(["plugins", "remove", "p-runner"])
+        .output()
+        .unwrap();
+    assert!(
+        remove.status.success(),
+        "{}",
+        String::from_utf8_lossy(&remove.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&remove.stdout).trim(),
+        "removed plugin p-runner"
+    );
+
+    let list_after = env.command().args(["plugins", "list"]).output().unwrap();
+    assert!(
+        list_after.status.success(),
+        "{}",
+        String::from_utf8_lossy(&list_after.stderr)
+    );
+    assert!(String::from_utf8_lossy(&list_after.stdout).contains("(no plugins configured)"));
+}
+
+#[test]
+fn plugins_enable_disable_updates_state_without_reordering() {
+    let env = temp_home();
+    let add = env
+        .command()
+        .args([
+            "plugins",
+            "add",
+            "p-guard",
+            "--kind",
+            "hook",
+            "--command",
+            "printf",
+            "--arg",
+            "ok",
+            "--hook-event",
+            "pre_prompt",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        add.status.success(),
+        "{}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    let disable = env
+        .command()
+        .args(["plugins", "disable", "p-guard"])
+        .output()
+        .unwrap();
+    assert!(
+        disable.status.success(),
+        "{}",
+        String::from_utf8_lossy(&disable.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&disable.stdout).trim(),
+        "disabled plugin p-guard"
+    );
+
+    let enabled_false = env
+        .command()
+        .args(["plugins", "show", "p-guard"])
+        .output()
+        .unwrap();
+    assert!(enabled_false.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&enabled_false.stdout).unwrap();
+    assert!(!value["enabled"].as_bool().unwrap());
+
+    let enable = env
+        .command()
+        .args(["plugins", "enable", "p-guard"])
+        .output()
+        .unwrap();
+    assert!(
+        enable.status.success(),
+        "{}",
+        String::from_utf8_lossy(&enable.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&enable.stdout).trim(),
+        "enabled plugin p-guard"
+    );
+
+    let enabled_true = env
+        .command()
+        .args(["plugins", "show", "p-guard"])
+        .output()
+        .unwrap();
+    assert!(enabled_true.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&enabled_true.stdout).unwrap();
+    assert!(value["enabled"].as_bool().unwrap());
+}
+
+#[test]
 fn loop_mode_runs_and_reports_iteration_count() {
     let env = temp_home();
     let output = env

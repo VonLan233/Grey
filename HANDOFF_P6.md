@@ -11,6 +11,7 @@
 - Hook 插件接入：`hook` 类型插件自动加入对应事件链（与命令级 Hook 共用同一配置流）。
 - Loop/Goal 命令接入：`grey loop` 与 `grey goal` 已在 CLI 级可用，并在完成时触发完整 completion 钩子负载。
 - Hook 决策入口补齐：权限决定可被 `permission_decision` 决绝，`pre_message_send`/`session_*`/`completion` 有实测执行路径。
+- `grey plugins` 管理命令接入：`list/show/add/remove/enable/disable`，变更持久写回 `grey.toml`（含集成测试覆盖）。
 - `HANDOFF_P6.md` 新建，开始记录 P6 交付边界与待办。
 
 ## 二、关键文件清单
@@ -37,7 +38,7 @@
 
 - WASM 插件宿主能力（清单、版本、沙箱）
 - Provider/Theme 插件运行时扩展
-- 插件安装/更新/卸载生命周期（当前为配置级声明与运行期加载）
+- [x] 插件安装/更新/卸载生命周期：CLI 已支持 `list/show/add/remove/enable/disable`，配置持久化与测试已补齐
 - 性能基准门禁：启动时延、渲染帧率、大仓库场景延迟
 - P7 相关发布流程（文档、打包、发布清单）
 
