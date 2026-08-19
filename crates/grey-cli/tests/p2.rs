@@ -981,6 +981,7 @@ secret = "secret-value"
 authorization = "authorization-value"
 password = "password-value"
 nested = { token = "nested-token" }
+args = ["--token", "argument-secret"]
 "#,
     )
     .unwrap();
@@ -1004,10 +1005,11 @@ nested = { token = "nested-token" }
         "authorization-value",
         "password-value",
         "nested-token",
+        "argument-secret",
     ] {
         assert!(!stdout.contains(secret), "secret leaked: {secret}");
     }
-    assert_eq!(stdout.matches("***").count(), 6);
+    assert_eq!(stdout.matches("***").count(), 7);
 }
 
 #[test]

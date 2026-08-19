@@ -2428,12 +2428,39 @@ fn format_plugin_kind(kind: PluginKind) -> &'static str {
     }
 }
 
-fn write_plugins_config(path: &Path, config: &GreyConfig) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+#[derive(Deserialize, Default)]
+struct RawPluginList {
+    #[serde(default)]
+    plugins: Vec<PluginConfig>,
+}
+
+fn read_raw_plugins(path: &Path) -> Result<Vec<PluginConfig>> {
+    if !path.exists() {
+        return Ok(Vec::new());
     }
-    let toml = toml::to_string_pretty(config)?;
-    fs::write(path, toml).with_context(|| format!("writing {}", path.display()))?;
+    toml::from_str::<RawPluginList>(
+        &fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?,
+    )
+    .map(|config| config.plugins)
+    .with_context(|| format!("parsing {}", path.display()))
+}
+
+fn show_raw_plugin(path: &Path, id: &str) -> Result<()> {
+    let source = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut config: toml::Value =
+        toml::from_str(&source).with_context(|| format!("parsing {}", path.display()))?;
+    let plugin = config
+        .get_mut("plugins")
+        .and_then(toml::Value::as_array_mut)
+        .and_then(|plugins| {
+            plugins
+                .iter_mut()
+                .find(|plugin| plugin.get("id").and_then(toml::Value::as_str) == Some(id))
+        })
+        .with_context(|| format!("plugin not found: {id}"))?;
+    let mut output = serde_json::to_value(plugin)?;
+    grey_core::raw_config::redact(&mut output);
+    println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
 }
 

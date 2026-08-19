@@ -1,6 +1,5 @@
 use crate::config::PluginConfig;
 use anyhow::{bail, Context, Result};
-use fs2::FileExt;
 use serde_json::Value;
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -73,7 +72,18 @@ pub fn set_enabled(doc: &mut DocumentMut, table: &str, id: &str, enabled: bool) 
         .iter_mut()
         .find(|entry| entry.get("id").and_then(Item::as_str) == Some(id))
         .with_context(|| format!("{table} entry not found: {id}"))?;
+    let suffix = entry
+        .get("enabled")
+        .and_then(Item::as_value)
+        .and_then(|value| value.decor().suffix().cloned());
     entry["enabled"] = value(enabled);
+    if let Some(suffix) = suffix {
+        entry["enabled"]
+            .as_value_mut()
+            .expect("enabled is a value")
+            .decor_mut()
+            .set_suffix(suffix);
+    }
     Ok(())
 }
 
@@ -135,7 +145,7 @@ pub fn redact(value: &mut Value) {
     match value {
         Value::Array(values) => values.iter_mut().for_each(redact),
         Value::Object(values) => values.iter_mut().for_each(|(name, value)| {
-            if crate::config::is_secret_field(name) {
+            if crate::config::is_secret_field(name) || name == "args" {
                 *value = Value::String("***".into());
             } else {
                 redact(value);
@@ -234,18 +244,15 @@ impl ConfigLock {
                 .truncate(false)
                 .open(&lock)
                 .with_context(|| format!("opening {}", lock.display()))?;
-            match file.try_lock_exclusive() {
+            match file.try_lock() {
                 Ok(()) => return Ok(Self(file)),
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::WouldBlock
-                        && Instant::now() < deadline =>
-                {
+                Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
                     thread::sleep(Duration::from_millis(10));
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(std::fs::TryLockError::WouldBlock) => {
                     bail!("timed out waiting for config lock: {}", lock.display());
                 }
-                Err(error) => {
+                Err(std::fs::TryLockError::Error(error)) => {
                     return Err(error).with_context(|| format!("locking {}", lock.display()))
                 }
             }
@@ -272,6 +279,16 @@ mod tests {
         assert!(edited.contains("${PLUGIN_TOKEN}"));
         assert!(edited.contains("extra = \"keep\""));
         assert!(edited.contains("enabled = false"));
+    }
+
+    #[test]
+    fn raw_config_edit_preserves_enabled_comment() {
+        let edited = edit_text(
+            "[[plugins]]\nid = \"old\"\nenabled = true # retain-me\n",
+            |doc| set_enabled(doc, "plugins", "old", false),
+        )
+        .unwrap();
+        assert!(edited.contains("enabled = false # retain-me"));
     }
 
     #[test]
