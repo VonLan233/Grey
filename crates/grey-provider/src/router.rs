@@ -66,7 +66,8 @@ impl ProviderRouter {
                         Some(entry.api_key.clone())
                     },
                     entry.include_usage,
-                )?),
+                )?
+                .with_response_max_bytes(cfg.runtime.response_max_bytes)),
                 "anthropic" => Box::new(anthropic::AnthropicProvider::new(
                     entry.base_url.clone(),
                     if entry.api_key.is_empty() {
@@ -80,7 +81,8 @@ impl ProviderRouter {
                         entry.version.clone()
                     },
                     if entry.max_tokens == 0 { 4096 } else { entry.max_tokens },
-                )?),
+                )?
+                .with_response_max_bytes(cfg.runtime.response_max_bytes)),
                 "gemini" => Box::new(crate::gemini::GeminiProvider::new(
                     entry.base_url.clone(),
                     if entry.api_key.is_empty() {
@@ -88,7 +90,8 @@ impl ProviderRouter {
                     } else {
                         Some(entry.api_key.clone())
                     },
-                )?),
+                )?
+                .with_response_max_bytes(cfg.runtime.response_max_bytes)),
                 proto => bail!(
                     "unknown protocol `{proto}` for provider `{}`; expected: mock, openai, anthropic",
                     entry.id

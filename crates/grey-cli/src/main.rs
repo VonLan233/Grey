@@ -1538,7 +1538,13 @@ async fn run_headless(
     let prompt = apply_pre_message_send_hooks(&pre_message_hooks, prompt).await?;
     let prompt = apply_pre_prompt_hooks(&pre_prompt_hooks, &prompt).await?;
     let run_result = if cli.format == OutputFormat::Text {
-        run_with_text_events(&agent, existing.as_ref(), &prompt).await
+        run_with_text_events(
+            &agent,
+            existing.as_ref(),
+            &prompt,
+            config.runtime.event_queue_capacity,
+        )
+        .await
     } else {
         run_with_cancellation(&agent, existing.as_ref(), &prompt, None).await
     };
@@ -1720,6 +1726,7 @@ fn build_agent_and_session(
     ));
     let mut options = AgentOptions::new(model.clone());
     options.max_steps = cli.max_steps;
+    options.response_max_bytes = config.runtime.response_max_bytes;
     let context = ContextManager::with_budget(
         config.context.clone(),
         Arc::new(CharApproxCounter),
@@ -1806,8 +1813,9 @@ async fn run_with_text_events(
     agent: &Agent,
     existing: Option<&Session>,
     prompt: &str,
+    event_queue_capacity: usize,
 ) -> Result<AgentOutcome> {
-    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let (events_tx, mut events_rx) = mpsc::channel(event_queue_capacity);
     let printer = tokio::spawn(async move {
         while let Some(event) = events_rx.recv().await {
             match event {
@@ -1850,7 +1858,7 @@ async fn run_with_cancellation(
     agent: &Agent,
     existing: Option<&Session>,
     prompt: &str,
-    events: Option<&mpsc::UnboundedSender<AgentEvent>>,
+    events: Option<&mpsc::Sender<AgentEvent>>,
 ) -> Result<AgentOutcome> {
     let run = async {
         if let Some(session) = existing {
@@ -1950,7 +1958,7 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
     });
     run_hook_chain(&session_start_hooks, &session_start_payload).await?;
 
-    let (events_tx, events_rx) = mpsc::unbounded_channel();
+    let (events_tx, events_rx) = mpsc::channel(config.runtime.event_queue_capacity);
     let (prompts_tx, mut prompts_rx) = mpsc::unbounded_channel::<String>();
     let workspace_for_worker = workspace.to_path_buf();
     let workspace_name_for_worker = workspace_for_worker.to_string_lossy().into_owned();
@@ -1966,14 +1974,18 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
             {
                 Ok(prompt) => prompt,
                 Err(error) => {
-                    let _ = events_tx.send(AgentEvent::Failed(format!("{error:#}")));
+                    let _ = events_tx
+                        .send(AgentEvent::Failed(format!("{error:#}")))
+                        .await;
                     continue;
                 }
             };
             let prompt = match apply_pre_prompt_hooks(&pre_prompt_hooks, &prompt).await {
                 Ok(prompt) => prompt,
                 Err(error) => {
-                    let _ = events_tx.send(AgentEvent::Failed(format!("{error:#}")));
+                    let _ = events_tx
+                        .send(AgentEvent::Failed(format!("{error:#}")))
+                        .await;
                     continue;
                 }
             };
@@ -2016,7 +2028,8 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
                         if let Some(store) = &store {
                             if let Err(error) = store.save(&mut current) {
                                 let _ = events_tx
-                                    .send(AgentEvent::Failed(format!("saving session: {error:#}")));
+                                    .send(AgentEvent::Failed(format!("saving session: {error:#}")))
+                                    .await;
                                 session = Some(current);
                                 continue;
                             }
@@ -2024,7 +2037,8 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
                                 persist_usage(store, &current.id, usage_tracker.as_deref())
                             {
                                 let _ = events_tx
-                                    .send(AgentEvent::Failed(format!("saving usage: {error:#}")));
+                                    .send(AgentEvent::Failed(format!("saving usage: {error:#}")))
+                                    .await;
                             }
                         }
                     }
@@ -2039,16 +2053,20 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
                         &workspace_name_for_worker,
                     );
                     if let Err(error) = run_hook_chain(&completion_hooks, &payload).await {
-                        let _ = events_tx.send(AgentEvent::Failed(format!(
-                            "completion hook failed: {error:#}"
-                        )));
+                        let _ = events_tx
+                            .send(AgentEvent::Failed(format!(
+                                "completion hook failed: {error:#}"
+                            )))
+                            .await;
                     }
-                    let _ = events_tx.send(AgentEvent::Completed {
-                        usage: outcome.usage,
-                        steps: outcome.steps,
-                        provider,
-                        model,
-                    });
+                    let _ = events_tx
+                        .send(AgentEvent::Completed {
+                            usage: outcome.usage,
+                            steps: outcome.steps,
+                            provider,
+                            model,
+                        })
+                        .await;
                 }
                 Err(error) => {
                     last_error = Some(error.to_string());
@@ -2060,11 +2078,15 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
                         &workspace_name_for_worker,
                     );
                     if let Err(error) = run_hook_chain(&completion_hooks, &payload).await {
-                        let _ = events_tx.send(AgentEvent::Failed(format!(
-                            "completion hook failed: {error:#}"
-                        )));
+                        let _ = events_tx
+                            .send(AgentEvent::Failed(format!(
+                                "completion hook failed: {error:#}"
+                            )))
+                            .await;
                     }
-                    let _ = events_tx.send(AgentEvent::Failed(format!("{error:#}")));
+                    let _ = events_tx
+                        .send(AgentEvent::Failed(format!("{error:#}")))
+                        .await;
                 }
             }
         }
@@ -2079,9 +2101,11 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
             "model": hook_session_model,
         });
         if let Err(error) = run_hook_chain(&session_end_hooks, &payload).await {
-            let _ = events_tx.send(AgentEvent::Failed(format!(
-                "session_end hook failed: {error:#}"
-            )));
+            let _ = events_tx
+                .send(AgentEvent::Failed(format!(
+                    "session_end hook failed: {error:#}"
+                )))
+                .await;
         }
     });
     let branch = detect_git_branch(&workspace_for_worker);

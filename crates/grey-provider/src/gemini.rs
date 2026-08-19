@@ -6,7 +6,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use grey_core::{
-    ChatRequest, Provider, ProviderEvent, ProviderFailure, ProviderFailureKind, ToolCall, Usage,
+    checked_utf8_bytes, ChatRequest, Provider, ProviderEvent, ProviderFailure, ProviderFailureKind,
+    RuntimeConfig, ToolCall, Usage,
 };
 use serde_json::{json, Value};
 
@@ -15,6 +16,7 @@ use crate::sse::SseDecoder;
 pub struct GeminiProvider {
     base_url: String,
     api_key: Option<String>,
+    response_max_bytes: usize,
     client: reqwest::Client,
 }
 
@@ -27,8 +29,14 @@ impl GeminiProvider {
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
+            response_max_bytes: RuntimeConfig::default().response_max_bytes,
             client,
         })
+    }
+
+    pub fn with_response_max_bytes(mut self, response_max_bytes: usize) -> Self {
+        self.response_max_bytes = response_max_bytes;
+        self
     }
 
     fn build_url(&self, model: &str) -> Result<String> {
@@ -75,7 +83,7 @@ impl Provider for GeminiProvider {
         let mut chunks = response.bytes_stream();
         let output = async_stream::stream! {
             let mut decoder = SseDecoder::default();
-            let mut protocol = GeminiStreamState::default();
+            let mut protocol = GeminiStreamState::with_limit(self.response_max_bytes);
 
             while let Some(chunk) = chunks.next().await {
                 let chunk = match chunk {
@@ -133,13 +141,27 @@ impl Provider for GeminiProvider {
     }
 }
 
-#[derive(Default)]
 struct GeminiStreamState {
     done: bool,
     next_call_id: u64,
+    tool_calls: usize,
+    text_bytes: usize,
+    tool_argument_bytes: usize,
+    response_max_bytes: usize,
 }
 
 impl GeminiStreamState {
+    fn with_limit(response_max_bytes: usize) -> Self {
+        Self {
+            done: false,
+            next_call_id: 0,
+            tool_calls: 0,
+            text_bytes: 0,
+            tool_argument_bytes: 0,
+            response_max_bytes,
+        }
+    }
+
     fn fail(&mut self, error: String) -> Option<ProviderEvent> {
         self.fail_failure(ProviderFailure::new(ProviderFailureKind::Protocol, error))
     }
@@ -179,11 +201,47 @@ impl GeminiStreamState {
                     if let Some(parts) = content.get("parts").and_then(|p| p.as_array()) {
                         for part in parts {
                             if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                let Some(next) = checked_utf8_bytes(
+                                    self.text_bytes,
+                                    text,
+                                    self.response_max_bytes,
+                                ) else {
+                                    return self
+                                        .fail(
+                                            "Gemini response text exceeds configured byte limit"
+                                                .into(),
+                                        )
+                                        .into_iter()
+                                        .collect();
+                                };
+                                self.text_bytes = next;
                                 events.push(ProviderEvent::Delta(text.to_string()));
                             }
                             if let Some(fc) = part.get("functionCall") {
                                 if let Some(name) = fc.get("name").and_then(|n| n.as_str()) {
+                                    if self.tool_calls >= crate::MAX_TOOL_CALLS {
+                                        return self
+                                            .fail(format!(
+                                                "Gemini stream exceeds {} tool calls",
+                                                crate::MAX_TOOL_CALLS
+                                            ))
+                                            .into_iter()
+                                            .collect();
+                                    }
                                     let args = fc.get("args").cloned().unwrap_or_else(|| json!({}));
+                                    let serialized = args.to_string();
+                                    let Some(next) = checked_utf8_bytes(
+                                        self.tool_argument_bytes,
+                                        &serialized,
+                                        self.response_max_bytes,
+                                    ) else {
+                                        return self
+                                            .fail("Gemini tool arguments exceed configured byte limit".into())
+                                            .into_iter()
+                                            .collect();
+                                    };
+                                    self.tool_argument_bytes = next;
+                                    self.tool_calls += 1;
                                     self.next_call_id += 1;
                                     events.push(ProviderEvent::ToolCall(ToolCall {
                                         id: format!("gemini-call-{name}--{}", self.next_call_id),
@@ -215,6 +273,12 @@ impl GeminiStreamState {
         }
 
         events
+    }
+}
+
+impl Default for GeminiStreamState {
+    fn default() -> Self {
+        Self::with_limit(RuntimeConfig::default().response_max_bytes)
     }
 }
 
@@ -428,6 +492,25 @@ mod tests {
             _ => panic!("expected Done"),
         }
         assert!(state.done);
+    }
+
+    #[test]
+    fn limit_rejects_gemini_text_and_tool_arguments_once() {
+        let mut text = GeminiStreamState::with_limit(3);
+        let payload = r#"{"candidates":[{"content":{"parts":[{"text":"甲乙"}]}}]}"#;
+        assert!(
+            matches!(text.consume(payload).as_slice(), [ProviderEvent::Error(failure)]
+            if failure.kind() == ProviderFailureKind::Protocol)
+        );
+        assert!(text.consume(payload).is_empty());
+
+        let mut tool = GeminiStreamState::with_limit(3);
+        let payload = r#"{"candidates":[{"content":{"parts":[{"functionCall":{"name":"grep","args":{"pattern":"long"}}}]}}]}"#;
+        assert!(
+            matches!(tool.consume(payload).as_slice(), [ProviderEvent::Error(failure)]
+            if failure.kind() == ProviderFailureKind::Protocol)
+        );
+        assert!(tool.consume(payload).is_empty());
     }
 
     #[tokio::test]

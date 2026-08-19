@@ -77,7 +77,6 @@ use grey_core::{GreyConfig, Provider, ProviderFailure, ProviderFailureKind};
 const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
 const ERROR_BODY_TRUNCATION_MARKER: &str = " … [truncated]";
 pub(crate) const MAX_TOOL_CALLS: usize = 128;
-pub(crate) const MAX_TOOL_DATA_BYTES: usize = 4 * 1024 * 1024;
 
 pub(crate) async fn send_http(
     client: &reqwest::Client,

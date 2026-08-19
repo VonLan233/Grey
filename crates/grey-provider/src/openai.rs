@@ -7,8 +7,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use grey_core::{
-    ChatMessage, ChatRequest, GreyConfig, Provider, ProviderEvent, ProviderFailure,
-    ProviderFailureKind, Role, ToolCall, Usage,
+    checked_utf8_bytes, ChatMessage, ChatRequest, GreyConfig, Provider, ProviderEvent,
+    ProviderFailure, ProviderFailureKind, Role, RuntimeConfig, ToolCall, Usage,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -19,6 +19,7 @@ pub struct OpenAiCompatibleProvider {
     base_url: String,
     api_key: Option<String>,
     include_usage: bool,
+    response_max_bytes: usize,
     client: reqwest::Client,
 }
 
@@ -29,6 +30,7 @@ impl OpenAiCompatibleProvider {
             (!cfg.openai.api_key.is_empty()).then(|| cfg.openai.api_key.clone()),
             cfg.openai.include_usage,
         )
+        .map(|provider| provider.with_response_max_bytes(cfg.runtime.response_max_bytes))
     }
 
     pub fn new(base_url: String, api_key: Option<String>) -> Result<Self> {
@@ -48,8 +50,14 @@ impl OpenAiCompatibleProvider {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
             include_usage,
+            response_max_bytes: RuntimeConfig::default().response_max_bytes,
             client,
         })
+    }
+
+    pub fn with_response_max_bytes(mut self, response_max_bytes: usize) -> Self {
+        self.response_max_bytes = response_max_bytes;
+        self
     }
 
     fn build_request(&self, request: &ChatRequest) -> Result<reqwest::Request> {
@@ -81,7 +89,7 @@ impl Provider for OpenAiCompatibleProvider {
         let mut chunks = response.bytes_stream();
         let output = async_stream::stream! {
             let mut decoder = SseDecoder::default();
-            let mut protocol = OpenAiStreamState::default();
+            let mut protocol = OpenAiStreamState::with_limit(self.response_max_bytes);
 
             while let Some(chunk) = chunks.next().await {
                 let chunk = match chunk {
@@ -272,15 +280,28 @@ struct ToolCallParts {
     arguments: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct OpenAiStreamState {
     calls: BTreeMap<usize, ToolCallParts>,
     tool_data_bytes: usize,
+    text_bytes: usize,
+    response_max_bytes: usize,
     usage: Usage,
     terminal: bool,
 }
 
 impl OpenAiStreamState {
+    fn with_limit(response_max_bytes: usize) -> Self {
+        Self {
+            calls: BTreeMap::new(),
+            tool_data_bytes: 0,
+            text_bytes: 0,
+            response_max_bytes,
+            usage: Usage::default(),
+            terminal: false,
+        }
+    }
+
     fn consume(&mut self, payload: &str) -> Vec<ProviderEvent> {
         if self.terminal {
             return Vec::new();
@@ -329,6 +350,18 @@ impl OpenAiStreamState {
         for choice in chunk.choices {
             if let Some(content) = choice.delta.content {
                 if !content.is_empty() {
+                    let Some(next) =
+                        checked_utf8_bytes(self.text_bytes, &content, self.response_max_bytes)
+                    else {
+                        return self
+                            .fail(ProviderFailure::new(
+                                ProviderFailureKind::Protocol,
+                                "OpenAI response text exceeds configured byte limit",
+                            ))
+                            .into_iter()
+                            .collect();
+                    };
+                    self.text_bytes = next;
                     events.push(ProviderEvent::Delta(content));
                 }
             }
@@ -344,22 +377,22 @@ impl OpenAiStreamState {
                         .into_iter()
                         .collect();
                 }
-                let added_bytes = delta.id.as_deref().map_or(0, str::len)
-                    + delta.function.name.as_deref().map_or(0, str::len)
-                    + delta.function.arguments.as_deref().map_or(0, str::len);
-                if self.tool_data_bytes.saturating_add(added_bytes) > crate::MAX_TOOL_DATA_BYTES {
-                    return self
-                        .fail(ProviderFailure::new(
-                            ProviderFailureKind::Protocol,
-                            format!(
-                                "OpenAI streamed tool data exceeds {} bytes",
-                                crate::MAX_TOOL_DATA_BYTES
-                            ),
-                        ))
-                        .into_iter()
-                        .collect();
+                if let Some(arguments) = delta.function.arguments.as_deref() {
+                    let Some(next) = checked_utf8_bytes(
+                        self.tool_data_bytes,
+                        arguments,
+                        self.response_max_bytes,
+                    ) else {
+                        return self
+                            .fail(ProviderFailure::new(
+                                ProviderFailureKind::Protocol,
+                                "OpenAI tool arguments exceed configured byte limit",
+                            ))
+                            .into_iter()
+                            .collect();
+                    };
+                    self.tool_data_bytes = next;
                 }
-                self.tool_data_bytes += added_bytes;
                 let call = self.calls.entry(delta.index).or_default();
                 if let Some(id) = delta.id {
                     call.id.push_str(&id);
@@ -424,6 +457,12 @@ impl OpenAiStreamState {
             self.terminal = true;
             Some(ProviderEvent::Error(failure))
         }
+    }
+}
+
+impl Default for OpenAiStreamState {
+    fn default() -> Self {
+        Self::with_limit(RuntimeConfig::default().response_max_bytes)
     }
 }
 
@@ -595,6 +634,28 @@ mod tests {
             if message.to_string().contains("tool calls"))
         );
         assert!(state.consume("[DONE]").is_empty());
+    }
+
+    #[test]
+    fn limit_rejects_openai_text_and_tool_arguments_once() {
+        let mut text = OpenAiStreamState::with_limit(3);
+        let payload = json!({"choices":[{"delta":{"content":"甲乙"}}]}).to_string();
+        assert!(
+            matches!(text.consume(&payload).as_slice(), [ProviderEvent::Error(failure)]
+            if failure.kind() == ProviderFailureKind::Protocol)
+        );
+        assert!(text.consume("[DONE]").is_empty());
+
+        let mut tool = OpenAiStreamState::with_limit(1);
+        let payload = json!({"choices":[{"delta":{"tool_calls":[{
+            "index":0,"id":"call-1","function":{"name":"grep","arguments":"{}"}
+        }]}}]})
+        .to_string();
+        assert!(
+            matches!(tool.consume(&payload).as_slice(), [ProviderEvent::Error(failure)]
+            if failure.kind() == ProviderFailureKind::Protocol)
+        );
+        assert!(tool.consume("[DONE]").is_empty());
     }
 
     #[tokio::test]

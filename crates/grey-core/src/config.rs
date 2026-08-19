@@ -192,6 +192,101 @@ impl Default for ContextConfig {
     }
 }
 
+const RUNTIME_QUEUE_MIN: usize = 1;
+const RUNTIME_QUEUE_MAX: usize = 65_536;
+const RUNTIME_BYTES_MIN: usize = 1024;
+const RUNTIME_BYTES_MAX: usize = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeConfig {
+    #[serde(default = "default_event_queue_capacity")]
+    pub event_queue_capacity: usize,
+    #[serde(default = "default_input_queue_capacity")]
+    pub input_queue_capacity: usize,
+    #[serde(default = "default_prompt_queue_capacity")]
+    pub prompt_queue_capacity: usize,
+    #[serde(default = "default_transcript_max_bytes")]
+    pub transcript_max_bytes: usize,
+    #[serde(default = "default_response_max_bytes")]
+    pub response_max_bytes: usize,
+    #[serde(default = "default_command_stdout_max_bytes")]
+    pub command_stdout_max_bytes: usize,
+    #[serde(default = "default_command_stderr_max_bytes")]
+    pub command_stderr_max_bytes: usize,
+    #[serde(default = "default_skill_max_bytes")]
+    pub skill_max_bytes: usize,
+}
+
+fn default_event_queue_capacity() -> usize {
+    256
+}
+fn default_input_queue_capacity() -> usize {
+    256
+}
+fn default_prompt_queue_capacity() -> usize {
+    1
+}
+fn default_transcript_max_bytes() -> usize {
+    1024 * 1024
+}
+fn default_response_max_bytes() -> usize {
+    4 * 1024 * 1024
+}
+fn default_command_stdout_max_bytes() -> usize {
+    64 * 1024
+}
+fn default_command_stderr_max_bytes() -> usize {
+    64 * 1024
+}
+fn default_skill_max_bytes() -> usize {
+    1024 * 1024
+}
+
+impl RuntimeConfig {
+    fn clamped(mut self) -> Self {
+        self.event_queue_capacity = self
+            .event_queue_capacity
+            .clamp(RUNTIME_QUEUE_MIN, RUNTIME_QUEUE_MAX);
+        self.input_queue_capacity = self
+            .input_queue_capacity
+            .clamp(RUNTIME_QUEUE_MIN, RUNTIME_QUEUE_MAX);
+        self.prompt_queue_capacity = self
+            .prompt_queue_capacity
+            .clamp(RUNTIME_QUEUE_MIN, RUNTIME_QUEUE_MAX);
+        self.transcript_max_bytes = self
+            .transcript_max_bytes
+            .clamp(RUNTIME_BYTES_MIN, RUNTIME_BYTES_MAX);
+        self.response_max_bytes = self
+            .response_max_bytes
+            .clamp(RUNTIME_BYTES_MIN, RUNTIME_BYTES_MAX);
+        self.command_stdout_max_bytes = self
+            .command_stdout_max_bytes
+            .clamp(RUNTIME_BYTES_MIN, RUNTIME_BYTES_MAX);
+        self.command_stderr_max_bytes = self
+            .command_stderr_max_bytes
+            .clamp(RUNTIME_BYTES_MIN, RUNTIME_BYTES_MAX);
+        self.skill_max_bytes = self
+            .skill_max_bytes
+            .clamp(RUNTIME_BYTES_MIN, RUNTIME_BYTES_MAX);
+        self
+    }
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            event_queue_capacity: default_event_queue_capacity(),
+            input_queue_capacity: default_input_queue_capacity(),
+            prompt_queue_capacity: default_prompt_queue_capacity(),
+            transcript_max_bytes: default_transcript_max_bytes(),
+            response_max_bytes: default_response_max_bytes(),
+            command_stdout_max_bytes: default_command_stdout_max_bytes(),
+            command_stderr_max_bytes: default_command_stderr_max_bytes(),
+            skill_max_bytes: default_skill_max_bytes(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheConfig {
     #[serde(default = "default_cache_enabled")]
@@ -483,6 +578,8 @@ pub struct GreyConfig {
     pub fallback: FallbackConfig,
     /// P2: context / token budget configuration.
     pub context: ContextConfig,
+    /// Runtime memory and queue limits.
+    pub runtime: RuntimeConfig,
     /// P2: request cache configuration.
     pub cache: CacheConfig,
     /// P2: usage tracking configuration.
@@ -517,6 +614,7 @@ impl Default for GreyConfig {
             routes: Vec::new(),
             fallback: FallbackConfig::default(),
             context: ContextConfig::default(),
+            runtime: RuntimeConfig::default(),
             cache: CacheConfig::default(),
             usage: UsageConfig::default(),
             hooks: HooksConfig::default(),
@@ -608,10 +706,15 @@ pub fn default_config_path() -> PathBuf {
 }
 
 pub fn load() -> Result<GreyConfig> {
+    let path = config_path();
+    load_from_path(path.as_deref())
+}
+
+fn load_from_path(path: Option<&Path>) -> Result<GreyConfig> {
     let mut cfg = GreyConfig::default();
     let mut legacy_file = false;
-    if let Some(path) = config_path() {
-        let raw = std::fs::read_to_string(&path)
+    if let Some(path) = path {
+        let raw = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
         let raw_value: toml::Value =
             toml::from_str(&raw).with_context(|| format!("parsing config {}", path.display()))?;
@@ -623,6 +726,7 @@ pub fn load() -> Result<GreyConfig> {
         cfg = merge_file(cfg, file_cfg, &raw_value);
     }
     apply_env(&mut cfg)?;
+    cfg.runtime = cfg.runtime.clamped();
     let legacy_env = [
         "GREY_PROVIDER",
         "GREY_MODEL",
@@ -666,6 +770,9 @@ fn merge_file(base: GreyConfig, over: GreyConfig, raw: &toml::Value) -> GreyConf
     if !table.contains_key("context") {
         merged.context = defaults.context;
     }
+    if !table.contains_key("runtime") {
+        merged.runtime = defaults.runtime;
+    }
     if !table.contains_key("cache") {
         merged.cache = defaults.cache;
     }
@@ -707,6 +814,7 @@ fn merge(mut base: GreyConfig, over: GreyConfig) -> GreyConfig {
         base.fallback.models = over.fallback.models;
     }
     base.context = over.context;
+    base.runtime = over.runtime;
     base.cache = over.cache;
     base.usage = over.usage;
     let has_hook_override = !over.hooks.pre_prompt.is_empty()
@@ -1018,6 +1126,50 @@ mod tests {
         assert_eq!(cfg.openai.base_url, "http://localhost:11434/v1");
         assert_eq!(cfg.default_provider, "mock");
         assert!(!cfg.providers.is_empty());
+    }
+
+    #[test]
+    fn bounded_runtime_defaults_and_file_values_are_clamped() {
+        let defaults = GreyConfig::default();
+        assert_eq!(defaults.runtime.event_queue_capacity, 256);
+        assert_eq!(defaults.runtime.input_queue_capacity, 256);
+        assert_eq!(defaults.runtime.prompt_queue_capacity, 1);
+        assert_eq!(defaults.runtime.transcript_max_bytes, 1024 * 1024);
+        assert_eq!(defaults.runtime.response_max_bytes, 4 * 1024 * 1024);
+        assert_eq!(defaults.runtime.command_stdout_max_bytes, 64 * 1024);
+        assert_eq!(defaults.runtime.command_stderr_max_bytes, 64 * 1024);
+        assert_eq!(defaults.runtime.skill_max_bytes, 1024 * 1024);
+
+        let dir = test_dir().join("bounded-runtime");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("grey.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"[runtime]
+event_queue_capacity = 0
+input_queue_capacity = {max}
+prompt_queue_capacity = 0
+transcript_max_bytes = {max}
+response_max_bytes = 0
+command_stdout_max_bytes = {max}
+command_stderr_max_bytes = 0
+skill_max_bytes = {max}
+"#,
+                max = i64::MAX
+            ),
+        )
+        .unwrap();
+
+        let cfg = load_from_path(Some(&path)).unwrap();
+        assert_eq!(cfg.runtime.event_queue_capacity, 1);
+        assert_eq!(cfg.runtime.input_queue_capacity, 65_536);
+        assert_eq!(cfg.runtime.prompt_queue_capacity, 1);
+        assert_eq!(cfg.runtime.transcript_max_bytes, 64 * 1024 * 1024);
+        assert_eq!(cfg.runtime.response_max_bytes, 1024);
+        assert_eq!(cfg.runtime.command_stdout_max_bytes, 64 * 1024 * 1024);
+        assert_eq!(cfg.runtime.command_stderr_max_bytes, 1024);
+        assert_eq!(cfg.runtime.skill_max_bytes, 64 * 1024 * 1024);
     }
 
     #[test]

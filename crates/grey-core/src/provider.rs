@@ -12,6 +12,13 @@ use serde_json::Value;
 
 use crate::tool::ToolDefinition;
 
+/// Returns the new UTF-8 byte count when a complete string fragment fits.
+pub fn checked_utf8_bytes(current: usize, addition: &str, limit: usize) -> Option<usize> {
+    current
+        .checked_add(addition.len())
+        .filter(|next| *next <= limit)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {

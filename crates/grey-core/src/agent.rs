@@ -11,9 +11,9 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::{
-    CachedResponse, ChatMessage, ChatRequest, ContextAudit, ContextManager, Provider,
-    ProviderEvent, ProviderFailure, ProviderFailureKind, ProviderModelRef, RequestCache, Role,
-    ToolCall, ToolExecutor, ToolResult, Usage, UsageTracker,
+    checked_utf8_bytes, CachedResponse, ChatMessage, ChatRequest, ContextAudit, ContextManager,
+    Provider, ProviderEvent, ProviderFailure, ProviderFailureKind, ProviderModelRef, RequestCache,
+    Role, RuntimeConfig, ToolCall, ToolExecutor, ToolResult, Usage, UsageTracker,
 };
 
 #[derive(Debug, Clone)]
@@ -22,6 +22,7 @@ pub struct AgentOptions {
     pub max_steps: usize,
     pub retries: usize,
     pub retry_delay: Duration,
+    pub response_max_bytes: usize,
 }
 
 impl AgentOptions {
@@ -31,6 +32,7 @@ impl AgentOptions {
             max_steps: 12,
             retries: 2,
             retry_delay: Duration::from_millis(250),
+            response_max_bytes: RuntimeConfig::default().response_max_bytes,
         }
     }
 }
@@ -213,7 +215,7 @@ impl Agent {
         &self,
         system_prompt: impl Into<String>,
         prompt: impl Into<String>,
-        events: Option<&mpsc::UnboundedSender<AgentEvent>>,
+        events: Option<&mpsc::Sender<AgentEvent>>,
     ) -> Result<AgentOutcome> {
         self.continue_messages(
             vec![ChatMessage::new(Role::System, system_prompt)],
@@ -227,7 +229,7 @@ impl Agent {
         &self,
         mut messages: Vec<ChatMessage>,
         prompt: impl Into<String>,
-        events: Option<&mpsc::UnboundedSender<AgentEvent>>,
+        events: Option<&mpsc::Sender<AgentEvent>>,
     ) -> Result<AgentOutcome> {
         anyhow::ensure!(
             self.options.max_steps > 0,
@@ -241,13 +243,14 @@ impl Agent {
 
         for step in 1..=self.options.max_steps {
             let (prepared, audit) = self.context.prepare(&messages).await;
+            messages = prepared;
             if audit.dropped_messages > 0
                 || audit.tool_outputs_truncated > 0
                 || audit.summary_created
             {
-                send_event(events, AgentEvent::ContextTrimmed(audit));
+                send_event(events, AgentEvent::ContextTrimmed(audit)).await?;
             }
-            let request = ChatRequest::new(self.options.model.clone(), prepared)
+            let request = ChatRequest::new(self.options.model.clone(), messages.clone())
                 .with_tools(definitions.clone());
 
             if let Some(cache) = &self.cache {
@@ -255,13 +258,19 @@ impl Agent {
                     .get_for_provider(&self.provider_id, &request.model, &request.messages)
                     .or_else(|| cache.get(&request.model, &request.messages))
                 {
+                    validate_response_limit(
+                        &cached_resp.text,
+                        &cached_resp.tool_calls,
+                        self.options.response_max_bytes,
+                    )?;
                     cached = true;
                     send_event(
                         events,
                         AgentEvent::CacheHit {
                             model: self.options.model.clone(),
                         },
-                    );
+                    )
+                    .await?;
                     let turn = CompletedTurn {
                         text: cached_resp.text,
                         calls: cached_resp.tool_calls,
@@ -291,6 +300,7 @@ impl Agent {
                     ));
 
                     if turn.calls.is_empty() {
+                        let (messages, _) = self.context.prepare(&messages).await;
                         return Ok(AgentOutcome {
                             messages,
                             response: turn.text,
@@ -308,9 +318,9 @@ impl Agent {
                         );
                     }
                     for call in turn.calls {
-                        send_event(events, AgentEvent::ToolStarted(call.clone()));
+                        send_event(events, AgentEvent::ToolStarted(call.clone())).await?;
                         let result = self.tools.execute(&call).await;
-                        send_event(events, AgentEvent::ToolFinished(result.clone()));
+                        send_event(events, AgentEvent::ToolFinished(result.clone())).await?;
                         self.push_tool_result_messages(
                             &call,
                             result,
@@ -363,6 +373,7 @@ impl Agent {
             ));
 
             if turn.calls.is_empty() {
+                let (messages, _) = self.context.prepare(&messages).await;
                 return Ok(AgentOutcome {
                     messages,
                     response: turn.text,
@@ -381,9 +392,9 @@ impl Agent {
             }
 
             for call in turn.calls {
-                send_event(events, AgentEvent::ToolStarted(call.clone()));
+                send_event(events, AgentEvent::ToolStarted(call.clone())).await?;
                 let result = self.tools.execute(&call).await;
-                send_event(events, AgentEvent::ToolFinished(result.clone()));
+                send_event(events, AgentEvent::ToolFinished(result.clone())).await?;
                 self.push_tool_result_messages(
                     &call,
                     result,
@@ -399,7 +410,7 @@ impl Agent {
     async fn stream_turn(
         &self,
         request: &ChatRequest,
-        events: Option<&mpsc::UnboundedSender<AgentEvent>>,
+        events: Option<&mpsc::Sender<AgentEvent>>,
     ) -> Result<CompletedTurn> {
         let mut candidates = vec![ProviderCandidate {
             provider: self.provider.clone(),
@@ -459,7 +470,8 @@ impl Agent {
                             to: candidates[index + 1].provider_id.clone(),
                             reason: failure.failure.to_string(),
                         },
-                    );
+                    )
+                    .await?;
                 }
                 Err(failure) => {
                     if failure.failure.allows_retry_or_fallback() {
@@ -485,7 +497,7 @@ impl Agent {
         &self,
         candidate: &ProviderCandidate,
         request: &ChatRequest,
-        events: Option<&mpsc::UnboundedSender<AgentEvent>>,
+        events: Option<&mpsc::Sender<AgentEvent>>,
     ) -> std::result::Result<CompletedTurn, AttemptFailure> {
         'attempts: for attempt in 0..=self.options.retries {
             let mut stream = match candidate.provider.stream_chat(request).await {
@@ -493,7 +505,7 @@ impl Agent {
                 Err(error) => {
                     let failure = ProviderFailure::from_error(error);
                     if failure.allows_retry_or_fallback() && attempt < self.options.retries {
-                        self.retry(attempt, &failure, events).await;
+                        self.retry(attempt, &failure, events).await?;
                         continue;
                     }
                     return Err(AttemptFailure {
@@ -506,15 +518,47 @@ impl Agent {
             let mut calls = Vec::new();
             let mut usage = None;
             let mut visible_output = false;
+            let mut tool_argument_bytes = 0;
 
             while let Some(event) = stream.next().await {
                 match event {
                     ProviderEvent::Delta(delta) => {
+                        if checked_utf8_bytes(text.len(), &delta, self.options.response_max_bytes)
+                            .is_none()
+                        {
+                            return Err(AttemptFailure::protocol(
+                                "provider response exceeds configured byte limit",
+                                visible_output,
+                            ));
+                        }
                         visible_output = true;
                         text.push_str(&delta);
-                        send_event(events, AgentEvent::Delta(delta));
+                        send_event(events, AgentEvent::Delta(delta))
+                            .await
+                            .map_err(|error| {
+                                AttemptFailure::event_channel(error, visible_output)
+                            })?;
                     }
                     ProviderEvent::ToolCall(call) => {
+                        let arguments =
+                            serde_json::to_string(&call.arguments).map_err(|error| {
+                                AttemptFailure::protocol_with_source(
+                                    "provider tool arguments are not serializable",
+                                    error,
+                                    visible_output,
+                                )
+                            })?;
+                        tool_argument_bytes = checked_utf8_bytes(
+                            tool_argument_bytes,
+                            &arguments,
+                            self.options.response_max_bytes,
+                        )
+                        .ok_or_else(|| {
+                            AttemptFailure::protocol(
+                                "provider tool arguments exceed configured byte limit",
+                                visible_output,
+                            )
+                        })?;
                         visible_output = true;
                         calls.push(call);
                     }
@@ -524,7 +568,7 @@ impl Agent {
                             && failure.allows_retry_or_fallback()
                             && attempt < self.options.retries =>
                     {
-                        self.retry(attempt, &failure, events).await;
+                        self.retry(attempt, &failure, events).await?;
                         continue 'attempts;
                     }
                     ProviderEvent::Error(failure) => {
@@ -562,16 +606,19 @@ impl Agent {
         &self,
         zero_based_attempt: usize,
         failure: &ProviderFailure,
-        events: Option<&mpsc::UnboundedSender<AgentEvent>>,
-    ) {
+        events: Option<&mpsc::Sender<AgentEvent>>,
+    ) -> std::result::Result<(), AttemptFailure> {
         send_event(
             events,
             AgentEvent::Retry {
                 attempt: zero_based_attempt + 2,
                 error: failure.to_string(),
             },
-        );
+        )
+        .await
+        .map_err(|error| AttemptFailure::event_channel(error, false))?;
         tokio::time::sleep(self.options.retry_delay).await;
+        Ok(())
     }
 
     fn push_tool_result_messages(
@@ -743,15 +790,73 @@ struct CompletedTurn {
     model: String,
 }
 
+fn validate_response_limit(
+    text: &str,
+    calls: &[ToolCall],
+    response_max_bytes: usize,
+) -> std::result::Result<(), ProviderFailure> {
+    if checked_utf8_bytes(0, text, response_max_bytes).is_none() {
+        return Err(ProviderFailure::new(
+            ProviderFailureKind::Protocol,
+            "provider response exceeds configured byte limit",
+        ));
+    }
+    let mut bytes = 0;
+    for call in calls {
+        let arguments = serde_json::to_string(&call.arguments).map_err(|error| {
+            ProviderFailure::with_source(
+                ProviderFailureKind::Protocol,
+                "provider tool arguments are not serializable",
+                error,
+            )
+        })?;
+        bytes = checked_utf8_bytes(bytes, &arguments, response_max_bytes).ok_or_else(|| {
+            ProviderFailure::new(
+                ProviderFailureKind::Protocol,
+                "provider tool arguments exceed configured byte limit",
+            )
+        })?;
+    }
+    Ok(())
+}
+
 struct AttemptFailure {
     failure: ProviderFailure,
     visible_output: bool,
 }
 
-fn send_event(events: Option<&mpsc::UnboundedSender<AgentEvent>>, event: AgentEvent) {
-    if let Some(events) = events {
-        let _ = events.send(event);
+impl AttemptFailure {
+    fn protocol(message: impl Into<String>, visible_output: bool) -> Self {
+        Self {
+            failure: ProviderFailure::new(ProviderFailureKind::Protocol, message),
+            visible_output,
+        }
     }
+
+    fn protocol_with_source(
+        message: impl Into<String>,
+        source: impl std::fmt::Display,
+        visible_output: bool,
+    ) -> Self {
+        Self {
+            failure: ProviderFailure::with_source(ProviderFailureKind::Protocol, message, source),
+            visible_output,
+        }
+    }
+
+    fn event_channel(error: anyhow::Error, visible_output: bool) -> Self {
+        Self::protocol_with_source("agent event receiver closed", error, visible_output)
+    }
+}
+
+async fn send_event(events: Option<&mpsc::Sender<AgentEvent>>, event: AgentEvent) -> Result<()> {
+    if let Some(events) = events {
+        events
+            .send(event)
+            .await
+            .map_err(|_| anyhow::anyhow!("agent event receiver closed"))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1028,6 +1133,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bounded_event_queue_backpressures_without_losing_deltas() {
+        let provider = Arc::new(ScriptedProvider {
+            turns: Mutex::new(VecDeque::from([vec![
+                ProviderEvent::Delta("甲".into()),
+                ProviderEvent::Delta("乙".into()),
+                ProviderEvent::Done(Usage::default()),
+            ]])),
+            requests: Mutex::new(Vec::new()),
+        });
+        let agent = agent(provider, 1);
+        let (events_tx, mut events_rx) = mpsc::channel(1);
+        let run =
+            tokio::spawn(async move { agent.run_new("system", "hello", Some(&events_tx)).await });
+
+        tokio::task::yield_now().await;
+        assert!(!run.is_finished(), "producer must wait for capacity");
+        assert!(matches!(events_rx.recv().await, Some(AgentEvent::Delta(text)) if text == "甲"));
+        assert!(matches!(events_rx.recv().await, Some(AgentEvent::Delta(text)) if text == "乙"));
+        let outcome = run.await.unwrap().unwrap();
+        assert_eq!(outcome.response, "甲乙");
+    }
+
+    #[tokio::test]
+    async fn bounded_agent_response_and_tool_arguments_fail_as_protocol() {
+        for events in [
+            vec![
+                ProviderEvent::Delta("甲乙".into()),
+                ProviderEvent::Done(Usage::default()),
+            ],
+            vec![
+                ProviderEvent::ToolCall(ToolCall {
+                    id: "call-1".into(),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({"path": "too-long"}),
+                }),
+                ProviderEvent::Done(Usage::default()),
+            ],
+        ] {
+            let provider = Arc::new(ScriptedProvider {
+                turns: Mutex::new(VecDeque::from([events])),
+                requests: Mutex::new(Vec::new()),
+            });
+            let mut options = AgentOptions::new("model");
+            options.retries = 0;
+            options.response_max_bytes = 3;
+            let agent = Agent::new(
+                provider,
+                Arc::new(ScriptedTools),
+                ContextManager::default(),
+                options,
+            );
+
+            let error = agent.run_new("system", "hello", None).await.unwrap_err();
+            let failure = error.downcast_ref::<ProviderFailure>().unwrap();
+            assert_eq!(failure.kind(), ProviderFailureKind::Protocol);
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_outcome_retains_only_context_prepared_history() {
+        let provider = Arc::new(ScriptedProvider {
+            turns: Mutex::new(VecDeque::from([
+                vec![
+                    ProviderEvent::Delta("first".into()),
+                    ProviderEvent::Done(Usage::default()),
+                ],
+                vec![
+                    ProviderEvent::Delta("second".into()),
+                    ProviderEvent::Done(Usage::default()),
+                ],
+            ])),
+            requests: Mutex::new(Vec::new()),
+        });
+        let config = crate::ContextConfig {
+            max_tokens: 24,
+            system_budget: 4,
+            history_budget: 12,
+            tool_output_budget: 4,
+            input_budget: 4,
+            summary_threshold: usize::MAX,
+            summary_max_messages: 0,
+        };
+        let mut options = AgentOptions::new("model");
+        options.retries = 0;
+        let agent = Agent::new(
+            provider,
+            Arc::new(ScriptedTools),
+            ContextManager::with_budget(config, Arc::new(crate::CharApproxCounter), None, "model"),
+            options,
+        );
+        let mut history = vec![ChatMessage::new(Role::System, "system")];
+        for index in 0..20 {
+            history.push(ChatMessage::new(Role::User, format!("old-message-{index}")));
+            history.push(ChatMessage::new(Role::Assistant, "old-response"));
+        }
+        let original_len = history.len();
+
+        let first = agent
+            .continue_messages(history, "new prompt", None)
+            .await
+            .unwrap();
+        assert!(first.messages.len() < original_len);
+        let first_len = first.messages.len();
+        let second = agent
+            .continue_messages(first.messages, "next prompt", None)
+            .await
+            .unwrap();
+        assert!(second.messages.len() <= first_len + 1);
+    }
+
+    #[tokio::test]
     async fn cache_hit_returns_without_provider_call() {
         let dir = tempfile::tempdir().unwrap();
         let cache = Arc::new(
@@ -1077,6 +1293,53 @@ mod tests {
         assert_eq!(outcome.response, "cached response");
         assert!(outcome.cached);
         assert_eq!(provider.requests.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn bounded_cache_hit_is_rejected_by_shared_response_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(
+            RequestCache::open(
+                &dir.path().join("cache.db"),
+                crate::cache::RequestCacheConfig::default(),
+            )
+            .unwrap(),
+        );
+        let messages = vec![
+            ChatMessage::new(Role::System, "system"),
+            ChatMessage::new(Role::User, "hello"),
+        ];
+        cache
+            .put(
+                "model",
+                &messages,
+                &CachedResponse {
+                    text: "甲乙".into(),
+                    tool_calls: Vec::new(),
+                    usage: Usage::default(),
+                    cached_at: 0,
+                },
+            )
+            .unwrap();
+        let provider = Arc::new(ScriptedProvider {
+            turns: Mutex::new(VecDeque::new()),
+            requests: Mutex::new(Vec::new()),
+        });
+        let mut options = AgentOptions::new("model");
+        options.response_max_bytes = 3;
+        let agent = Agent::new(
+            provider,
+            Arc::new(ScriptedTools),
+            ContextManager::default(),
+            options,
+        )
+        .with_cache(cache);
+
+        let error = agent.run_new("system", "hello", None).await.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ProviderFailure>().unwrap().kind(),
+            ProviderFailureKind::Protocol
+        );
     }
 
     #[tokio::test]
@@ -1190,7 +1453,7 @@ mod tests {
             options,
         )
         .with_fallback_providers(vec![ProviderCandidate::new(fallback, "fallback-model")]);
-        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let (events_tx, mut events_rx) = mpsc::channel(8);
 
         let outcome = agent
             .run_new("system", "hello", Some(&events_tx))

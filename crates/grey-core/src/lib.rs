@@ -21,13 +21,13 @@ pub use cache::{CacheStats, CachedResponse, RequestCache};
 pub use config::{
     AnthropicConfig, CacheConfig, ContextConfig, FallbackConfig, GreyConfig, HooksConfig,
     LspConfig, McpToolConfig, ModelEntry, OpenAiConfig, PluginConfig, PluginKind, ProviderEntry,
-    RouteRule, TaskKind, TuiColorOverrides, TuiCompletionConfig, TuiConfig, TuiKeysConfig,
-    TuiLayoutConfig, TuiThemeConfig, UsageConfig,
+    RouteRule, RuntimeConfig, TaskKind, TuiColorOverrides, TuiCompletionConfig, TuiConfig,
+    TuiKeysConfig, TuiLayoutConfig, TuiThemeConfig, UsageConfig,
 };
 pub use context::{ContextAudit, ContextManager};
 pub use provider::{
-    collect, redact_provider_secrets, ChatMessage, ChatRequest, Provider, ProviderEvent,
-    ProviderFailure, ProviderFailureKind, ProviderModelRef, Role, ToolCall, Usage,
+    checked_utf8_bytes, collect, redact_provider_secrets, ChatMessage, ChatRequest, Provider,
+    ProviderEvent, ProviderFailure, ProviderFailureKind, ProviderModelRef, Role, ToolCall, Usage,
 };
 pub use session::{Session, SessionStore, SessionSummary};
 pub use summary::SummaryEngine;

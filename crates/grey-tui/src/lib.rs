@@ -1025,7 +1025,7 @@ impl AppState {
 
 /// Run the real conversation UI over channels owned by an agent orchestrator.
 pub async fn run_agent_tui(
-    events: mpsc::UnboundedReceiver<AgentEvent>,
+    events: mpsc::Receiver<AgentEvent>,
     prompts: PromptSender,
     tui_config: &TuiConfig,
     git_branch: Option<&str>,
@@ -1044,7 +1044,8 @@ pub async fn run_agent_tui(
 
 /// Run the P0 mock stream through the production state/event/render pipeline.
 pub async fn run_stream_demo() -> Result<()> {
-    let (agent_sender, agent_events) = mpsc::unbounded_channel();
+    let (agent_sender, agent_events) =
+        mpsc::channel(grey_core::RuntimeConfig::default().event_queue_capacity);
     let (prompt_sender, prompt_receiver) = mpsc::unbounded_channel();
     let demo = tokio::spawn(run_demo_driver(agent_sender, prompt_receiver));
     let result = run_agent_tui(agent_events, prompt_sender, &TuiConfig::default(), None).await;
@@ -1054,7 +1055,7 @@ pub async fn run_stream_demo() -> Result<()> {
 
 async fn run_loop<B: Backend>(
     terminal: &mut Terminal<B>,
-    mut agent_events: mpsc::UnboundedReceiver<AgentEvent>,
+    mut agent_events: mpsc::Receiver<AgentEvent>,
     prompts: PromptSender,
     mut input_events: mpsc::UnboundedReceiver<InputMessage>,
     settings: TuiSettings,
@@ -1351,13 +1352,13 @@ fn centered_rect(width_percent: u16, height_percent: u16, area: Rect) -> Rect {
 }
 
 async fn run_demo_driver(
-    events: mpsc::UnboundedSender<AgentEvent>,
+    events: mpsc::Sender<AgentEvent>,
     mut prompts: mpsc::UnboundedReceiver<String>,
 ) {
     if !send_demo_stream(&events, DEMO_REPLY).await {
         return;
     }
-    if !finish_demo_turn(&events) {
+    if !finish_demo_turn(&events).await {
         return;
     }
     while let Some(prompt) = prompts.recv().await {
@@ -1365,13 +1366,13 @@ async fn run_demo_driver(
         if !send_demo_stream(&events, &reply).await {
             return;
         }
-        if !finish_demo_turn(&events) {
+        if !finish_demo_turn(&events).await {
             return;
         }
     }
 }
 
-fn finish_demo_turn(events: &mpsc::UnboundedSender<AgentEvent>) -> bool {
+async fn finish_demo_turn(events: &mpsc::Sender<AgentEvent>) -> bool {
     events
         .send(AgentEvent::Completed {
             usage: grey_core::Usage::default(),
@@ -1379,17 +1380,18 @@ fn finish_demo_turn(events: &mpsc::UnboundedSender<AgentEvent>) -> bool {
             provider: "mock".into(),
             model: "mock".into(),
         })
+        .await
         .is_ok()
 }
 
-async fn send_demo_stream(events: &mpsc::UnboundedSender<AgentEvent>, text: &str) -> bool {
+async fn send_demo_stream(events: &mpsc::Sender<AgentEvent>, text: &str) -> bool {
     let characters: Vec<char> = text.chars().collect();
     let mut index = 0;
     while index < characters.len() {
         let chunk_len = (index % 5) + 2;
         let end = (index + chunk_len).min(characters.len());
         let chunk: String = characters[index..end].iter().collect();
-        if events.send(AgentEvent::Delta(chunk)).is_err() {
+        if events.send(AgentEvent::Delta(chunk)).await.is_err() {
             return false;
         }
         index = end;

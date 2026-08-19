@@ -7,8 +7,8 @@ use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use grey_core::{
-    ChatMessage, ChatRequest, GreyConfig, Provider, ProviderEvent, ProviderFailure,
-    ProviderFailureKind, Role, ToolCall, Usage,
+    checked_utf8_bytes, ChatMessage, ChatRequest, GreyConfig, Provider, ProviderEvent,
+    ProviderFailure, ProviderFailureKind, Role, RuntimeConfig, ToolCall, Usage,
 };
 use serde_json::{json, Value};
 
@@ -19,6 +19,7 @@ pub struct AnthropicProvider {
     api_key: Option<String>,
     version: String,
     max_tokens: u32,
+    response_max_bytes: usize,
     client: reqwest::Client,
 }
 
@@ -30,6 +31,7 @@ impl AnthropicProvider {
             cfg.anthropic.version.clone(),
             cfg.anthropic.max_tokens,
         )
+        .map(|provider| provider.with_response_max_bytes(cfg.runtime.response_max_bytes))
     }
 
     pub fn new(
@@ -47,8 +49,14 @@ impl AnthropicProvider {
             api_key,
             version,
             max_tokens,
+            response_max_bytes: RuntimeConfig::default().response_max_bytes,
             client,
         })
+    }
+
+    pub fn with_response_max_bytes(mut self, response_max_bytes: usize) -> Self {
+        self.response_max_bytes = response_max_bytes;
+        self
     }
 
     fn build_request(&self, request: &ChatRequest) -> Result<reqwest::Request> {
@@ -81,7 +89,7 @@ impl Provider for AnthropicProvider {
         let mut chunks = response.bytes_stream();
         let output = async_stream::stream! {
             let mut decoder = SseDecoder::default();
-            let mut protocol = AnthropicStreamState::default();
+            let mut protocol = AnthropicStreamState::with_limit(self.response_max_bytes);
 
             while let Some(chunk) = chunks.next().await {
                 let chunk = match chunk {
@@ -236,18 +244,34 @@ struct AnthropicToolParts {
     input_json: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct AnthropicStreamState {
     calls: BTreeMap<usize, AnthropicToolParts>,
     active_blocks: BTreeSet<usize>,
     seen_blocks: BTreeSet<usize>,
     tool_data_bytes: usize,
+    text_bytes: usize,
+    response_max_bytes: usize,
     usage: Usage,
     started: bool,
     terminal: bool,
 }
 
 impl AnthropicStreamState {
+    fn with_limit(response_max_bytes: usize) -> Self {
+        Self {
+            calls: BTreeMap::new(),
+            active_blocks: BTreeSet::new(),
+            seen_blocks: BTreeSet::new(),
+            tool_data_bytes: 0,
+            text_bytes: 0,
+            response_max_bytes,
+            usage: Usage::default(),
+            started: false,
+            terminal: false,
+        }
+    }
+
     fn consume(&mut self, payload: &str) -> Vec<ProviderEvent> {
         if self.terminal {
             return Vec::new();
@@ -379,6 +403,15 @@ impl AnthropicStreamState {
                 if text.is_empty() {
                     Vec::new()
                 } else {
+                    let Some(next) =
+                        checked_utf8_bytes(self.text_bytes, text, self.response_max_bytes)
+                    else {
+                        return self
+                            .fail("Anthropic response text exceeds configured byte limit")
+                            .into_iter()
+                            .collect();
+                    };
+                    self.text_bytes = next;
                     vec![ProviderEvent::Delta(text.to_string())]
                 }
             }
@@ -405,17 +438,18 @@ impl AnthropicStreamState {
                         .collect();
                 }
                 let initial_input = block.get("input").cloned().unwrap_or_else(|| json!({}));
-                let added_bytes = id.len() + name.len() + initial_input.to_string().len();
-                if self.tool_data_bytes.saturating_add(added_bytes) > crate::MAX_TOOL_DATA_BYTES {
+                let initial_json = initial_input.to_string();
+                let Some(next) = checked_utf8_bytes(
+                    self.tool_data_bytes,
+                    &initial_json,
+                    self.response_max_bytes,
+                ) else {
                     return self
-                        .fail(format!(
-                            "Anthropic streamed tool data exceeds {} bytes",
-                            crate::MAX_TOOL_DATA_BYTES
-                        ))
+                        .fail("Anthropic tool arguments exceed configured byte limit")
                         .into_iter()
                         .collect();
-                }
-                self.tool_data_bytes += added_bytes;
+                };
+                self.tool_data_bytes = next;
                 self.calls.insert(
                     index,
                     AnthropicToolParts {
@@ -468,7 +502,18 @@ impl AnthropicStreamState {
         };
         match delta.get("type").and_then(Value::as_str) {
             Some("text_delta") => match delta.get("text").and_then(Value::as_str) {
-                Some(text) if !text.is_empty() => vec![ProviderEvent::Delta(text.to_string())],
+                Some(text) if !text.is_empty() => {
+                    let Some(next) =
+                        checked_utf8_bytes(self.text_bytes, text, self.response_max_bytes)
+                    else {
+                        return self
+                            .fail("Anthropic response text exceeds configured byte limit")
+                            .into_iter()
+                            .collect();
+                    };
+                    self.text_bytes = next;
+                    vec![ProviderEvent::Delta(text.to_string())]
+                }
                 Some(_) => Vec::new(),
                 None => self
                     .fail("Anthropic text_delta is missing text")
@@ -482,15 +527,14 @@ impl AnthropicStreamState {
                         .into_iter()
                         .collect();
                 };
-                if self.tool_data_bytes.saturating_add(partial.len()) > crate::MAX_TOOL_DATA_BYTES {
+                let Some(next) =
+                    checked_utf8_bytes(self.tool_data_bytes, partial, self.response_max_bytes)
+                else {
                     return self
-                        .fail(format!(
-                            "Anthropic streamed tool data exceeds {} bytes",
-                            crate::MAX_TOOL_DATA_BYTES
-                        ))
+                        .fail("Anthropic tool arguments exceed configured byte limit")
                         .into_iter()
                         .collect();
-                }
+                };
                 let Some(call) = self.calls.get_mut(&index) else {
                     return self
                         .fail(format!(
@@ -500,7 +544,7 @@ impl AnthropicStreamState {
                         .collect();
                 };
                 call.input_json.push_str(partial);
-                self.tool_data_bytes += partial.len();
+                self.tool_data_bytes = next;
                 Vec::new()
             }
             Some(_) => Vec::new(),
@@ -581,6 +625,12 @@ impl AnthropicStreamState {
             self.terminal = true;
             Some(ProviderEvent::Error(failure))
         }
+    }
+}
+
+impl Default for AnthropicStreamState {
+    fn default() -> Self {
+        Self::with_limit(RuntimeConfig::default().response_max_bytes)
     }
 }
 
@@ -713,6 +763,38 @@ mod tests {
             matches!(state.consume(&overflow).as_slice(), [ProviderEvent::Error(message)]
             if message.to_string().contains("tool calls"))
         );
+    }
+
+    #[test]
+    fn limit_rejects_anthropic_text_and_tool_arguments_once() {
+        let start = json!({"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}).to_string();
+        let mut text = AnthropicStreamState::with_limit(3);
+        assert!(text.consume(&start).is_empty());
+        let payload = json!({"type":"content_block_start","index":0,"content_block":{
+            "type":"text","text":"甲乙"
+        }})
+        .to_string();
+        assert!(
+            matches!(text.consume(&payload).as_slice(), [ProviderEvent::Error(failure)]
+            if failure.kind() == ProviderFailureKind::Protocol)
+        );
+        assert!(text
+            .consume(&json!({"type":"message_stop"}).to_string())
+            .is_empty());
+
+        let mut tool = AnthropicStreamState::with_limit(3);
+        assert!(tool.consume(&start).is_empty());
+        let payload = json!({"type":"content_block_start","index":0,"content_block":{
+            "type":"tool_use","id":"tool-1","name":"grep","input":{"x":"long"}
+        }})
+        .to_string();
+        assert!(
+            matches!(tool.consume(&payload).as_slice(), [ProviderEvent::Error(failure)]
+            if failure.kind() == ProviderFailureKind::Protocol)
+        );
+        assert!(tool
+            .consume(&json!({"type":"message_stop"}).to_string())
+            .is_empty());
     }
 
     #[test]
