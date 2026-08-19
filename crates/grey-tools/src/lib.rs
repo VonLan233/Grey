@@ -3,7 +3,6 @@
 use std::collections::HashSet;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,6 +10,7 @@ use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use globset::{Glob, GlobMatcher};
 use grey_core::{
+    process::{run_bounded, CommandSpec},
     McpToolConfig, PluginConfig, ToolCall, ToolDefinition, ToolExecutor, ToolResult, ToolRisk,
 };
 use ignore::WalkBuilder;
@@ -19,8 +19,6 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::json;
 use serde_json::Value;
 use tempfile::NamedTempFile;
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 
 pub const BUILTIN_TOOL_NAMES: [&str; 5] = ["read_file", "edit_file", "bash", "glob", "grep"];
 const LSP_TOOL_DEFAULT_MAX_ITEMS: usize = 50;
@@ -991,29 +989,11 @@ impl BuiltinTools {
         }
         let requested = Duration::from_millis(args.timeout_ms.unwrap_or(u64::MAX));
         let timeout = requested.min(self.max_command_duration);
-        let mut command = Command::new("sh");
-        command
-            .arg("-lc")
-            .arg(&args.command)
+        let spec = command_with_runtime_env(CommandSpec::legacy_shell(&args.command))
             .current_dir(&self.workspace)
-            .kill_on_drop(true);
-        let output = match tokio::time::timeout(timeout, command.output()).await {
-            Ok(output) => output.context("running shell command")?,
-            Err(_) => {
-                return Ok(ToolResult::failure(
-                    call,
-                    format!("command timed out after {}ms", timeout.as_millis()),
-                ))
-            }
-        };
-        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-        if !output.stderr.is_empty() {
-            if !text.is_empty() && !text.ends_with('\n') {
-                text.push('\n');
-            }
-            text.push_str(&String::from_utf8_lossy(&output.stderr));
-        }
-        let text = truncate_output(text);
+            .timeout(timeout);
+        let output = run_bounded(spec).await.context("running shell command")?;
+        let text = truncate_output(output.combined_lossy());
         if output.status.success() {
             Ok(ToolResult::success(call, text))
         } else {
@@ -1407,45 +1387,36 @@ async fn run_command_inner(
     timeout_ms: u64,
     workspace: Option<&Path>,
 ) -> Result<String> {
-    let mut command = Command::new(command);
+    let mut spec = command_with_runtime_env(CommandSpec::direct(command, args.iter().copied()))
+        .timeout(Duration::from_millis(timeout_ms));
     if let Some(workspace) = workspace {
-        command.current_dir(workspace);
+        spec = spec.current_dir(workspace);
     }
-    command
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(if input.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .kill_on_drop(true);
-    let mut child = command.spawn().context("spawning command")?;
     if let Some(input) = input {
-        let mut stdin = child.stdin.take().context("opening command stdin")?;
-        stdin
-            .write_all(input.as_bytes())
-            .await
-            .context("writing hook or tool input")?;
+        spec = spec.stdin(input.as_bytes().to_vec());
     }
-
-    let output = tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait_with_output())
-        .await
-        .map_err(|_| anyhow::anyhow!("command timed out after {timeout_ms}ms"))?
-        .context("waiting for command")?;
-    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-    if !output.stderr.is_empty() {
-        if !text.is_empty() && !text.ends_with('\n') {
-            text.push('\n');
-        }
-        text.push_str(&String::from_utf8_lossy(&output.stderr));
-    }
+    let output = run_bounded(spec).await?;
+    let text = output.combined_lossy();
     if output.status.success() {
         Ok(text)
     } else {
         bail!("{}", text.trim());
     }
+}
+
+fn command_with_runtime_env(mut spec: CommandSpec) -> CommandSpec {
+    for key in ["PATH", "HOME"] {
+        if let Some(value) = std::env::var_os(key) {
+            spec = spec.env(key, value);
+        }
+    }
+    #[cfg(windows)]
+    for key in ["PATHEXT", "SYSTEMROOT", "USERPROFILE"] {
+        if let Some(value) = std::env::var_os(key) {
+            spec = spec.env(key, value);
+        }
+    }
+    spec
 }
 
 #[derive(Deserialize)]

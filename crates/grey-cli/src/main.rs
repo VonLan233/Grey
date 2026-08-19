@@ -11,9 +11,11 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use futures_util::future::join_all;
 use grey_core::{
-    config, Agent, AgentEvent, AgentOptions, AgentOutcome, CharApproxCounter, ChatMessage,
-    ChatRequest, ContextManager, GreyConfig, PluginConfig, PluginKind, Provider, Role, Session,
-    SessionStore, SummaryEngine, ToolExecutor,
+    config,
+    process::{run_bounded, CommandSpec},
+    Agent, AgentEvent, AgentOptions, AgentOutcome, CharApproxCounter, ChatMessage, ChatRequest,
+    ContextManager, GreyConfig, PluginConfig, PluginKind, Provider, Role, Session, SessionStore,
+    SummaryEngine, ToolExecutor,
 };
 use grey_provider::router::ProviderRouter;
 use grey_tools::{
@@ -23,9 +25,6 @@ use grey_tools::{
 use grey_tools::{CombinedTools, HookedTools};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::process::Stdio;
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command as TokioCommand;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 
@@ -2233,37 +2232,23 @@ async fn run_hook_chain(commands: &[String], payload: &Value) -> Result<()> {
 }
 
 async fn run_shell_command(command: &str, input: Option<&str>, timeout_ms: u64) -> Result<String> {
-    let mut command_process = TokioCommand::new("sh");
-    command_process
-        .arg("-lc")
-        .arg(command)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(if input.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .kill_on_drop(true);
-    let mut child = command_process.spawn().context("spawning command")?;
-    if let Some(input) = input {
-        let mut stdin = child.stdin.take().context("opening hook stdin")?;
-        stdin
-            .write_all(input.as_bytes())
-            .await
-            .context("writing hook input")?;
-    }
-    let output = tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait_with_output())
-        .await
-        .map_err(|_| anyhow::anyhow!("command timed out after {timeout_ms}ms"))?
-        .context("waiting for hook command")?;
-    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-    if !output.stderr.is_empty() {
-        if !text.is_empty() && !text.ends_with('\n') {
-            text.push('\n');
+    let mut spec = CommandSpec::legacy_shell(command).timeout(Duration::from_millis(timeout_ms));
+    for key in ["PATH", "HOME"] {
+        if let Some(value) = std::env::var_os(key) {
+            spec = spec.env(key, value);
         }
-        text.push_str(&String::from_utf8_lossy(&output.stderr));
     }
+    #[cfg(windows)]
+    for key in ["PATHEXT", "SYSTEMROOT", "USERPROFILE"] {
+        if let Some(value) = std::env::var_os(key) {
+            spec = spec.env(key, value);
+        }
+    }
+    if let Some(input) = input {
+        spec = spec.stdin(input.as_bytes().to_vec());
+    }
+    let output = run_bounded(spec).await?;
+    let text = output.combined_lossy();
     if output.status.success() {
         Ok(text)
     } else {
