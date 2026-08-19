@@ -7,7 +7,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use grey_core::{
-    ChatMessage, ChatRequest, GreyConfig, Provider, ProviderEvent, Role, ToolCall, Usage,
+    ChatMessage, ChatRequest, GreyConfig, Provider, ProviderEvent, ProviderFailure,
+    ProviderFailureKind, Role, ToolCall, Usage,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -75,14 +76,7 @@ impl Provider for OpenAiCompatibleProvider {
         request: &'a ChatRequest,
     ) -> Result<futures_util::stream::BoxStream<'a, ProviderEvent>> {
         let http_request = self.build_request(request)?;
-        let response = self
-            .client
-            .execute(http_request)
-            .await
-            .with_context(|| format!("POST {}/chat/completions", self.base_url))?;
-        if !response.status().is_success() {
-            return Err(crate::bounded_http_error(response, "OpenAI provider").await);
-        }
+        let response = crate::send_http(&self.client, http_request, "OpenAI provider").await?;
 
         let mut chunks = response.bytes_stream();
         let output = async_stream::stream! {
@@ -93,7 +87,11 @@ impl Provider for OpenAiCompatibleProvider {
                 let chunk = match chunk {
                     Ok(chunk) => chunk,
                     Err(error) => {
-                        if let Some(event) = protocol.fail(format!("stream transport error: {error}")) {
+                        if let Some(event) = protocol.fail(ProviderFailure::with_source(
+                            ProviderFailureKind::Transport,
+                            "OpenAI stream transport failed",
+                            error,
+                        )) {
                             yield event;
                         }
                         return;
@@ -102,7 +100,11 @@ impl Provider for OpenAiCompatibleProvider {
                 let payloads = match decoder.feed(&chunk) {
                     Ok(payloads) => payloads,
                     Err(error) => {
-                        if let Some(event) = protocol.fail(error.to_string()) {
+                        if let Some(event) = protocol.fail(ProviderFailure::with_source(
+                            ProviderFailureKind::Protocol,
+                            "OpenAI SSE framing is malformed",
+                            error,
+                        )) {
                             yield event;
                         }
                         return;
@@ -120,12 +122,19 @@ impl Provider for OpenAiCompatibleProvider {
             }
 
             if let Err(error) = decoder.finish() {
-                if let Some(event) = protocol.fail(error.to_string()) {
+                if let Some(event) = protocol.fail(ProviderFailure::with_source(
+                    ProviderFailureKind::Protocol,
+                    "OpenAI SSE stream ended with an incomplete event",
+                    error,
+                )) {
                     yield event;
                 }
                 return;
             }
-            if let Some(event) = protocol.fail("stream ended before OpenAI [DONE] marker") {
+            if let Some(event) = protocol.fail(ProviderFailure::new(
+                ProviderFailureKind::Protocol,
+                "stream ended before OpenAI [DONE] marker",
+            )) {
                 yield event;
             }
         };
@@ -284,14 +293,21 @@ impl OpenAiStreamState {
             Ok(value) => value,
             Err(error) => {
                 return self
-                    .fail(format!("malformed OpenAI SSE payload: {error}"))
+                    .fail(ProviderFailure::with_source(
+                        ProviderFailureKind::Protocol,
+                        "malformed OpenAI SSE payload",
+                        error,
+                    ))
                     .into_iter()
                     .collect()
             }
         };
         if let Some(error) = value.get("error") {
             return self
-                .fail(format!("OpenAI stream error: {error}"))
+                .fail(ProviderFailure::new(
+                    ProviderFailureKind::Protocol,
+                    format!("OpenAI stream error: {error}"),
+                ))
                 .into_iter()
                 .collect();
         }
@@ -300,7 +316,11 @@ impl OpenAiStreamState {
             Ok(chunk) => chunk,
             Err(error) => {
                 return self
-                    .fail(format!("unexpected OpenAI stream payload: {error}"))
+                    .fail(ProviderFailure::with_source(
+                        ProviderFailureKind::Protocol,
+                        "unexpected OpenAI stream payload",
+                        error,
+                    ))
                     .into_iter()
                     .collect()
             }
@@ -317,9 +337,9 @@ impl OpenAiStreamState {
                     && self.calls.len() >= crate::MAX_TOOL_CALLS
                 {
                     return self
-                        .fail(format!(
-                            "OpenAI stream exceeds {} tool calls",
-                            crate::MAX_TOOL_CALLS
+                        .fail(ProviderFailure::new(
+                            ProviderFailureKind::Protocol,
+                            format!("OpenAI stream exceeds {} tool calls", crate::MAX_TOOL_CALLS),
                         ))
                         .into_iter()
                         .collect();
@@ -329,9 +349,12 @@ impl OpenAiStreamState {
                     + delta.function.arguments.as_deref().map_or(0, str::len);
                 if self.tool_data_bytes.saturating_add(added_bytes) > crate::MAX_TOOL_DATA_BYTES {
                     return self
-                        .fail(format!(
-                            "OpenAI streamed tool data exceeds {} bytes",
-                            crate::MAX_TOOL_DATA_BYTES
+                        .fail(ProviderFailure::new(
+                            ProviderFailureKind::Protocol,
+                            format!(
+                                "OpenAI streamed tool data exceeds {} bytes",
+                                crate::MAX_TOOL_DATA_BYTES
+                            ),
                         ))
                         .into_iter()
                         .collect();
@@ -363,7 +386,10 @@ impl OpenAiStreamState {
         for (index, parts) in std::mem::take(&mut self.calls) {
             if parts.id.is_empty() || parts.name.is_empty() {
                 return self
-                    .fail(format!("incomplete OpenAI tool call at index {index}"))
+                    .fail(ProviderFailure::new(
+                        ProviderFailureKind::Protocol,
+                        format!("incomplete OpenAI tool call at index {index}"),
+                    ))
                     .into_iter()
                     .collect();
             }
@@ -371,8 +397,10 @@ impl OpenAiStreamState {
                 Ok(arguments) => arguments,
                 Err(error) => {
                     return self
-                        .fail(format!(
-                            "malformed OpenAI tool arguments at index {index}: {error}"
+                        .fail(ProviderFailure::with_source(
+                            ProviderFailureKind::Protocol,
+                            format!("malformed OpenAI tool arguments at index {index}"),
+                            error,
                         ))
                         .into_iter()
                         .collect()
@@ -389,12 +417,12 @@ impl OpenAiStreamState {
         events
     }
 
-    fn fail(&mut self, message: impl Into<String>) -> Option<ProviderEvent> {
+    fn fail(&mut self, failure: ProviderFailure) -> Option<ProviderEvent> {
         if self.terminal {
             None
         } else {
             self.terminal = true;
-            Some(ProviderEvent::Error(message.into()))
+            Some(ProviderEvent::Error(failure))
         }
     }
 }
@@ -451,7 +479,7 @@ mod tests {
         let mut malformed = OpenAiStreamState::default();
         assert!(matches!(
             malformed.consume("not-json").as_slice(),
-            [ProviderEvent::Error(message)] if message.contains("malformed")
+            [ProviderEvent::Error(message)] if message.to_string().contains("malformed")
         ));
         assert!(malformed.consume("[DONE]").is_empty());
 
@@ -463,18 +491,34 @@ mod tests {
         assert!(incomplete.consume(&delta).is_empty());
         assert!(matches!(
             incomplete.consume("[DONE]").as_slice(),
-            [ProviderEvent::Error(message)] if message.contains("arguments")
+            [ProviderEvent::Error(message)] if message.to_string().contains("arguments")
         ));
+    }
+
+    #[test]
+    fn malformed_stream_failure_is_protocol() {
+        let mut state = OpenAiStreamState::default();
+        let events = state.consume("not-json");
+        assert!(matches!(events.as_slice(), [ProviderEvent::Error(failure)]
+            if failure.kind() == grey_core::ProviderFailureKind::Protocol));
     }
 
     #[test]
     fn transport_errors_are_emitted_once() {
         let mut state = OpenAiStreamState::default();
         assert!(matches!(
-            state.fail("connection reset"),
+            state.fail(ProviderFailure::new(
+                ProviderFailureKind::Transport,
+                "connection reset",
+            )),
             Some(ProviderEvent::Error(_))
         ));
-        assert!(state.fail("second error").is_none());
+        assert!(state
+            .fail(ProviderFailure::new(
+                ProviderFailureKind::Transport,
+                "second error",
+            ))
+            .is_none());
     }
 
     #[test]
@@ -548,7 +592,7 @@ mod tests {
 
         assert!(
             matches!(state.consume(&payload).last(), Some(ProviderEvent::Error(message))
-            if message.contains("tool calls"))
+            if message.to_string().contains("tool calls"))
         );
         assert!(state.consume("[DONE]").is_empty());
     }
@@ -589,7 +633,7 @@ mod tests {
         server.await.unwrap();
         assert!(
             matches!(events.as_slice(), [ProviderEvent::Delta(_), ProviderEvent::Error(message)]
-            if message.contains("[DONE]"))
+            if message.to_string().contains("[DONE]"))
         );
     }
 
@@ -613,7 +657,7 @@ mod tests {
             .await;
         server.await.unwrap();
         assert!(matches!(events.last(), Some(ProviderEvent::Error(message))
-            if message.contains("transport")));
+            if message.kind() == ProviderFailureKind::Transport));
         assert!(!events
             .iter()
             .any(|event| matches!(event, ProviderEvent::Done(_))));

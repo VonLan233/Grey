@@ -6,7 +6,8 @@ use std::sync::Arc;
 use anyhow::{bail, Result};
 use futures_util::{stream::BoxStream, StreamExt};
 use grey_core::{
-    GreyConfig, Provider, ProviderCandidate, ProviderEvent, ProviderModelRef, RouteRule, TaskKind,
+    GreyConfig, Provider, ProviderCandidate, ProviderEvent, ProviderFailure, ProviderFailureKind,
+    ProviderModelRef, RouteRule, TaskKind,
 };
 
 use crate::fallback::FallbackChain;
@@ -190,22 +191,30 @@ impl ProviderRouter {
             let mut last_error = None;
             for reference in refs {
                 let Some(provider) = self.providers.get(&reference.provider).cloned() else {
-                    last_error = Some(format!("unknown fallback provider `{}`", reference.provider));
-                    continue;
+                    yield ProviderEvent::Error(ProviderFailure::new(
+                        ProviderFailureKind::Protocol,
+                        format!("unknown fallback provider `{}`", reference.provider),
+                    ));
+                    return;
                 };
                 let mut candidate_request = request.clone();
                 candidate_request.model.clone_from(&reference.model);
                 let mut stream = match provider.stream_chat(&candidate_request).await {
                     Ok(stream) => stream,
                     Err(error) => {
-                        let message = format!("{}: {error:#}", reference);
-                        self.fallback.mark_failed(&reference, &message);
-                        last_error = Some(message);
-                        continue;
+                        let failure = ProviderFailure::from_error(error);
+                        if failure.allows_retry_or_fallback() {
+                            self.fallback.mark_failed(&reference, &failure);
+                            last_error = Some(failure);
+                            continue;
+                        }
+                        yield ProviderEvent::Error(failure);
+                        return;
                     }
                 };
                 let mut visible_output = false;
                 let mut completed = false;
+                let mut should_fallback = false;
                 while let Some(event) = stream.next().await {
                     match &event {
                         ProviderEvent::Delta(_) | ProviderEvent::ToolCall(_) => {
@@ -215,14 +224,22 @@ impl ProviderRouter {
                             completed = true;
                             self.fallback.mark_success(&reference);
                         }
-                        ProviderEvent::Error(error) => {
-                            self.fallback.mark_failed(&reference, error);
+                        ProviderEvent::Error(failure) => {
                             if visible_output {
+                                if failure.allows_retry_or_fallback() {
+                                    self.fallback.mark_failed(&reference, failure);
+                                }
                                 yield event;
                                 return;
                             }
-                            last_error = Some(error.clone());
-                            break;
+                            if failure.allows_retry_or_fallback() {
+                                self.fallback.mark_failed(&reference, failure);
+                                last_error = Some(failure.clone());
+                                should_fallback = true;
+                                break;
+                            }
+                            yield event;
+                            return;
                         }
                     }
                     if completed {
@@ -233,15 +250,21 @@ impl ProviderRouter {
                         yield event;
                     }
                 }
-                if visible_output {
-                    let error = format!("{reference} stream ended before completion");
-                    self.fallback.mark_failed(&reference, &error);
-                    yield ProviderEvent::Error(error);
-                    return;
+                if should_fallback {
+                    continue;
                 }
+                let failure = ProviderFailure::new(
+                    ProviderFailureKind::Protocol,
+                    format!("{reference} stream ended before completion"),
+                );
+                yield ProviderEvent::Error(failure);
+                return;
             }
             yield ProviderEvent::Error(
-                last_error.unwrap_or_else(|| "all provider candidates failed".to_string())
+                last_error.unwrap_or_else(|| ProviderFailure::new(
+                    ProviderFailureKind::Protocol,
+                    "all provider candidates failed",
+                ))
             );
         };
         Ok(Box::pin(output))
@@ -367,7 +390,7 @@ mod tests {
     struct FailingThenSuccessProvider {
         pub id: &'static str,
         pub calls: Arc<AtomicUsize>,
-        pub fail: bool,
+        pub events: Vec<grey_core::ProviderEvent>,
     }
 
     #[async_trait::async_trait]
@@ -381,25 +404,18 @@ mod tests {
             _request: &'a grey_core::ChatRequest,
         ) -> anyhow::Result<futures_util::stream::BoxStream<'a, grey_core::ProviderEvent>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            let events = if self.fail {
-                vec![grey_core::ProviderEvent::Error(
-                    "simulated provider failure".into(),
-                )]
-            } else {
-                vec![
-                    grey_core::ProviderEvent::Delta("from fallback".into()),
-                    grey_core::ProviderEvent::Done(grey_core::Usage {
-                        input_tokens: 2,
-                        output_tokens: 3,
-                    }),
-                ]
-            };
-            Ok(Box::pin(stream::iter(events)))
+            Ok(Box::pin(stream::iter(self.events.clone())))
         }
     }
 
-    #[tokio::test]
-    async fn stream_chat_falls_back_when_primary_fails_before_visible_output() {
+    fn router_for_events(
+        primary_events: Vec<grey_core::ProviderEvent>,
+    ) -> (
+        ProviderRouter,
+        ResolvedProvider,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+    ) {
         let primary_calls = Arc::new(AtomicUsize::new(0));
         let fallback_calls = Arc::new(AtomicUsize::new(0));
         let mut providers = std::collections::HashMap::new();
@@ -408,7 +424,7 @@ mod tests {
             Arc::new(FailingThenSuccessProvider {
                 id: "primary",
                 calls: primary_calls.clone(),
-                fail: true,
+                events: primary_events,
             }) as Arc<dyn grey_core::Provider>,
         );
         providers.insert(
@@ -416,27 +432,42 @@ mod tests {
             Arc::new(FailingThenSuccessProvider {
                 id: "fallback",
                 calls: fallback_calls.clone(),
-                fail: false,
+                events: vec![
+                    grey_core::ProviderEvent::Delta("from fallback".into()),
+                    grey_core::ProviderEvent::Done(grey_core::Usage {
+                        input_tokens: 2,
+                        output_tokens: 3,
+                    }),
+                ],
             }) as Arc<dyn grey_core::Provider>,
         );
-
-        let fallback_chain = Arc::new(
+        let fallback = Arc::new(
             FallbackChain::try_from_config(&grey_core::FallbackConfig {
                 providers: vec!["primary".into(), "fallback".into()],
                 models: Default::default(),
             })
             .unwrap(),
         );
-
         let router = ProviderRouter {
             providers,
             routes: vec![],
-            fallback: fallback_chain,
+            fallback,
             default_provider: "primary".into(),
             default_model: "m".into(),
         };
-
         let resolved = router.resolve(&TaskKind::Default).unwrap();
+        (router, resolved, primary_calls, fallback_calls)
+    }
+
+    #[tokio::test]
+    async fn stream_chat_falls_back_when_primary_fails_before_visible_output() {
+        let (router, resolved, primary_calls, fallback_calls) =
+            router_for_events(vec![grey_core::ProviderEvent::Error(
+                grey_core::ProviderFailure::new(
+                    grey_core::ProviderFailureKind::Server,
+                    "simulated provider failure",
+                ),
+            )]);
         assert_eq!(resolved.provider_id, "primary");
         assert_eq!(resolved.fallback_chain.len(), 2);
 
@@ -453,5 +484,73 @@ mod tests {
         assert_eq!(usage.output_tokens, 3);
         assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_chat_auth_failure_never_fallback() {
+        let (router, resolved, primary_calls, fallback_calls) =
+            router_for_events(vec![grey_core::ProviderEvent::Error(
+                grey_core::ProviderFailure::new(
+                    grey_core::ProviderFailureKind::Auth,
+                    "login required",
+                ),
+            )]);
+        let request = grey_core::ChatRequest::new("m", vec![]);
+        let stream = router.stream_chat(&request, &resolved).await.unwrap();
+        let error = grey_core::collect(stream).await.unwrap_err();
+
+        assert_eq!(
+            error
+                .downcast_ref::<grey_core::ProviderFailure>()
+                .unwrap()
+                .kind(),
+            grey_core::ProviderFailureKind::Auth
+        );
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn repeated_auth_failures_never_poison_health_or_fallback() {
+        let (router, resolved, primary_calls, fallback_calls) =
+            router_for_events(vec![grey_core::ProviderEvent::Error(
+                grey_core::ProviderFailure::new(
+                    grey_core::ProviderFailureKind::Auth,
+                    "login required",
+                ),
+            )]);
+        let request = grey_core::ChatRequest::new("m", vec![]);
+
+        for _ in 0..4 {
+            let stream = router.stream_chat(&request, &resolved).await.unwrap();
+            assert!(grey_core::collect(stream).await.is_err());
+        }
+
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 4);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn stream_chat_visible_output_failure_never_fallback() {
+        let (router, resolved, primary_calls, fallback_calls) = router_for_events(vec![
+            grey_core::ProviderEvent::Delta("partial".into()),
+            grey_core::ProviderEvent::Error(grey_core::ProviderFailure::new(
+                grey_core::ProviderFailureKind::Server,
+                "server failed",
+            )),
+        ]);
+        let request = grey_core::ChatRequest::new("m", vec![]);
+        let stream = router.stream_chat(&request, &resolved).await.unwrap();
+        let error = grey_core::collect(stream).await.unwrap_err();
+
+        assert_eq!(
+            error
+                .downcast_ref::<grey_core::ProviderFailure>()
+                .unwrap()
+                .kind(),
+            grey_core::ProviderFailureKind::Server
+        );
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
     }
 }

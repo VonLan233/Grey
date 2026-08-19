@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use grey_core::{FallbackConfig, ProviderHealth, ProviderModelRef};
+use grey_core::{FallbackConfig, ProviderFailure, ProviderHealth, ProviderModelRef};
 
 const FAILURE_THRESHOLD: u32 = 3;
 const INITIAL_COOLDOWN: Duration = Duration::from_secs(60);
@@ -89,7 +89,7 @@ impl FallbackChain {
         }
     }
 
-    pub fn mark_failed(&self, pmr: &ProviderModelRef, _error: &str) {
+    pub fn mark_failed(&self, pmr: &ProviderModelRef, _failure: &ProviderFailure) {
         let mut health = self.health.lock().unwrap();
         let state = health.entry(pmr.clone()).or_default();
         state.consecutive_failures += 1;
@@ -134,8 +134,8 @@ impl ProviderHealth for FallbackChain {
         self.is_healthy(reference)
     }
 
-    fn mark_failed(&self, reference: &ProviderModelRef, error: &str) {
-        self.mark_failed(reference, error)
+    fn mark_failed(&self, reference: &ProviderModelRef, failure: &ProviderFailure) {
+        self.mark_failed(reference, failure)
     }
 
     fn mark_success(&self, reference: &ProviderModelRef) {
@@ -155,6 +155,10 @@ impl fmt::Debug for FallbackChain {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn failure() -> ProviderFailure {
+        ProviderFailure::new(grey_core::ProviderFailureKind::Server, "server unavailable")
+    }
 
     fn pmr(provider: &str, model: &str) -> ProviderModelRef {
         ProviderModelRef::new(provider, model)
@@ -215,10 +219,10 @@ mod tests {
         let chain = FallbackChain::empty();
         let pmr = pmr("a", "m1");
         assert!(chain.is_healthy(&pmr));
-        chain.mark_failed(&pmr, "err1");
-        chain.mark_failed(&pmr, "err2");
+        chain.mark_failed(&pmr, &failure());
+        chain.mark_failed(&pmr, &failure());
         assert!(chain.is_healthy(&pmr));
-        chain.mark_failed(&pmr, "err3");
+        chain.mark_failed(&pmr, &failure());
         assert!(!chain.is_healthy(&pmr));
     }
 
@@ -226,9 +230,9 @@ mod tests {
     fn mark_success_resets_health() {
         let chain = FallbackChain::empty();
         let pmr = pmr("a", "m1");
-        chain.mark_failed(&pmr, "e1");
-        chain.mark_failed(&pmr, "e2");
-        chain.mark_failed(&pmr, "e3");
+        chain.mark_failed(&pmr, &failure());
+        chain.mark_failed(&pmr, &failure());
+        chain.mark_failed(&pmr, &failure());
         assert!(!chain.is_healthy(&pmr));
         chain.mark_success(&pmr);
         assert!(chain.is_healthy(&pmr));
@@ -246,7 +250,7 @@ mod tests {
         let r1 = pmr("a", "m1");
         let r2 = pmr("b", "m2");
         for _ in 0..3 {
-            chain.mark_failed(&r1, "err");
+            chain.mark_failed(&r1, &failure());
         }
         let refs = vec![r1.clone(), r2.clone()];
         let healthy = chain.healthy_refs(&refs);

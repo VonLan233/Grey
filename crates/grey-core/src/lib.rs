@@ -26,8 +26,8 @@ pub use config::{
 };
 pub use context::{ContextAudit, ContextManager};
 pub use provider::{
-    collect, ChatMessage, ChatRequest, Provider, ProviderEvent, ProviderModelRef, Role, ToolCall,
-    Usage,
+    collect, redact_provider_secrets, ChatMessage, ChatRequest, Provider, ProviderEvent,
+    ProviderFailure, ProviderFailureKind, ProviderModelRef, Role, ToolCall, Usage,
 };
 pub use session::{Session, SessionStore, SessionSummary};
 pub use summary::SummaryEngine;

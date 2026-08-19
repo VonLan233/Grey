@@ -7,7 +7,8 @@ use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use grey_core::{
-    ChatMessage, ChatRequest, GreyConfig, Provider, ProviderEvent, Role, ToolCall, Usage,
+    ChatMessage, ChatRequest, GreyConfig, Provider, ProviderEvent, ProviderFailure,
+    ProviderFailureKind, Role, ToolCall, Usage,
 };
 use serde_json::{json, Value};
 
@@ -75,14 +76,7 @@ impl Provider for AnthropicProvider {
         request: &'a ChatRequest,
     ) -> Result<futures_util::stream::BoxStream<'a, ProviderEvent>> {
         let http_request = self.build_request(request)?;
-        let response = self
-            .client
-            .execute(http_request)
-            .await
-            .with_context(|| format!("POST {}/messages", self.base_url))?;
-        if !response.status().is_success() {
-            return Err(crate::bounded_http_error(response, "Anthropic provider").await);
-        }
+        let response = crate::send_http(&self.client, http_request, "Anthropic provider").await?;
 
         let mut chunks = response.bytes_stream();
         let output = async_stream::stream! {
@@ -93,7 +87,11 @@ impl Provider for AnthropicProvider {
                 let chunk = match chunk {
                     Ok(chunk) => chunk,
                     Err(error) => {
-                        if let Some(event) = protocol.fail(format!("stream transport error: {error}")) {
+                        if let Some(event) = protocol.fail_failure(ProviderFailure::with_source(
+                            ProviderFailureKind::Transport,
+                            "Anthropic stream transport failed",
+                            error,
+                        )) {
                             yield event;
                         }
                         return;
@@ -102,7 +100,11 @@ impl Provider for AnthropicProvider {
                 let payloads = match decoder.feed(&chunk) {
                     Ok(payloads) => payloads,
                     Err(error) => {
-                        if let Some(event) = protocol.fail(error.to_string()) {
+                        if let Some(event) = protocol.fail_failure(ProviderFailure::with_source(
+                            ProviderFailureKind::Protocol,
+                            "Anthropic SSE framing is malformed",
+                            error,
+                        )) {
                             yield event;
                         }
                         return;
@@ -120,7 +122,11 @@ impl Provider for AnthropicProvider {
             }
 
             if let Err(error) = decoder.finish() {
-                if let Some(event) = protocol.fail(error.to_string()) {
+                if let Some(event) = protocol.fail_failure(ProviderFailure::with_source(
+                    ProviderFailureKind::Protocol,
+                    "Anthropic SSE stream ended with an incomplete event",
+                    error,
+                )) {
                     yield event;
                 }
                 return;
@@ -565,11 +571,15 @@ impl AnthropicStreamState {
     }
 
     fn fail(&mut self, message: impl Into<String>) -> Option<ProviderEvent> {
+        self.fail_failure(ProviderFailure::new(ProviderFailureKind::Protocol, message))
+    }
+
+    fn fail_failure(&mut self, failure: ProviderFailure) -> Option<ProviderEvent> {
         if self.terminal {
             None
         } else {
             self.terminal = true;
-            Some(ProviderEvent::Error(message.into()))
+            Some(ProviderEvent::Error(failure))
         }
     }
 }
@@ -632,7 +642,7 @@ mod tests {
         let mut malformed = AnthropicStreamState::default();
         assert!(matches!(
             malformed.consume("{").as_slice(),
-            [ProviderEvent::Error(message)] if message.contains("malformed")
+            [ProviderEvent::Error(message)] if message.to_string().contains("malformed")
         ));
         assert!(malformed.fail("again").is_none());
 
@@ -641,8 +651,16 @@ mod tests {
             .to_string();
         assert!(matches!(
             vendor.consume(&payload).as_slice(),
-            [ProviderEvent::Error(message)] if message.contains("busy")
+            [ProviderEvent::Error(message)] if message.to_string().contains("busy")
         ));
+    }
+
+    #[test]
+    fn malformed_stream_failure_is_protocol() {
+        let mut state = AnthropicStreamState::default();
+        let events = state.consume("{");
+        assert!(matches!(events.as_slice(), [ProviderEvent::Error(failure)]
+            if failure.kind() == grey_core::ProviderFailureKind::Protocol));
     }
 
     #[test]
@@ -651,14 +669,14 @@ mod tests {
         let stop = json!({"type":"message_stop"}).to_string();
         assert!(
             matches!(stop_only.consume(&stop).as_slice(), [ProviderEvent::Error(message)]
-            if message.contains("before message_start"))
+            if message.to_string().contains("before message_start"))
         );
 
         let mut missing_usage = AnthropicStreamState::default();
         let start = json!({"type":"message_start","message":{}}).to_string();
         assert!(
             matches!(missing_usage.consume(&start).as_slice(), [ProviderEvent::Error(message)]
-            if message.contains("input_tokens"))
+            if message.to_string().contains("input_tokens"))
         );
 
         let mut active_block = AnthropicStreamState::default();
@@ -668,7 +686,7 @@ mod tests {
         assert!(active_block.consume(&block).is_empty());
         assert!(
             matches!(active_block.consume(&stop).as_slice(), [ProviderEvent::Error(message)]
-            if message.contains("content_block_stop"))
+            if message.to_string().contains("content_block_stop"))
         );
     }
 
@@ -693,7 +711,7 @@ mod tests {
             .to_string();
         assert!(
             matches!(state.consume(&overflow).as_slice(), [ProviderEvent::Error(message)]
-            if message.contains("tool calls"))
+            if message.to_string().contains("tool calls"))
         );
     }
 
@@ -790,7 +808,7 @@ mod tests {
             .await;
         server.await.unwrap();
         assert!(matches!(events.as_slice(), [ProviderEvent::Error(message)]
-            if message.contains("message_stop")));
+            if message.to_string().contains("message_stop")));
     }
 
     #[tokio::test]
@@ -813,7 +831,7 @@ mod tests {
             .await;
         server.await.unwrap();
         assert!(matches!(events.last(), Some(ProviderEvent::Error(message))
-            if message.contains("transport")));
+            if message.kind() == ProviderFailureKind::Transport));
         assert!(!events
             .iter()
             .any(|event| matches!(event, ProviderEvent::Done(_))));

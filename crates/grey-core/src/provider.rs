@@ -1,5 +1,9 @@
 //! Vendor-neutral provider contracts and normalized conversation messages.
 
+use std::error::Error;
+use std::fmt;
+use std::sync::Arc;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
@@ -139,12 +143,215 @@ impl ChatRequest {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderFailureKind {
+    Auth,
+    Authorization,
+    RateLimit,
+    Transport,
+    Server,
+    Protocol,
+}
+
+impl ProviderFailureKind {
+    pub fn allows_retry_or_fallback(self) -> bool {
+        matches!(self, Self::RateLimit | Self::Transport | Self::Server)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderFailure {
+    kind: ProviderFailureKind,
+    message: String,
+    source: Option<Arc<ProviderFailureSource>>,
+}
+
+#[derive(Debug)]
+struct ProviderFailureSource(String);
+
+impl fmt::Display for ProviderFailureSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Error for ProviderFailureSource {}
+
+impl ProviderFailure {
+    pub fn new(kind: ProviderFailureKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: redact_provider_secrets(&message.into()),
+            source: None,
+        }
+    }
+
+    pub fn with_source(
+        kind: ProviderFailureKind,
+        message: impl Into<String>,
+        source: impl fmt::Display,
+    ) -> Self {
+        Self {
+            kind,
+            message: redact_provider_secrets(&message.into()),
+            source: Some(Arc::new(ProviderFailureSource(redact_provider_secrets(
+                &source.to_string(),
+            )))),
+        }
+    }
+
+    pub fn from_error(error: anyhow::Error) -> Self {
+        match error.downcast::<Self>() {
+            Ok(failure) => failure,
+            Err(error) => Self::with_source(
+                ProviderFailureKind::Protocol,
+                "provider returned an unclassified error",
+                format!("{error:#}"),
+            ),
+        }
+    }
+
+    pub fn kind(&self) -> ProviderFailureKind {
+        self.kind
+    }
+
+    pub fn allows_retry_or_fallback(&self) -> bool {
+        self.kind.allows_retry_or_fallback()
+    }
+}
+
+impl PartialEq for ProviderFailure {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.message == other.message
+    }
+}
+
+impl Eq for ProviderFailure {}
+
+impl fmt::Display for ProviderFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl Error for ProviderFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|source| source as &(dyn Error + 'static))
+    }
+}
+
+pub fn redact_provider_secrets(input: &str) -> String {
+    if let Ok(mut value) = serde_json::from_str::<Value>(input) {
+        crate::raw_config::redact(&mut value);
+        return serde_json::to_string(&value).unwrap_or_else(|_| "***".to_string());
+    }
+
+    let mut redacted = input.to_string();
+    for key in ["authorization", "api_key", "api-key", "apikey", "token"] {
+        redacted = redact_assignments(&redacted, key);
+    }
+    redact_bearer_tokens(&redacted)
+}
+
+fn redact_assignments(input: &str, key: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut remaining = input;
+    loop {
+        let lowercase = remaining.to_ascii_lowercase();
+        let Some(relative_key_start) = lowercase.find(key) else {
+            output.push_str(remaining);
+            return output;
+        };
+        let key_end = relative_key_start + key.len();
+        let suffix = &remaining[key_end..];
+        let separator_offset = suffix
+            .char_indices()
+            .find(|(_, character)| {
+                !character.is_ascii_whitespace() && *character != '"' && *character != '\''
+            })
+            .map(|(index, _)| index)
+            .unwrap_or(suffix.len());
+        let Some(separator) = suffix[separator_offset..].chars().next() else {
+            output.push_str(remaining);
+            return output;
+        };
+        if separator != ':' && separator != '=' {
+            let advance = key_end;
+            output.push_str(&remaining[..advance]);
+            remaining = &remaining[advance..];
+            continue;
+        }
+
+        let after_separator = key_end + separator_offset + separator.len_utf8();
+        let value_suffix = &remaining[after_separator..];
+        let value_offset = value_suffix
+            .char_indices()
+            .find(|(_, character)| !character.is_ascii_whitespace())
+            .map(|(index, _)| index)
+            .unwrap_or(value_suffix.len());
+        let value_start = after_separator + value_offset;
+        let quote = remaining[value_start..]
+            .chars()
+            .next()
+            .filter(|character| *character == '"' || *character == '\'');
+        let secret_start = value_start + quote.map_or(0, char::len_utf8);
+        let secret_end = if let Some(quote) = quote {
+            remaining[secret_start..]
+                .find(quote)
+                .map(|index| secret_start + index)
+                .unwrap_or(remaining.len())
+        } else if key == "authorization" {
+            remaining[secret_start..]
+                .find(['\r', '\n', ',', ';'])
+                .map(|index| secret_start + index)
+                .unwrap_or(remaining.len())
+        } else {
+            remaining[secret_start..]
+                .find(|character: char| {
+                    character.is_ascii_whitespace()
+                        || matches!(character, '&' | ',' | ';' | '}' | ']')
+                })
+                .map(|index| secret_start + index)
+                .unwrap_or(remaining.len())
+        };
+
+        output.push_str(&remaining[..secret_start]);
+        output.push_str("***");
+        remaining = &remaining[secret_end..];
+    }
+}
+
+fn redact_bearer_tokens(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut remaining = input;
+    loop {
+        let lowercase = remaining.to_ascii_lowercase();
+        let Some(start) = lowercase.find("bearer ") else {
+            output.push_str(remaining);
+            return output;
+        };
+        let secret_start = start + "bearer ".len();
+        let secret_end = remaining[secret_start..]
+            .find(|character: char| {
+                character.is_ascii_whitespace()
+                    || matches!(character, '"' | '\'' | '&' | ',' | ';' | '}' | ']')
+            })
+            .map(|index| secret_start + index)
+            .unwrap_or(remaining.len());
+        output.push_str(&remaining[..secret_start]);
+        output.push_str("***");
+        remaining = &remaining[secret_end..];
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProviderEvent {
     Delta(String),
     ToolCall(ToolCall),
     Done(Usage),
-    Error(String),
+    Error(ProviderFailure),
 }
 
 #[async_trait]
@@ -171,7 +378,7 @@ pub async fn collect(
             ProviderEvent::Delta(delta) => text.push_str(&delta),
             ProviderEvent::ToolCall(call) => calls.push(call),
             ProviderEvent::Done(done_usage) => usage = done_usage,
-            ProviderEvent::Error(error) => anyhow::bail!("provider error: {error}"),
+            ProviderEvent::Error(error) => return Err(error.into()),
         }
     }
     Ok((text, calls, usage))
@@ -217,5 +424,22 @@ mod tests {
         assert_eq!(text, "hello");
         assert_eq!(calls.len(), 1);
         assert_eq!(usage.output_tokens, 2);
+    }
+
+    #[test]
+    fn provider_failure_preserves_a_redacted_source_chain() {
+        let failure = ProviderFailure::with_source(
+            ProviderFailureKind::Transport,
+            "Authorization: Bearer message-secret",
+            "request failed with token=source-secret and api_key=other-secret",
+        );
+        let error = anyhow::Error::new(failure);
+        let diagnostic = format!("{error:#}");
+
+        assert!(diagnostic.contains("***"));
+        assert!(diagnostic.contains("request failed"));
+        assert!(!diagnostic.contains("message-secret"));
+        assert!(!diagnostic.contains("source-secret"));
+        assert!(!diagnostic.contains("other-secret"));
     }
 }

@@ -5,7 +5,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use grey_core::{ChatRequest, Provider, ProviderEvent, ToolCall, Usage};
+use grey_core::{
+    ChatRequest, Provider, ProviderEvent, ProviderFailure, ProviderFailureKind, ToolCall, Usage,
+};
 use serde_json::{json, Value};
 
 use crate::sse::SseDecoder;
@@ -68,13 +70,7 @@ impl Provider for GeminiProvider {
         request: &'a ChatRequest,
     ) -> Result<futures_util::stream::BoxStream<'a, ProviderEvent>> {
         let http_request = self.build_request(request)?;
-        let response =
-            self.client.execute(http_request).await.with_context(|| {
-                format!("POST {}/models/...:streamGenerateContent", self.base_url)
-            })?;
-        if !response.status().is_success() {
-            return Err(crate::bounded_http_error(response, "Gemini provider").await);
-        }
+        let response = crate::send_http(&self.client, http_request, "Gemini provider").await?;
 
         let mut chunks = response.bytes_stream();
         let output = async_stream::stream! {
@@ -85,7 +81,11 @@ impl Provider for GeminiProvider {
                 let chunk = match chunk {
                     Ok(chunk) => chunk,
                     Err(error) => {
-                        if let Some(event) = protocol.fail(format!("stream transport error: {error}")) {
+                        if let Some(event) = protocol.fail_failure(ProviderFailure::with_source(
+                            ProviderFailureKind::Transport,
+                            "Gemini stream transport failed",
+                            error,
+                        )) {
                             yield event;
                         }
                         return;
@@ -94,7 +94,11 @@ impl Provider for GeminiProvider {
                 let payloads = match decoder.feed(&chunk) {
                     Ok(payloads) => payloads,
                     Err(error) => {
-                        if let Some(event) = protocol.fail(error.to_string()) {
+                        if let Some(event) = protocol.fail_failure(ProviderFailure::with_source(
+                            ProviderFailureKind::Protocol,
+                            "Gemini SSE framing is malformed",
+                            error,
+                        )) {
                             yield event;
                         }
                         return;
@@ -112,7 +116,11 @@ impl Provider for GeminiProvider {
             }
 
             if let Err(error) = decoder.finish() {
-                if let Some(event) = protocol.fail(error.to_string()) {
+                if let Some(event) = protocol.fail_failure(ProviderFailure::with_source(
+                    ProviderFailureKind::Protocol,
+                    "Gemini SSE stream ended with an incomplete event",
+                    error,
+                )) {
                     yield event;
                 }
                 return;
@@ -133,11 +141,15 @@ struct GeminiStreamState {
 
 impl GeminiStreamState {
     fn fail(&mut self, error: String) -> Option<ProviderEvent> {
+        self.fail_failure(ProviderFailure::new(ProviderFailureKind::Protocol, error))
+    }
+
+    fn fail_failure(&mut self, failure: ProviderFailure) -> Option<ProviderEvent> {
         if self.done {
             None
         } else {
             self.done = true;
-            Some(ProviderEvent::Error(error))
+            Some(ProviderEvent::Error(failure))
         }
     }
 
@@ -148,7 +160,11 @@ impl GeminiStreamState {
         let value: Value = match serde_json::from_str(payload) {
             Ok(v) => v,
             Err(e) => {
-                return vec![ProviderEvent::Error(format!("invalid JSON: {e}"))];
+                return vec![ProviderEvent::Error(ProviderFailure::with_source(
+                    ProviderFailureKind::Protocol,
+                    "invalid Gemini JSON",
+                    e,
+                ))];
             }
         };
 
@@ -325,6 +341,14 @@ mod tests {
             .and_then(|value| value.to_str().ok())
             .unwrap();
         assert_eq!(api_key, "k-123");
+    }
+
+    #[test]
+    fn malformed_stream_failure_is_protocol() {
+        let mut state = GeminiStreamState::default();
+        let events = state.consume("not-json");
+        assert!(matches!(events.as_slice(), [ProviderEvent::Error(failure)]
+            if failure.kind() == grey_core::ProviderFailureKind::Protocol));
     }
 
     #[test]

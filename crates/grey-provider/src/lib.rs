@@ -71,17 +71,43 @@ mod test_support {
 
 use anyhow::{bail, Result};
 use futures_util::StreamExt;
-use grey_core::{GreyConfig, Provider};
+use grey_core::{GreyConfig, Provider, ProviderFailure, ProviderFailureKind};
 
 const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_TOOL_CALLS: usize = 128;
 pub(crate) const MAX_TOOL_DATA_BYTES: usize = 4 * 1024 * 1024;
 
+pub(crate) async fn send_http(
+    client: &reqwest::Client,
+    request: reqwest::Request,
+    provider: &str,
+) -> std::result::Result<reqwest::Response, ProviderFailure> {
+    let response = client.execute(request).await.map_err(|error| {
+        ProviderFailure::with_source(
+            ProviderFailureKind::Transport,
+            format!("{provider} request failed before receiving a response"),
+            error,
+        )
+    })?;
+    if response.status().is_success() {
+        Ok(response)
+    } else {
+        Err(bounded_http_error(response, provider).await)
+    }
+}
+
 pub(crate) async fn bounded_http_error(
     response: reqwest::Response,
     provider: &str,
-) -> anyhow::Error {
+) -> ProviderFailure {
     let status = response.status();
+    let kind = match status.as_u16() {
+        401 => ProviderFailureKind::Auth,
+        403 => ProviderFailureKind::Authorization,
+        429 => ProviderFailureKind::RateLimit,
+        500..=599 => ProviderFailureKind::Server,
+        _ => ProviderFailureKind::Protocol,
+    };
     let mut chunks = response.bytes_stream();
     let mut body = Vec::new();
     let mut truncated = false;
@@ -98,15 +124,106 @@ pub(crate) async fn bounded_http_error(
             }
             Err(error) => {
                 let preview = String::from_utf8_lossy(&body);
-                return anyhow::anyhow!(
-                    "{provider} returned {status}; failed reading error body: {error}; partial body: {preview}"
+                return ProviderFailure::with_source(
+                    kind,
+                    http_failure_message(
+                        provider,
+                        status,
+                        &format!("partial response: {preview}"),
+                        false,
+                    ),
+                    error,
                 );
             }
         }
     }
     let preview = String::from_utf8_lossy(&body);
+    ProviderFailure::new(
+        kind,
+        http_failure_message(provider, status, &preview, truncated),
+    )
+}
+
+fn http_failure_message(
+    provider: &str,
+    status: reqwest::StatusCode,
+    preview: &str,
+    truncated: bool,
+) -> String {
     let suffix = if truncated { "… [truncated]" } else { "" };
-    anyhow::anyhow!("{provider} returned {status}: {preview}{suffix}")
+    match status.as_u16() {
+        401 => format!(
+            "{provider} authentication failed (HTTP 401). Check its API key, or run `grey auth login openai` for ChatGPT OAuth. Response: {preview}{suffix}"
+        ),
+        403 => format!(
+            "{provider} authorization failed (HTTP 403). Check the API key scope and account/project permissions; for ChatGPT OAuth, run `grey auth login openai`. Response: {preview}{suffix}"
+        ),
+        _ => format!("{provider} returned {status}: {preview}{suffix}"),
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use grey_core::ProviderFailureKind;
+
+    use super::{bounded_http_error, send_http, test_support::serve_one_response};
+
+    async fn http_failure(status: &'static str, body: &str) -> grey_core::ProviderFailure {
+        let (base_url, server) = serve_one_response(body.as_bytes().to_vec(), None, status).await;
+        let response = reqwest::Client::new().get(base_url).send().await.unwrap();
+        server.await.unwrap();
+        bounded_http_error(response, "test provider").await
+    }
+
+    #[tokio::test]
+    async fn http_failure_statuses_have_precise_kinds() {
+        for (status, expected) in [
+            ("401 Unauthorized", ProviderFailureKind::Auth),
+            ("403 Forbidden", ProviderFailureKind::Authorization),
+            ("429 Too Many Requests", ProviderFailureKind::RateLimit),
+            ("503 Service Unavailable", ProviderFailureKind::Server),
+            ("400 Bad Request", ProviderFailureKind::Protocol),
+        ] {
+            assert_eq!(http_failure(status, "failure").await.kind(), expected);
+        }
+
+        let auth = http_failure("401 Unauthorized", "login required").await;
+        assert!(auth.to_string().contains("API key"));
+        assert!(auth.to_string().contains("grey auth login openai"));
+        let authorization = http_failure("403 Forbidden", "denied").await;
+        assert!(authorization.to_string().contains("permissions"));
+    }
+
+    #[tokio::test]
+    async fn io_failure_is_transport() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let client = reqwest::Client::new();
+        let request = client.get(format!("http://{address}")).build().unwrap();
+
+        let failure = send_http(&client, request, "test provider")
+            .await
+            .unwrap_err();
+
+        assert_eq!(failure.kind(), ProviderFailureKind::Transport);
+    }
+
+    #[tokio::test]
+    async fn http_failure_body_is_bounded_and_redacted() {
+        let secret = "secret-value-must-not-appear";
+        let body = format!(
+            r#"{{"Authorization":"Bearer {secret}","token":"{secret}","api_key":"{secret}","detail":"{}"}}"#,
+            "x".repeat(20 * 1024)
+        );
+        let failure = http_failure("500 Internal Server Error", &body).await;
+        let diagnostic = format!("{failure:#}");
+
+        assert_eq!(failure.kind(), ProviderFailureKind::Server);
+        assert!(!diagnostic.contains(secret));
+        assert!(diagnostic.contains("***"));
+        assert!(diagnostic.contains("truncated"));
+    }
 }
 
 /// Build the provider selected by config (or a CLI override).

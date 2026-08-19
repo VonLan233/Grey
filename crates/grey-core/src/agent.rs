@@ -12,8 +12,8 @@ use tokio::sync::mpsc;
 
 use crate::{
     CachedResponse, ChatMessage, ChatRequest, ContextAudit, ContextManager, Provider,
-    ProviderEvent, ProviderModelRef, RequestCache, Role, ToolCall, ToolExecutor, ToolResult, Usage,
-    UsageTracker,
+    ProviderEvent, ProviderFailure, ProviderFailureKind, ProviderModelRef, RequestCache, Role,
+    ToolCall, ToolExecutor, ToolResult, Usage, UsageTracker,
 };
 
 #[derive(Debug, Clone)]
@@ -88,7 +88,7 @@ pub struct ProviderCandidate {
 
 pub trait ProviderHealth: Send + Sync {
     fn is_healthy(&self, reference: &ProviderModelRef) -> bool;
-    fn mark_failed(&self, reference: &ProviderModelRef, error: &str);
+    fn mark_failed(&self, reference: &ProviderModelRef, failure: &ProviderFailure);
     fn mark_success(&self, reference: &ProviderModelRef);
 }
 
@@ -443,31 +443,42 @@ impl Agent {
                     turn.model.clone_from(&candidate.model);
                     return Ok(turn);
                 }
-                Err(failure) if !failure.visible_output && index + 1 < candidates.len() => {
+                Err(failure)
+                    if !failure.visible_output
+                        && failure.failure.allows_retry_or_fallback()
+                        && index + 1 < candidates.len() =>
+                {
                     if let Some(health) = &candidate.health {
-                        health.mark_failed(&reference, &failure.error);
+                        health.mark_failed(&reference, &failure.failure);
                     }
-                    last_error = Some(failure.error.clone());
+                    last_error = Some(failure.failure.clone());
                     send_event(
                         events,
                         AgentEvent::ProviderSwitched {
                             from: candidate.provider_id.clone(),
                             to: candidates[index + 1].provider_id.clone(),
-                            reason: failure.error,
+                            reason: failure.failure.to_string(),
                         },
                     );
                 }
                 Err(failure) => {
-                    if let Some(health) = &candidate.health {
-                        health.mark_failed(&reference, &failure.error);
+                    if failure.failure.allows_retry_or_fallback() {
+                        if let Some(health) = &candidate.health {
+                            health.mark_failed(&reference, &failure.failure);
+                        }
                     }
-                    return Err(anyhow::anyhow!(failure.error));
+                    return Err(failure.failure.into());
                 }
             }
         }
-        Err(anyhow::anyhow!(last_error.unwrap_or_else(|| {
-            "all provider candidates failed".to_string()
-        })))
+        Err(last_error
+            .unwrap_or_else(|| {
+                ProviderFailure::new(
+                    ProviderFailureKind::Protocol,
+                    "all provider candidates failed",
+                )
+            })
+            .into())
     }
 
     async fn stream_candidate(
@@ -479,15 +490,16 @@ impl Agent {
         'attempts: for attempt in 0..=self.options.retries {
             let mut stream = match candidate.provider.stream_chat(request).await {
                 Ok(stream) => stream,
-                Err(error) if attempt < self.options.retries => {
-                    self.retry(attempt, &error.to_string(), events).await;
-                    continue;
-                }
                 Err(error) => {
+                    let failure = ProviderFailure::from_error(error);
+                    if failure.allows_retry_or_fallback() && attempt < self.options.retries {
+                        self.retry(attempt, &failure, events).await;
+                        continue;
+                    }
                     return Err(AttemptFailure {
-                        error: format!("starting provider stream: {error:#}"),
+                        failure,
                         visible_output: false,
-                    })
+                    });
                 }
             };
             let mut text = String::new();
@@ -507,15 +519,17 @@ impl Agent {
                         calls.push(call);
                     }
                     ProviderEvent::Done(done_usage) => usage = Some(done_usage),
-                    ProviderEvent::Error(error)
-                        if !visible_output && attempt < self.options.retries =>
+                    ProviderEvent::Error(failure)
+                        if !visible_output
+                            && failure.allows_retry_or_fallback()
+                            && attempt < self.options.retries =>
                     {
-                        self.retry(attempt, &error, events).await;
+                        self.retry(attempt, &failure, events).await;
                         continue 'attempts;
                     }
-                    ProviderEvent::Error(error) => {
+                    ProviderEvent::Error(failure) => {
                         return Err(AttemptFailure {
-                            error: format!("provider stream failed: {error}"),
+                            failure,
                             visible_output,
                         })
                     }
@@ -523,13 +537,11 @@ impl Agent {
             }
 
             if usage.is_none() {
-                if !visible_output && attempt < self.options.retries {
-                    self.retry(attempt, "provider stream ended before completion", events)
-                        .await;
-                    continue;
-                }
                 return Err(AttemptFailure {
-                    error: "provider stream ended before completion".to_string(),
+                    failure: ProviderFailure::new(
+                        ProviderFailureKind::Protocol,
+                        "provider stream ended before completion",
+                    ),
                     visible_output,
                 });
             }
@@ -549,14 +561,14 @@ impl Agent {
     async fn retry(
         &self,
         zero_based_attempt: usize,
-        error: &str,
+        failure: &ProviderFailure,
         events: Option<&mpsc::UnboundedSender<AgentEvent>>,
     ) {
         send_event(
             events,
             AgentEvent::Retry {
                 attempt: zero_based_attempt + 2,
-                error: error.to_string(),
+                error: failure.to_string(),
             },
         );
         tokio::time::sleep(self.options.retry_delay).await;
@@ -732,7 +744,7 @@ struct CompletedTurn {
 }
 
 struct AttemptFailure {
-    error: String,
+    failure: ProviderFailure,
     visible_output: bool,
 }
 
@@ -979,7 +991,10 @@ mod tests {
         let provider = Arc::new(ScriptedProvider {
             turns: Mutex::new(VecDeque::from([vec![
                 ProviderEvent::Delta("partial".into()),
-                ProviderEvent::Error("disconnect".into()),
+                ProviderEvent::Error(ProviderFailure::new(
+                    ProviderFailureKind::Transport,
+                    "disconnect",
+                )),
             ]])),
             requests: Mutex::new(Vec::new()),
         });
@@ -1151,7 +1166,10 @@ mod tests {
     async fn switches_to_fallback_provider_before_visible_output() {
         let primary = Arc::new(FixedProvider {
             id: "primary",
-            events: vec![ProviderEvent::Error("primary unavailable".into())],
+            events: vec![ProviderEvent::Error(ProviderFailure::new(
+                ProviderFailureKind::Server,
+                "primary unavailable",
+            ))],
         });
         let fallback = Arc::new(FixedProvider {
             id: "fallback",
@@ -1188,5 +1206,266 @@ mod tests {
             }
         }
         assert!(switched);
+    }
+
+    struct CountingFailureProvider {
+        id: &'static str,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        events: Vec<ProviderEvent>,
+    }
+
+    struct StartupFailureProvider {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        failure: ProviderFailure,
+    }
+
+    #[derive(Default)]
+    struct ThresholdHealth {
+        failures: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ProviderHealth for ThresholdHealth {
+        fn is_healthy(&self, _reference: &ProviderModelRef) -> bool {
+            self.failures.load(std::sync::atomic::Ordering::SeqCst) < 3
+        }
+
+        fn mark_failed(&self, _reference: &ProviderModelRef, _failure: &ProviderFailure) {
+            self.failures
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn mark_success(&self, _reference: &ProviderModelRef) {
+            self.failures.store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl Provider for StartupFailureProvider {
+        fn id(&self) -> &str {
+            "startup-failure"
+        }
+
+        async fn stream_chat<'a>(
+            &'a self,
+            _request: &'a ChatRequest,
+        ) -> Result<BoxStream<'a, ProviderEvent>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(self.failure.clone().into())
+        }
+    }
+
+    #[async_trait]
+    impl Provider for CountingFailureProvider {
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        async fn stream_chat<'a>(
+            &'a self,
+            _request: &'a ChatRequest,
+        ) -> Result<BoxStream<'a, ProviderEvent>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::pin(stream::iter(self.events.clone())))
+        }
+    }
+
+    fn failure(kind: ProviderFailureKind, message: &str) -> ProviderEvent {
+        ProviderEvent::Error(ProviderFailure::new(kind, message))
+    }
+
+    #[tokio::test]
+    async fn auth_failure_does_not_retry_or_fallback() {
+        assert_no_retry_or_fallback(ProviderFailureKind::Auth).await;
+    }
+
+    #[tokio::test]
+    async fn authorization_failure_does_not_retry_or_fallback() {
+        assert_no_retry_or_fallback(ProviderFailureKind::Authorization).await;
+    }
+
+    #[tokio::test]
+    async fn startup_auth_failure_does_not_retry_or_fallback() {
+        let primary_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fallback_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let primary = Arc::new(StartupFailureProvider {
+            calls: primary_calls.clone(),
+            failure: ProviderFailure::new(ProviderFailureKind::Auth, "login required"),
+        });
+        let fallback = Arc::new(CountingFailureProvider {
+            id: "fallback",
+            calls: fallback_calls.clone(),
+            events: vec![ProviderEvent::Done(Usage::default())],
+        });
+        let mut options = AgentOptions::new("model");
+        options.retries = 2;
+        options.retry_delay = Duration::ZERO;
+        let agent = Agent::new(
+            primary,
+            Arc::new(ScriptedTools),
+            ContextManager::default(),
+            options,
+        )
+        .with_fallback_providers(vec![ProviderCandidate::new(fallback, "fallback-model")]);
+
+        let error = agent.run_new("system", "hello", None).await.unwrap_err();
+
+        assert!(error.to_string().contains("login required"));
+        assert_eq!(primary_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(fallback_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn repeated_auth_failures_never_poison_health_or_fallback() {
+        let primary_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fallback_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let health = Arc::new(ThresholdHealth::default());
+        let primary = Arc::new(CountingFailureProvider {
+            id: "primary",
+            calls: primary_calls.clone(),
+            events: vec![failure(ProviderFailureKind::Auth, "login required")],
+        });
+        let fallback = Arc::new(CountingFailureProvider {
+            id: "fallback",
+            calls: fallback_calls.clone(),
+            events: vec![ProviderEvent::Done(Usage::default())],
+        });
+        let mut options = AgentOptions::new("model");
+        options.retries = 0;
+        let agent = Agent::new(
+            primary,
+            Arc::new(ScriptedTools),
+            ContextManager::default(),
+            options,
+        )
+        .with_fallback_health(health.clone())
+        .with_fallback_providers(vec![
+            ProviderCandidate::new(fallback, "fallback-model").with_health(health)
+        ]);
+
+        for _ in 0..4 {
+            assert!(agent
+                .run_new("system", "secret prompt", None)
+                .await
+                .is_err());
+        }
+
+        assert_eq!(primary_calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(fallback_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn protocol_failure_does_not_retry_or_fallback() {
+        assert_no_retry_or_fallback(ProviderFailureKind::Protocol).await;
+    }
+
+    async fn assert_no_retry_or_fallback(kind: ProviderFailureKind) {
+        let primary_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fallback_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let primary = Arc::new(CountingFailureProvider {
+            id: "primary",
+            calls: primary_calls.clone(),
+            events: vec![failure(kind, "classified failure")],
+        });
+        let fallback = Arc::new(CountingFailureProvider {
+            id: "fallback",
+            calls: fallback_calls.clone(),
+            events: vec![ProviderEvent::Done(Usage::default())],
+        });
+        let mut options = AgentOptions::new("model");
+        options.retries = 2;
+        options.retry_delay = Duration::ZERO;
+        let agent = Agent::new(
+            primary,
+            Arc::new(ScriptedTools),
+            ContextManager::default(),
+            options,
+        )
+        .with_fallback_providers(vec![ProviderCandidate::new(fallback, "fallback-model")]);
+
+        let error = agent.run_new("system", "hello", None).await.unwrap_err();
+
+        assert!(error.to_string().contains("classified failure"));
+        assert_eq!(primary_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(fallback_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn transient_failures_retry_then_fallback_before_visible_output() {
+        for kind in [
+            ProviderFailureKind::RateLimit,
+            ProviderFailureKind::Transport,
+            ProviderFailureKind::Server,
+        ] {
+            assert_transient_failure_retries_then_fallback(kind).await;
+        }
+    }
+
+    async fn assert_transient_failure_retries_then_fallback(kind: ProviderFailureKind) {
+        let primary_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fallback_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let primary = Arc::new(CountingFailureProvider {
+            id: "primary",
+            calls: primary_calls.clone(),
+            events: vec![failure(kind, "transient failure")],
+        });
+        let fallback = Arc::new(CountingFailureProvider {
+            id: "fallback",
+            calls: fallback_calls.clone(),
+            events: vec![
+                ProviderEvent::Delta("fallback".into()),
+                ProviderEvent::Done(Usage::default()),
+            ],
+        });
+        let mut options = AgentOptions::new("model");
+        options.retries = 2;
+        options.retry_delay = Duration::ZERO;
+        let agent = Agent::new(
+            primary,
+            Arc::new(ScriptedTools),
+            ContextManager::default(),
+            options,
+        )
+        .with_fallback_providers(vec![ProviderCandidate::new(fallback, "fallback-model")]);
+
+        let outcome = agent.run_new("system", "hello", None).await.unwrap();
+
+        assert_eq!(outcome.response, "fallback");
+        assert_eq!(primary_calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(fallback_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn visible_output_failure_never_fallback() {
+        let primary_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fallback_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let primary = Arc::new(CountingFailureProvider {
+            id: "primary",
+            calls: primary_calls.clone(),
+            events: vec![
+                ProviderEvent::Delta("partial".into()),
+                failure(ProviderFailureKind::Server, "server failed"),
+            ],
+        });
+        let fallback = Arc::new(CountingFailureProvider {
+            id: "fallback",
+            calls: fallback_calls.clone(),
+            events: vec![ProviderEvent::Done(Usage::default())],
+        });
+        let mut options = AgentOptions::new("model");
+        options.retries = 2;
+        options.retry_delay = Duration::ZERO;
+        let agent = Agent::new(
+            primary,
+            Arc::new(ScriptedTools),
+            ContextManager::default(),
+            options,
+        )
+        .with_fallback_providers(vec![ProviderCandidate::new(fallback, "fallback-model")]);
+
+        let error = agent.run_new("system", "hello", None).await.unwrap_err();
+
+        assert!(error.to_string().contains("server failed"));
+        assert_eq!(primary_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(fallback_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }
