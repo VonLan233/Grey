@@ -2219,6 +2219,65 @@ fn skills_manage_config_relative_files_and_enablement() {
 }
 
 #[test]
+fn mcp_servers_are_connected_during_agent_runs() {
+    let env = temp_home();
+    let config_dir = env.home.path().join(".config/grey");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let marker = env.home.path().join("mcp-initialized");
+    let script = env.home.path().join("mcp-mock.sh");
+    std::fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) touch "{}"; echo '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2025-11-25","capabilities":{{"tools":{{}}}}}}}}' ;;
+    *'"method":"tools/list"'*) echo '{{"jsonrpc":"2.0","id":2,"result":{{"tools":[]}}}}' ;;
+  esac
+done
+"#,
+            marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        config_dir.join("grey.toml"),
+        format!(
+            r#"
+default_provider = "mock"
+default_model = "mock"
+
+[[providers]]
+id = "mock"
+protocol = "mock"
+
+[[mcp_servers]]
+id = "mock-server"
+command = "sh"
+args = ["{}"]
+"#,
+            script.display()
+        ),
+    )
+    .unwrap();
+
+    let output = env
+        .command()
+        .args(["--no-save", "--no-cache", "ok"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        marker.exists(),
+        "configured MCP server was not connected during the agent run"
+    );
+}
+
+#[test]
 fn mcp_add_list_show_find_update_remove_workflow() {
     let env = temp_home();
     let add = env

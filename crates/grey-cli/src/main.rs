@@ -23,8 +23,8 @@ use grey_core::{
 use grey_provider::chatgpt_oauth::ChatgptOauth;
 use grey_provider::router::{enabled_provider_plugins, ProviderRouter};
 use grey_tools::{
-    AlwaysApprove, Approver, BuiltinTools, DenySideEffects, HookedApprover, LspTools, McpTools,
-    PluginTools, StdioApprover,
+    AlwaysApprove, Approver, BuiltinTools, DenySideEffects, HookedApprover, LspTools, McpServers,
+    McpTools, PluginTools, StdioApprover,
 };
 use grey_tools::{CombinedTools, HookedTools};
 use serde::{Deserialize, Serialize};
@@ -2330,6 +2330,16 @@ fn build_agent_and_session(
     let mcp = McpTools::new(config.mcp_tools.clone());
     if !mcp.is_empty() {
         executors.push(Arc::new(mcp));
+    }
+    if !config.mcp_servers.is_empty() {
+        let mcp = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(McpServers::connect(workspace, config.mcp_servers.clone()))
+        })
+        .context("connecting MCP servers")?;
+        if !mcp.is_empty() {
+            executors.push(Arc::new(mcp));
+        }
     }
     let plugin_tools = PluginTools::new_with_runtime(
         workspace,
