@@ -2217,3 +2217,122 @@ fn skills_manage_config_relative_files_and_enablement() {
         .join(".config/grey/skills/reviewer/SKILL.md")
         .exists());
 }
+
+#[test]
+fn mcp_add_list_show_find_update_remove_workflow() {
+    let env = temp_home();
+    let add = env
+        .command()
+        .args([
+            "mcp",
+            "add",
+            "demo",
+            "--command",
+            "sh",
+            "--arg=--stdio",
+            "--timeout-ms",
+            "1000",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        add.status.success(),
+        "{}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&add.stdout).trim(),
+        "added mcp server"
+    );
+
+    let show = env
+        .command()
+        .args(["mcp", "show", "demo"])
+        .output()
+        .unwrap();
+    assert!(
+        show.status.success(),
+        "{}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let show_value: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
+    assert_eq!(show_value["id"].as_str().unwrap(), "demo");
+    assert_eq!(show_value["transport"].as_str().unwrap(), "stdio");
+    assert_eq!(show_value["command"].as_str().unwrap(), "sh");
+
+    let list = env.command().args(["mcp", "list"]).output().unwrap();
+    assert!(
+        list.status.success(),
+        "{}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let list_output = String::from_utf8_lossy(&list.stdout);
+    assert!(list_output.contains("demo"));
+    assert!(list_output.contains("stdio"));
+    assert!(list_output.contains("sh"));
+    assert!(list_output.contains("timeout_ms=1000"));
+
+    let find = env.command().args(["mcp", "find", "demo"]).output().unwrap();
+    assert!(
+        find.status.success(),
+        "{}",
+        String::from_utf8_lossy(&find.stderr)
+    );
+    assert!(String::from_utf8_lossy(&find.stdout).contains("demo"));
+
+    let update = env
+        .command()
+        .args(["mcp", "add", "demo", "--command", "sh-v2"])
+        .output()
+        .unwrap();
+    assert!(
+        update.status.success(),
+        "{}",
+        String::from_utf8_lossy(&update.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&update.stdout).trim(),
+        "updated mcp server demo"
+    );
+    let show_after = env
+        .command()
+        .args(["mcp", "show", "demo"])
+        .output()
+        .unwrap();
+    let after_value: serde_json::Value = serde_json::from_slice(&show_after.stdout).unwrap();
+    assert_eq!(after_value["command"].as_str().unwrap(), "sh-v2");
+    let persisted =
+        std::fs::read_to_string(env.home.path().join(".config/grey/grey.toml")).unwrap();
+    assert!(
+        persisted.contains("args = [\"--stdio\"]"),
+        "update must preserve args: {persisted}"
+    );
+    assert!(
+        persisted.contains("timeout_ms = 1000"),
+        "update must preserve timeout: {persisted}"
+    );
+
+    let remove = env
+        .command()
+        .args(["mcp", "remove", "demo"])
+        .output()
+        .unwrap();
+    assert!(
+        remove.status.success(),
+        "{}",
+        String::from_utf8_lossy(&remove.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&remove.stdout).trim(),
+        "removed mcp server demo"
+    );
+
+    let list_after = env.command().args(["mcp", "list"]).output().unwrap();
+    assert!(
+        list_after.status.success(),
+        "{}",
+        String::from_utf8_lossy(&list_after.stderr)
+    );
+    assert!(String::from_utf8_lossy(&list_after.stdout)
+        .contains("(no mcp servers configured)"));
+}

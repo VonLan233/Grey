@@ -1,18 +1,27 @@
 //! Workspace-scoped built-in tools with explicit approval for side effects.
 
-use std::collections::HashSet;
+#[cfg(windows)]
+use process_wrap::tokio::JobObject;
+#[cfg(unix)]
+use process_wrap::tokio::ProcessGroup;
+use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop};
+use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{ChildStdin, ChildStdout};
+use tokio::sync::Mutex;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use globset::{Glob, GlobMatcher};
 use grey_core::{
     process::{run_bounded, CommandSpec},
-    HookEvent, HookPayload, HookRunner, HookTool, McpToolConfig, PluginConfig, PluginRuntime,
-    RuntimeConfig, ToolCall, ToolDefinition, ToolExecutor, ToolResult, ToolRisk, WasmPlugin,
+    HookEvent, HookPayload, HookRunner, HookTool, McpServerConfig, McpToolConfig, PluginConfig,
+    PluginRuntime, RuntimeConfig, ToolCall, ToolDefinition, ToolExecutor, ToolResult, ToolRisk,
+    WasmPlugin,
 };
 use ignore::WalkBuilder;
 use regex::Regex;
@@ -25,6 +34,11 @@ pub const BUILTIN_TOOL_NAMES: [&str; 5] = ["read_file", "edit_file", "bash", "gl
 const LSP_TOOL_DEFAULT_MAX_ITEMS: usize = 50;
 const LSP_TOOL_MAX_ITEMS: usize = 500;
 const DEFAULT_TOOL_TIMEOUT: u64 = 5_000;
+const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
+const MCP_LINE_LIMIT: usize = 1024 * 1024;
+const MCP_RESULT_LIMIT: usize = 64 * 1024;
+const MCP_TERM_WAIT: Duration = Duration::from_millis(250);
+const MCP_REAP_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct McpTool {
@@ -707,6 +721,326 @@ impl McpTools {
 
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct McpProtocolTool {
+    server: String,
+    name: String,
+    description: String,
+    input_schema: Value,
+}
+
+struct McpConnection {
+    child: Option<Box<dyn ChildWrapper>>,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    next_id: u64,
+    timeout: Duration,
+}
+
+/// Stdio-only MCP client. One mutex per server intentionally serializes JSON-RPC
+/// requests, because a single stdio stream has no safe concurrent reader.
+pub struct McpServers {
+    connections: HashMap<String, Arc<Mutex<McpConnection>>>,
+    tools: Vec<McpProtocolTool>,
+}
+
+impl McpServers {
+    pub async fn connect(workspace: &Path, configured: Vec<McpServerConfig>) -> Result<Self> {
+        let workspace = workspace
+            .canonicalize()
+            .context("canonicalizing MCP workspace")?;
+        anyhow::ensure!(workspace.is_dir(), "MCP workspace must be a directory");
+        let mut connections = HashMap::new();
+        let mut tools = Vec::new();
+        for server in configured {
+            validate_mcp_server(&server)?;
+            anyhow::ensure!(
+                !connections.contains_key(&server.id),
+                "duplicate MCP server id: {}",
+                server.id
+            );
+            let mut command = CommandWrap::with_new(&server.command, |command| {
+                command
+                    .args(&server.args)
+                    .current_dir(&workspace)
+                    .env_clear()
+                    .envs(&server.env)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null());
+            });
+            command.wrap(KillOnDrop);
+            #[cfg(unix)]
+            command.wrap(ProcessGroup::leader());
+            #[cfg(windows)]
+            command.wrap(JobObject);
+            let mut child = command
+                .spawn()
+                .with_context(|| format!("spawning MCP server {}", server.id))?;
+            let stdin = child.stdin().take().context("opening MCP server stdin")?;
+            let stdout =
+                BufReader::new(child.stdout().take().context("opening MCP server stdout")?);
+            let timeout = Duration::from_millis(server.timeout_ms.unwrap_or(DEFAULT_TOOL_TIMEOUT));
+            let mut connection = McpConnection {
+                child: Some(child),
+                stdin,
+                stdout,
+                next_id: 1,
+                timeout,
+            };
+            let initialized = connection
+                .request(
+                    "initialize",
+                    json!({
+                        "protocolVersion": MCP_PROTOCOL_VERSION,
+                        "capabilities": {},
+                        "clientInfo": { "name": "grey", "version": env!("CARGO_PKG_VERSION") }
+                    }),
+                )
+                .await
+                .with_context(|| format!("initializing MCP server {}", server.id))?;
+            let version = initialized
+                .get("protocolVersion")
+                .and_then(Value::as_str)
+                .context("MCP initialize response lacks protocolVersion")?;
+            anyhow::ensure!(
+                version == MCP_PROTOCOL_VERSION,
+                "MCP server {} selected unsupported protocol version {version}",
+                server.id
+            );
+            connection
+                .notify("notifications/initialized", json!({}))
+                .await?;
+            let connection = Arc::new(Mutex::new(connection));
+            let discovered = list_mcp_tools(&connection)
+                .await
+                .with_context(|| format!("listing MCP tools for {}", server.id))?;
+            for tool in discovered {
+                tools.push(McpProtocolTool {
+                    name: format!("{}__{}", server.id, tool.name),
+                    server: server.id.clone(),
+                    description: tool.description.unwrap_or_else(|| "MCP tool".into()),
+                    input_schema: tool.input_schema,
+                });
+            }
+            connections.insert(server.id, connection);
+        }
+        Ok(Self { connections, tools })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tools.is_empty()
+    }
+}
+
+#[derive(Deserialize)]
+struct McpListedTool {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(rename = "inputSchema", default = "empty_schema")]
+    input_schema: Value,
+}
+fn empty_schema() -> Value {
+    json!({"type":"object","properties":{}})
+}
+
+async fn list_mcp_tools(connection: &Arc<Mutex<McpConnection>>) -> Result<Vec<McpListedTool>> {
+    let mut cursor: Option<String> = None;
+    let mut all = Vec::new();
+    loop {
+        let response = connection
+            .lock()
+            .await
+            .request("tools/list", json!({"cursor": cursor}))
+            .await?;
+        let mut page: Vec<McpListedTool> =
+            serde_json::from_value(response.get("tools").cloned().unwrap_or(Value::Null))
+                .context("invalid MCP tools/list tools")?;
+        all.append(&mut page);
+        cursor = response
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if cursor.is_none() {
+            return Ok(all);
+        }
+    }
+}
+
+fn validate_mcp_server(server: &McpServerConfig) -> Result<()> {
+    anyhow::ensure!(
+        !server.id.trim().is_empty(),
+        "MCP server id must not be empty"
+    );
+    anyhow::ensure!(
+        server.transport == "stdio",
+        "MCP server {}: only stdio transport is supported",
+        server.id
+    );
+    anyhow::ensure!(
+        !server.command.trim().is_empty(),
+        "MCP server {} command must not be empty",
+        server.id
+    );
+    anyhow::ensure!(
+        !server.command.contains("://"),
+        "MCP server {} must be a direct command, not a URL",
+        server.id
+    );
+    anyhow::ensure!(
+        server.timeout_ms.unwrap_or(DEFAULT_TOOL_TIMEOUT) > 0,
+        "MCP server {} timeout must be positive",
+        server.id
+    );
+    Ok(())
+}
+
+impl McpConnection {
+    async fn notify(&mut self, method: &str, params: Value) -> Result<()> {
+        self.write(json!({"jsonrpc":"2.0", "method": method, "params": params}))
+            .await
+    }
+    async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.write(json!({"jsonrpc":"2.0", "id": id, "method": method, "params": params}))
+            .await?;
+        let response = match tokio::time::timeout(self.timeout, self.read_response(id)).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                self.stop().await;
+                return Err(error);
+            }
+            Err(_) => {
+                self.stop().await;
+                bail!(
+                    "MCP request {method} timed out after {}ms",
+                    self.timeout.as_millis()
+                );
+            }
+        };
+        if let Some(error) = response.get("error") {
+            bail!("MCP {method} failed: {error}");
+        }
+        response
+            .get("result")
+            .cloned()
+            .context("MCP response lacks result")
+    }
+    async fn write(&mut self, value: Value) -> Result<()> {
+        let text = serde_json::to_vec(&value)?;
+        anyhow::ensure!(
+            text.len() <= MCP_LINE_LIMIT,
+            "MCP request exceeds {MCP_LINE_LIMIT} bytes"
+        );
+        self.stdin.write_all(&text).await?;
+        self.stdin.write_all(b"\n").await?;
+        self.stdin.flush().await?;
+        Ok(())
+    }
+    async fn read_response(&mut self, id: u64) -> Result<Value> {
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let count = (&mut self.stdout)
+                .take((MCP_LINE_LIMIT + 1) as u64)
+                .read_until(b'\n', &mut line)
+                .await?;
+            anyhow::ensure!(count != 0, "MCP server closed stdout");
+            anyhow::ensure!(
+                line.len() <= MCP_LINE_LIMIT,
+                "MCP response exceeds {MCP_LINE_LIMIT} bytes"
+            );
+            let response: Value =
+                serde_json::from_slice(&line).context("malformed MCP JSONL response")?;
+            if response.get("id").and_then(Value::as_u64) == Some(id) {
+                return Ok(response);
+            }
+        }
+    }
+    async fn stop(&mut self) {
+        let _ = self.stdin.shutdown().await;
+        if let Some(child) = self.child.take() {
+            let _ = terminate_and_reap_mcp(child).await;
+        }
+    }
+}
+
+async fn terminate_and_reap_mcp(mut child: Box<dyn ChildWrapper>) -> Result<()> {
+    #[cfg(unix)]
+    if child.try_wait()?.is_none() {
+        if let Err(error) = child.signal(15) {
+            if child.try_wait()?.is_none() {
+                return Err(error).context("terminating MCP process group");
+            }
+        }
+        match tokio::time::timeout(MCP_TERM_WAIT, child.wait()).await {
+            Ok(Ok(_)) => return Ok(()),
+            Ok(Err(error)) => return Err(error).context("reaping MCP process group after SIGTERM"),
+            Err(_) => {}
+        }
+    }
+    if child.try_wait()?.is_none() {
+        child.start_kill().context("killing MCP process tree")?;
+    }
+    tokio::time::timeout(MCP_REAP_WAIT, child.wait())
+        .await
+        .context("reaping MCP process tree timed out")??;
+    Ok(())
+}
+
+impl Drop for McpConnection {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    let _ = terminate_and_reap_mcp(child).await;
+                });
+            } else {
+                let _ = child.start_kill();
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for McpServers {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        self.tools
+            .iter()
+            .map(|tool| ToolDefinition {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                input_schema: tool.input_schema.clone(),
+                risk: ToolRisk::ReadOnly,
+            })
+            .collect()
+    }
+    async fn execute(&self, call: &ToolCall) -> ToolResult {
+        let Some(tool) = self.tools.iter().find(|tool| tool.name == call.name) else {
+            return ToolResult::failure(call, format!("unknown MCP tool {}", call.name));
+        };
+        let Some(connection) = self.connections.get(&tool.server) else {
+            return ToolResult::failure(call, "MCP server connection unavailable");
+        };
+        let result = connection.lock().await.request("tools/call", json!({"name": tool.name.split_once("__").map(|(_, name)| name).unwrap_or(&tool.name), "arguments": call.arguments})).await;
+        match result {
+            Ok(value) => match serde_json::to_string(&value) {
+                Ok(output) if output.len() <= MCP_RESULT_LIMIT => ToolResult::success(call, output),
+                Ok(_) => ToolResult::failure(
+                    call,
+                    format!("MCP tool result exceeds {MCP_RESULT_LIMIT} bytes"),
+                ),
+                Err(error) => ToolResult::failure(call, format!("serializing MCP result: {error}")),
+            },
+            Err(error) => {
+                ToolResult::failure(call, format!("MCP tool {} failed: {error:#}", call.name))
+            }
+        }
     }
 }
 

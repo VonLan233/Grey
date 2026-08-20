@@ -35,6 +35,7 @@ P5 已进入交付：TUI 支持布局高度/主题配置与基础完成提醒；
 - SQLite 请求缓存（TTL/LRU/provider 隔离）与 `--no-cache` 控制
 - 每会话 token/cost usage 记录，跨 CLI 调用累积并由 `usage show/summary` 查询
 - MCP 命令工具与 Hook：`pre_prompt`、`pre_tool_call`、`post_tool_call`
+- MCP stdio 协议客户端：`[[mcp_servers]]` 持久化服务器、`initialize/tools/list/tools/call`、`grey mcp` CRUD 与 `id__tool` 工具注册
 - P6 扩展能力：`grey plugins`、`[[plugins]]`（tool/hook）、`grey loop`、`grey goal`、以及 Hook 全链路事件
 - 多 Agent 编排：`grey orchestrate` 并行运行子 agent，支持 `--session`/`--continue` 与结果持久化
 - TUI 外观与提醒：`[tui]` 布局高度、主题与长任务完成提醒可配置（可控制终端鸣铃、强鸣铃）
@@ -148,6 +149,12 @@ name = "ls"
 command = "ls"
 args = [".", "-la"]
 
+[[mcp_servers]]
+id = "filesystem"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+# transport 固定为 "stdio"；env 可注入环境变量（支持 ${VAR} 展开），timeout_ms 可选
+
 [tui]
 layout = { input_lines = 6 }
 theme = { preset = "slate", overrides = { border = "#1f2937", accent = "#60a5fa", prompt = "yellow", status_fg = "black", status_bg = "#60a5fa" } }
@@ -249,6 +256,33 @@ grey plugins add tool-check --kind tool --command printf --arg hello
 
 `add`/`remove` 会将变更落盘到 `GREY_CONFIG`（或默认 `~/.config/grey/grey.toml`）对应的
 `[[plugins]]` 配置。
+
+### MCP 服务器
+
+Grey 支持两类 MCP 配置，二者可共存：
+
+- `[[mcp_tools]]`：**兼容层**（保留，不迁移）。每个条目是单条 shell 命令工具，不执行
+  MCP JSON-RPC 协议，直接注册为同名工具。
+- `[[mcp_servers]]`：**持久化 stdio MCP 协议客户端**（推荐）。启动后执行
+  `initialize` → `tools/list` → `tools/call`，发现的工具以 `id__tool` 命名注册；单连接
+  串行处理请求，超时（默认 5s，`timeout_ms` 覆盖）后对进程组先 `TERM` 再 `KILL` 回收。
+
+迁移说明：若某个 `[[mcp_tools]]` 条目本身就是一个会讲 MCP stdio JSON-RPC 的服务进程，
+把它迁移到 `[[mcp_servers]]`（补一个稳定 `id`）即可走协议握手；纯 shell 命令工具继续留在
+`[[mcp_tools]]`。`[[mcp_servers]]` 只支持 `stdio` 传输，`command` 必须是直接命令而非 URL。
+
+管理命令（落盘到 `GREY_CONFIG` 的 `[[mcp_servers]]`）：
+
+```bash
+grey mcp list
+grey mcp show filesystem
+grey mcp find filesystem
+grey mcp add filesystem --command npx --arg=-y --arg=@modelcontextprotocol/server-filesystem
+grey mcp remove filesystem
+```
+
+`add` 以 `id` 为准执行 upsert（更新时保留已有 `args`/`timeout_ms`/`env`）；`env` 暂由
+配置文件手写，`show` 会脱敏 `args` 与常见密钥字段。
 
 ## 会话
 

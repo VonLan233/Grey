@@ -16,9 +16,9 @@ use grey_core::{
     config,
     process::{run_bounded, CommandSpec, DEFAULT_STDIN_LIMIT},
     Agent, AgentEvent, AgentOptions, AgentOutcome, CharApproxCounter, ChatMessage, ChatRequest,
-    ContextManager, GreyConfig, HookEvent, HookPayload, HookRunner, PluginConfig, PluginKind,
-    PluginRuntime, Provider, Role, Session, SessionStore, SkillConfig, SummaryEngine, ToolExecutor,
-    WasmPlugin,
+    ContextManager, GreyConfig, HookEvent, HookPayload, HookRunner, McpServerConfig, PluginConfig,
+    PluginKind, PluginRuntime, Provider, Role, Session, SessionStore, SkillConfig, SummaryEngine,
+    ToolExecutor, WasmPlugin,
 };
 use grey_provider::chatgpt_oauth::ChatgptOauth;
 use grey_provider::router::{enabled_provider_plugins, ProviderRouter};
@@ -247,6 +247,11 @@ enum Command {
     Plugins {
         #[command(subcommand)]
         action: PluginAction,
+    },
+    /// Persistent MCP protocol server management (stdio CRUD).
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
     },
     /// Hook extension management (P10).
     Hooks {
@@ -512,6 +517,37 @@ enum PluginAction {
 }
 
 #[derive(Subcommand, Clone)]
+enum McpAction {
+    /// List configured MCP servers.
+    List,
+    /// Show an MCP server by id.
+    Show { id: String },
+    /// Find MCP servers by id or command.
+    Find { query: String },
+    /// Add or update a stdio MCP server entry.
+    Add {
+        id: String,
+        /// Executable command that speaks the MCP stdio JSON-RPC protocol.
+        #[arg(long)]
+        command: Option<String>,
+        /// Repeated arguments appended to the command.
+        #[arg(long = "arg")]
+        args: Option<Vec<String>>,
+        /// Remove all existing command arguments.
+        #[arg(long)]
+        clear_args: bool,
+        /// Command timeout override in milliseconds.
+        #[arg(long)]
+        timeout_ms: Option<u64>,
+        /// Remove an existing command timeout.
+        #[arg(long)]
+        clear_timeout: bool,
+    },
+    /// Remove an MCP server by id.
+    Remove { id: String },
+}
+
+#[derive(Subcommand, Clone)]
 enum HookAction {
     /// List configured hook plugins and legacy hooks.
     List,
@@ -768,6 +804,7 @@ async fn run_command(cli: &Cli, command: Command) -> Result<()> {
         Command::Sessions { action } => run_sessions(action),
         Command::Providers { action } => run_providers(action),
         Command::Plugins { action } => run_plugins(action),
+        Command::Mcp { action } => run_mcp(action),
         Command::Hooks { action } => run_hooks(action),
         Command::Skills { action } => run_skills(action),
         Command::Cache { action } => run_cache(action),
@@ -3242,6 +3279,91 @@ fn run_plugins(action: PluginAction) -> Result<()> {
     }
 }
 
+fn run_mcp(action: McpAction) -> Result<()> {
+    let config_path = grey_core::raw_config::mutation_target()?;
+
+    match action {
+        McpAction::List => {
+            let servers = read_raw_mcp_servers(&config_path)?;
+            print_mcp_servers(&servers);
+            Ok(())
+        }
+        McpAction::Show { id } => {
+            show_raw_mcp_server(&config_path, &id)?;
+            Ok(())
+        }
+        McpAction::Find { query } => {
+            let mut servers = read_raw_mcp_servers(&config_path)?;
+            servers.retain(|server| mcp_server_matches(server, &query));
+            servers.sort_by(|left, right| left.id.cmp(&right.id));
+            print_mcp_servers(&servers);
+            Ok(())
+        }
+        McpAction::Add {
+            id,
+            command,
+            args,
+            clear_args,
+            timeout_ms,
+            clear_timeout,
+        } => {
+            if clear_args && args.is_some() {
+                bail!("--clear-args cannot be combined with --arg");
+            }
+            if clear_timeout && timeout_ms.is_some() {
+                bail!("--clear-timeout cannot be combined with --timeout-ms");
+            }
+            let mut updated = false;
+            let output_id = id.clone();
+            grey_core::raw_config::edit_file(&config_path, |doc| {
+                let existing = grey_core::raw_config::mcp_server_config_for_id(doc, &id)?;
+                updated = existing.is_some();
+                let existing = existing.unwrap_or_default();
+                let command = command
+                    .clone()
+                    .filter(|command| !command.trim().is_empty())
+                    .or_else(|| {
+                        (!existing.command.trim().is_empty())
+                            .then(|| existing.command.clone())
+                    })
+                    .with_context(|| {
+                        format!("--command is required when adding mcp server {id}")
+                    })?;
+                let server = McpServerConfig {
+                    id: id.clone(),
+                    transport: "stdio".into(),
+                    command,
+                    args: if clear_args {
+                        Vec::new()
+                    } else {
+                        args.clone().unwrap_or(existing.args)
+                    },
+                    env: existing.env,
+                    timeout_ms: if clear_timeout {
+                        None
+                    } else {
+                        timeout_ms.or(existing.timeout_ms)
+                    },
+                };
+                grey_core::raw_config::upsert_mcp_server(doc, &server)
+            })?;
+            if updated {
+                println!("updated mcp server {output_id}");
+            } else {
+                println!("added mcp server");
+            }
+            Ok(())
+        }
+        McpAction::Remove { id } => {
+            grey_core::raw_config::edit_file(&config_path, |doc| {
+                grey_core::raw_config::remove_mcp_server(doc, &id)
+            })?;
+            println!("removed mcp server {id}");
+            Ok(())
+        }
+    }
+}
+
 fn run_skills(action: SkillAction) -> Result<()> {
     let config_path = grey_core::raw_config::mutation_target()?;
     let config_dir = skill_config_dir(&config_path)?;
@@ -3565,6 +3687,74 @@ fn show_raw_plugin(path: &Path, id: &str) -> Result<()> {
         })
         .with_context(|| format!("plugin not found: {id}"))?;
     let mut output = serde_json::to_value(plugin)?;
+    grey_core::raw_config::redact(&mut output);
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+fn mcp_server_matches(server: &McpServerConfig, query: &str) -> bool {
+    let query = query.to_lowercase();
+    [server.id.as_str(), server.command.as_str()]
+        .into_iter()
+        .any(|field| field.to_lowercase().contains(&query))
+}
+
+fn print_mcp_servers(servers: &[McpServerConfig]) {
+    if servers.is_empty() {
+        println!("(no mcp servers configured)");
+        return;
+    }
+    for server in servers {
+        let args = if server.args.is_empty() {
+            "-".to_owned()
+        } else {
+            server.args.join(" ")
+        };
+        println!(
+            "{}\t{}\t{}\targs=[{}]\ttimeout_ms={}",
+            server.id,
+            server.transport,
+            server.command,
+            args,
+            server
+                .timeout_ms
+                .map(|millis| millis.to_string())
+                .unwrap_or_else(|| "default".into())
+        );
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct RawMcpServerList {
+    #[serde(default)]
+    mcp_servers: Vec<McpServerConfig>,
+}
+
+fn read_raw_mcp_servers(path: &Path) -> Result<Vec<McpServerConfig>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let source = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let servers = toml::from_str::<RawMcpServerList>(&source)
+        .map(|config| config.mcp_servers)
+        .context("parsing raw mcp server configuration")?;
+    Ok(servers)
+}
+
+fn show_raw_mcp_server(path: &Path, id: &str) -> Result<()> {
+    let source = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut config: toml::Value =
+        toml::from_str(&source).with_context(|| format!("parsing {}", path.display()))?;
+    let server = config
+        .get_mut("mcp_servers")
+        .and_then(toml::Value::as_array_mut)
+        .and_then(|servers| {
+            servers
+                .iter_mut()
+                .find(|server| server.get("id").and_then(toml::Value::as_str) == Some(id))
+        })
+        .with_context(|| format!("mcp server not found: {id}"))?;
+    let mut output = serde_json::to_value(server)?;
     grey_core::raw_config::redact(&mut output);
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())

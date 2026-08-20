@@ -3,12 +3,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use grey_core::{
-    HookRunner, HooksConfig, McpToolConfig, PluginConfig, PluginKind, RuntimeConfig, ToolCall,
-    ToolExecutor,
+    HookRunner, HooksConfig, McpServerConfig, McpToolConfig, PluginConfig, PluginKind,
+    RuntimeConfig, ToolCall, ToolExecutor,
 };
 use grey_tools::{
     AlwaysApprove, BuiltinTools, CombinedTools, DenySideEffects, HookedApprover, HookedTools,
-    LspTools, McpTools, PluginTools, BUILTIN_TOOL_NAMES,
+    LspTools, McpServers, McpTools, PluginTools, BUILTIN_TOOL_NAMES,
 };
 
 fn call(name: &str, arguments: serde_json::Value) -> ToolCall {
@@ -21,6 +21,252 @@ fn call(name: &str, arguments: serde_json::Value) -> ToolCall {
 
 fn hook_runner(hooks: HooksConfig) -> HookRunner {
     HookRunner::new(&hooks, &[], &RuntimeConfig::default())
+}
+
+#[cfg(unix)]
+fn mcp_mock(workspace: &std::path::Path) -> std::path::PathBuf {
+    let script = workspace.join("mcp-mock.sh");
+    std::fs::write(&script, r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}}}}' ;;
+    *'"method":"tools/list"'*'"cursor":null'*) echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"first","description":"first tool","inputSchema":{"type":"object"}}],"nextCursor":"page-2"}}' ;;
+    *'"method":"tools/list"'*) echo '{"jsonrpc":"2.0","id":3,"result":{"tools":[{"name":"second","inputSchema":{"type":"object"}}]}}' ;;
+    *'"method":"tools/call"'*) echo '{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"ok"}]}}' ;;
+  esac
+done
+"#).unwrap();
+    script
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stdio_mcp_initializes_paginates_and_calls() {
+    let workspace = tempfile::tempdir().unwrap();
+    let server = McpServers::connect(
+        workspace.path(),
+        vec![McpServerConfig {
+            id: "mock".into(),
+            command: "sh".into(),
+            args: vec![mcp_mock(workspace.path()).display().to_string()],
+            timeout_ms: Some(1_000),
+            ..Default::default()
+        }],
+    )
+    .await
+    .unwrap();
+    let names: Vec<_> = server
+        .definitions()
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect();
+    assert_eq!(names, ["mock__first", "mock__second"]);
+    let result = server
+        .execute(&call("mock__second", serde_json::json!({"value": 1})))
+        .await;
+    assert!(result.success, "{}", result.output);
+    assert!(result.output.contains("ok"));
+}
+
+#[tokio::test]
+async fn stdio_mcp_rejects_non_stdio_transport() {
+    let workspace = tempfile::tempdir().unwrap();
+    let error = McpServers::connect(
+        workspace.path(),
+        vec![McpServerConfig {
+            id: "bad".into(),
+            transport: "sse".into(),
+            command: "https://example.test".into(),
+            ..Default::default()
+        }],
+    )
+    .await
+    .err()
+    .unwrap();
+    assert!(error.to_string().contains("only stdio"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stdio_mcp_rejects_malformed_jsonl() {
+    let workspace = tempfile::tempdir().unwrap();
+    let script = workspace.path().join("mcp-malformed.sh");
+    std::fs::write(&script, "#!/bin/sh\nread _\nprintf 'not-json\\n'\n").unwrap();
+    let error = match McpServers::connect(
+        workspace.path(),
+        vec![McpServerConfig {
+            id: "bad".into(),
+            command: "sh".into(),
+            args: vec![script.display().to_string()],
+            ..Default::default()
+        }],
+    )
+    .await
+    {
+        Ok(_) => panic!("malformed MCP JSONL was accepted"),
+        Err(error) => error,
+    };
+    assert!(
+        format!("{error:#}").contains("malformed MCP JSONL"),
+        "{error:#}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stdio_mcp_rejects_oversize_jsonl_before_buffering_a_full_line() {
+    let workspace = tempfile::tempdir().unwrap();
+    let script = workspace.path().join("mcp-oversize.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nread _\nhead -c 1048577 /dev/zero | tr '\\0' x\nprintf '\\n'\n",
+    )
+    .unwrap();
+    let error = match McpServers::connect(
+        workspace.path(),
+        vec![McpServerConfig {
+            id: "large".into(),
+            command: "sh".into(),
+            args: vec![script.display().to_string()],
+            ..Default::default()
+        }],
+    )
+    .await
+    {
+        Ok(_) => panic!("oversize MCP JSONL was accepted"),
+        Err(error) => error,
+    };
+    assert!(
+        format!("{error:#}").contains("MCP response exceeds"),
+        "{error:#}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stdio_mcp_timeout_terminates_and_reaps_its_process_group() {
+    let workspace = tempfile::tempdir().unwrap();
+    let pid_file = workspace.path().join("mcp-pids");
+    let script = workspace.path().join("mcp-timeout.sh");
+    std::fs::write(&script, r#"#!/bin/sh
+sleep 30 & child=$!
+printf '%s %s\n' "$$" "$child" > "$PID_FILE"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25"}}' ;;
+    *'"method":"tools/list"'*) echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"hang","inputSchema":{"type":"object"}}]}}' ;;
+    *'"method":"tools/call"'*) sleep 30 ;;
+  esac
+done
+"#).unwrap();
+    let server = McpServers::connect(
+        workspace.path(),
+        vec![McpServerConfig {
+            id: "timeout".into(),
+            command: "sh".into(),
+            args: vec![script.display().to_string()],
+            env: std::collections::HashMap::from([(
+                "PID_FILE".into(),
+                pid_file.display().to_string(),
+            )]),
+            timeout_ms: Some(50),
+            ..Default::default()
+        }],
+    )
+    .await
+    .unwrap();
+    let result = server
+        .execute(&call("timeout__hang", serde_json::json!({})))
+        .await;
+    assert!(!result.success, "{result:?}");
+    let pids = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Ok(pids) = std::fs::read_to_string(&pid_file) {
+                break pids;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for pid in pids.split_whitespace() {
+        let status = std::process::Command::new("/bin/kill")
+            .args(["-0", pid])
+            .status()
+            .unwrap();
+        assert!(!status.success(), "MCP descendant {pid} survived timeout");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stdio_mcp_cancellation_reaps_its_process_group() {
+    let workspace = tempfile::tempdir().unwrap();
+    let pid_file = workspace.path().join("mcp-pids");
+    let script = workspace.path().join("mcp-cancel.sh");
+    std::fs::write(&script, r#"#!/bin/sh
+sleep 30 & child=$!
+printf '%s %s\n' "$$" "$child" > "$PID_FILE"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25"}}' ;;
+    *'"method":"tools/list"'*) echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"hang","inputSchema":{"type":"object"}}]}}' ;;
+    *'"method":"tools/call"'*) sleep 30 ;;
+  esac
+done
+"#).unwrap();
+    let server = Arc::new(
+        McpServers::connect(
+            workspace.path(),
+            vec![McpServerConfig {
+                id: "cancel".into(),
+                command: "sh".into(),
+                args: vec![script.display().to_string()],
+                env: std::collections::HashMap::from([(
+                    "PID_FILE".into(),
+                    pid_file.display().to_string(),
+                )]),
+                timeout_ms: Some(5_000),
+                ..Default::default()
+            }],
+        )
+        .await
+        .unwrap(),
+    );
+    let pending = {
+        let server = Arc::clone(&server);
+        tokio::spawn(async move {
+            server
+                .execute(&call("cancel__hang", serde_json::json!({})))
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    pending.abort();
+    let _ = pending.await;
+    drop(server);
+    let pids = std::fs::read_to_string(&pid_file).unwrap();
+    for pid in pids.split_whitespace() {
+        for _ in 0..100 {
+            if !std::process::Command::new("/bin/kill")
+                .args(["-0", pid])
+                .status()
+                .unwrap()
+                .success()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !std::process::Command::new("/bin/kill")
+                .args(["-0", pid])
+                .status()
+                .unwrap()
+                .success(),
+            "MCP descendant {pid} survived cancellation"
+        );
+    }
 }
 
 #[test]

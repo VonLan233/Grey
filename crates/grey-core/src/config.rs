@@ -147,6 +147,40 @@ pub struct McpToolConfig {
     pub timeout_ms: Option<u64>,
 }
 
+/// A persistent MCP protocol server. `mcp_tools` remains the legacy
+/// one-command compatibility format and is not treated as MCP transport.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerConfig {
+    pub id: String,
+    #[serde(default = "default_mcp_transport")]
+    pub transport: String,
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+fn default_mcp_transport() -> String {
+    "stdio".into()
+}
+
+impl Default for McpServerConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            transport: default_mcp_transport(),
+            command: String::new(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            timeout_ms: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum TaskKind {
@@ -659,6 +693,8 @@ pub struct GreyConfig {
     pub hooks: HooksConfig,
     /// External command MCP tools.
     pub mcp_tools: Vec<McpToolConfig>,
+    /// Persistent MCP protocol servers over stdio only.
+    pub mcp_servers: Vec<McpServerConfig>,
     /// TUI preferences for theme/layout/reminder.
     pub tui: TuiConfig,
     /// Plugin registry for P6 extension points.
@@ -698,6 +734,7 @@ impl Default for GreyConfig {
             usage: UsageConfig::default(),
             hooks: HooksConfig::default(),
             mcp_tools: Vec::new(),
+            mcp_servers: Vec::new(),
             plugins: Vec::new(),
             skills: Vec::new(),
             plugin_config_dir: default_plugin_config_dir(),
@@ -978,6 +1015,9 @@ fn merge_file(base: GreyConfig, over: GreyConfig, raw: &toml::Value) -> GreyConf
     if !table.contains_key("mcp_tools") {
         merged.mcp_tools = defaults.mcp_tools;
     }
+    if !table.contains_key("mcp_servers") {
+        merged.mcp_servers = defaults.mcp_servers;
+    }
     if !table.contains_key("plugins") {
         merged.plugins = defaults.plugins;
     }
@@ -1027,6 +1067,9 @@ fn merge(mut base: GreyConfig, over: GreyConfig) -> GreyConfig {
     }
     if !over.mcp_tools.is_empty() {
         base.mcp_tools = over.mcp_tools;
+    }
+    if !over.mcp_servers.is_empty() {
+        base.mcp_servers = over.mcp_servers;
     }
     if !over.plugins.is_empty() {
         base.plugins = over.plugins;
@@ -1276,6 +1319,15 @@ fn apply_env(cfg: &mut GreyConfig) -> Result<()> {
         tool.command = expand_env_refs(&tool.command)?;
         for arg in tool.args.iter_mut() {
             *arg = expand_env_refs(arg)?;
+        }
+    }
+    for server in cfg.mcp_servers.iter_mut() {
+        server.command = expand_env_refs(&server.command)?;
+        for arg in &mut server.args {
+            *arg = expand_env_refs(arg)?;
+        }
+        for value in server.env.values_mut() {
+            *value = expand_env_refs(value)?;
         }
     }
     for plugin in cfg.plugins.iter_mut() {
@@ -1757,6 +1809,22 @@ description = "echo test tool"
         assert!(cfg.hooks.permission_decision.is_empty());
         assert_eq!(cfg.mcp_tools.len(), 1);
         assert_eq!(cfg.mcp_tools[0].name, "echoer");
+    }
+
+    #[test]
+    fn parses_stdio_mcp_servers() {
+        let cfg: GreyConfig = toml::from_str(
+            r#"
+[[mcp_servers]]
+id = "demo"
+command = "server"
+args = ["--stdio"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.mcp_servers.len(), 1);
+        assert_eq!(cfg.mcp_servers[0].transport, "stdio");
+        assert_eq!(cfg.mcp_servers[0].id, "demo");
     }
 
     #[test]

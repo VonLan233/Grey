@@ -1,7 +1,8 @@
-use crate::config::{self, PluginConfig, PluginRuntime, SkillConfig};
+use crate::config::{self, McpServerConfig, PluginConfig, PluginRuntime, SkillConfig};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -182,6 +183,71 @@ pub fn remove_plugin(doc: &mut DocumentMut, id: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn mcp_servers(doc: &DocumentMut) -> Result<Vec<McpServerConfig>> {
+    let servers = toml::from_str::<RawMcpServerList>(&doc.to_string())
+        .context("parsing raw mcp server configuration")?
+        .mcp_servers;
+    validate_existing_mcp_servers(doc)?;
+    Ok(servers)
+}
+
+pub fn mcp_server_config_for_id(doc: &DocumentMut, id: &str) -> Result<Option<McpServerConfig>> {
+    let Some(servers) = doc
+        .as_table()
+        .get("mcp_servers")
+        .and_then(Item::as_array_of_tables)
+    else {
+        return Ok(None);
+    };
+    servers
+        .iter()
+        .find(|entry| entry.get("id").and_then(Item::as_str) == Some(id))
+        .map(|entry| toml::from_str(&entry.to_string()).context("parsing raw mcp server entry"))
+        .transpose()
+}
+
+pub fn upsert_mcp_server(doc: &mut DocumentMut, server: &McpServerConfig) -> Result<()> {
+    validate_existing_mcp_servers(doc)?;
+    let servers = array_of_tables_mut(doc, "mcp_servers")?;
+    let entry = servers
+        .iter_mut()
+        .find(|entry| entry.get("id").and_then(Item::as_str) == Some(server.id.as_str()));
+    let entry = match entry {
+        Some(entry) => entry,
+        None => {
+            let mut entry = Table::new();
+            entry["id"] = value(server.id.as_str());
+            servers.push(entry);
+            servers
+                .get_mut(servers.len() - 1)
+                .expect("new mcp server table")
+        }
+    };
+    entry["id"] = value(server.id.as_str());
+    entry["transport"] = value(server.transport.as_str());
+    entry["command"] = value(server.command.as_str());
+    entry["args"] = Item::Value(TomlValue::Array(value_array(&server.args)));
+    set_optional_integer(entry, "timeout_ms", server.timeout_ms);
+    if server.env.is_empty() {
+        // ponytail: the CLI never edits server env; leave an existing env untouched so an
+        // update cannot silently drop it. Use --env editing only if server env becomes a real CLI need.
+    } else {
+        entry["env"] = Item::Value(TomlValue::InlineTable(env_inline_table(&server.env)));
+    }
+    Ok(())
+}
+
+pub fn remove_mcp_server(doc: &mut DocumentMut, id: &str) -> Result<()> {
+    validate_existing_mcp_servers(doc)?;
+    let servers = array_of_tables_mut(doc, "mcp_servers")?;
+    let index = servers
+        .iter()
+        .position(|entry| entry.get("id").and_then(Item::as_str) == Some(id))
+        .with_context(|| format!("mcp_servers entry not found: {id}"))?;
+    servers.remove(index);
+    Ok(())
+}
+
 pub fn skills(doc: &DocumentMut) -> Result<Vec<SkillConfig>> {
     let skills = toml::from_str::<RawSkillList>(&doc.to_string())?.skills;
     config::validate_skills(&skills)?;
@@ -253,6 +319,12 @@ struct RawPluginList {
 }
 
 #[derive(Deserialize, Default)]
+struct RawMcpServerList {
+    #[serde(default)]
+    mcp_servers: Vec<McpServerConfig>,
+}
+
+#[derive(Deserialize, Default)]
 struct RawSkillList {
     #[serde(default)]
     skills: Vec<SkillConfig>,
@@ -263,6 +335,34 @@ fn validate_existing_plugins(doc: &DocumentMut) -> Result<()> {
         .context("parsing raw plugin configuration")?
         .plugins;
     config::validate_unique_plugin_ids(&plugins)
+}
+
+fn validate_existing_mcp_servers(doc: &DocumentMut) -> Result<()> {
+    let servers = toml::from_str::<RawMcpServerList>(&doc.to_string())
+        .context("parsing raw mcp server configuration")?
+        .mcp_servers;
+    let mut ids = HashSet::with_capacity(servers.len());
+    for server in &servers {
+        anyhow::ensure!(
+            server.id == server.id.trim(),
+            "mcp server id must not have leading or trailing whitespace: {:?}",
+            server.id
+        );
+        anyhow::ensure!(
+            ids.insert(server.id.as_str()),
+            "duplicate mcp server id: {}",
+            server.id
+        );
+    }
+    Ok(())
+}
+
+fn env_inline_table(env: &HashMap<String, String>) -> toml_edit::InlineTable {
+    let mut table = toml_edit::InlineTable::new();
+    for (key, secret) in env {
+        table.insert(key.as_str(), TomlValue::from(secret.as_str()));
+    }
+    table
 }
 
 pub fn redact(value: &mut Value) {
@@ -556,5 +656,41 @@ mod tests {
         })
         .unwrap();
         assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o077, 0);
+    }
+
+    #[test]
+    fn raw_config_mcp_upsert_keeps_env_and_rejects_duplicates() {
+        let edited = edit_text("", |doc| {
+            upsert_mcp_server(
+                doc,
+                &McpServerConfig {
+                    id: "demo".into(),
+                    command: "server".into(),
+                    args: vec!["--stdio".into()],
+                    env: HashMap::from([("TOKEN".into(), "secret".into())]),
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+        assert!(edited.contains("transport = \"stdio\""));
+        assert!(edited.contains("env = { TOKEN = \"secret\" }"));
+
+        let kept = edit_text(&edited, |doc| {
+            upsert_mcp_server(
+                doc,
+                &McpServerConfig {
+                    id: "demo".into(),
+                    command: "server-v2".into(),
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+        assert!(kept.contains("command = \"server-v2\""));
+        assert!(kept.contains("TOKEN"), "update must not drop existing env: {kept}");
+
+        let duplicate = "[[mcp_servers]]\nid = \"dup\"\n[[mcp_servers]]\nid = \"dup\"\n";
+        assert!(edit_text(duplicate, |doc| remove_mcp_server(doc, "dup")).is_err());
     }
 }
