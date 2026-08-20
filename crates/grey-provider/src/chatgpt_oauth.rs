@@ -1,7 +1,7 @@
 //! Native ChatGPT subscription OAuth and secure token lifecycle.
 
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -88,7 +88,9 @@ impl LoginAttempt {
             .append_pair("code_challenge", &self.code_challenge)
             .append_pair("code_challenge_method", "S256")
             .append_pair("state", &self.state)
-            .append_pair("originator", ORIGINATOR);
+            .append_pair("originator", ORIGINATOR)
+            .append_pair("id_token_add_organizations", "true")
+            .append_pair("codex_cli_simplified_flow", "true");
         url
     }
 
@@ -116,7 +118,17 @@ fn pkce_challenge(verifier: &str) -> String {
 pub struct ChatgptOauth {
     store: CredentialStore,
     exchange: Arc<dyn TokenExchange>,
-    refresh_lock: Arc<Mutex<()>>,
+    credential_lock: Arc<Mutex<()>>,
+}
+
+/// Serializes lifecycle writes to the one process-wide keyring entry.
+///
+/// A mutation linearizes when it acquires this lock. Login and refresh keep it
+/// through token exchange and replacement, so a later logout cannot be followed
+/// by a stale replacement from either operation.
+fn credential_coordinator() -> Arc<Mutex<()>> {
+    static COORDINATOR: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
+    Arc::clone(COORDINATOR.get_or_init(|| Arc::new(Mutex::new(()))))
 }
 
 impl ChatgptOauth {
@@ -128,7 +140,7 @@ impl ChatgptOauth {
         Ok(Self {
             store: CredentialStore::new(Arc::new(OsKeyringBackend)),
             exchange: Arc::new(HttpTokenExchange { client }),
-            refresh_lock: Arc::new(Mutex::new(())),
+            credential_lock: credential_coordinator(),
         })
     }
 
@@ -148,12 +160,14 @@ impl ChatgptOauth {
         )
         .await?;
         let form = authorization_code_form(&code, &pending.attempt);
+        let _guard = self.credential_lock.lock().await;
         let value = self.exchange.exchange(form).await?;
         let token = token_from_response(&value, None)?;
         self.store.replace(&token).await
     }
 
     pub async fn logout(&self) -> Result<()> {
+        let _guard = self.credential_lock.lock().await;
         self.store.delete().await
     }
 
@@ -198,7 +212,7 @@ impl ChatgptOauth {
     }
 
     async fn refresh_if_current(&self, observed_access_token: &str) -> Result<AccessGrant> {
-        let _guard = self.refresh_lock.lock().await;
+        let _guard = self.credential_lock.lock().await;
         let current = self.store.load().await?.ok_or_else(|| {
             ProviderFailure::new(
                 ProviderFailureKind::Auth,
@@ -555,11 +569,18 @@ async fn handle_callback_connection(
         "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
         html.len()
     );
-    stream
-        .write_all(response.as_bytes())
-        .await
-        .context("writing ChatGPT OAuth callback response")?;
-    parsed
+    let write_result = stream.write_all(response.as_bytes()).await;
+    callback_outcome(parsed, write_result)
+}
+
+fn callback_outcome(parsed: Result<String>, write_result: std::io::Result<()>) -> Result<String> {
+    match parsed {
+        Ok(code) => Ok(code),
+        Err(validation_error) => {
+            write_result.context("writing ChatGPT OAuth callback response")?;
+            Err(validation_error)
+        }
+    }
 }
 
 async fn read_callback_request(stream: &mut TcpStream) -> Result<Vec<u8>> {
@@ -727,6 +748,21 @@ mod tests {
         }
     }
 
+    struct BlockingExchange {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        response: Value,
+    }
+
+    #[async_trait]
+    impl TokenExchange for BlockingExchange {
+        async fn exchange(&self, _form: Vec<(String, String)>) -> Result<Value> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(self.response.clone())
+        }
+    }
+
     fn token(access: &str, refresh: Option<&str>, expires_at: u64) -> TokenCredential {
         TokenCredential {
             access_token: access.into(),
@@ -775,7 +811,16 @@ mod tests {
         assert_eq!(query["code_challenge_method"], "S256");
         assert_eq!(query["state"], "state");
         assert_eq!(query["originator"], ORIGINATOR);
+        assert_eq!(query["id_token_add_organizations"], "true");
+        assert_eq!(query["codex_cli_simplified_flow"], "true");
         assert!(LoginAttempt::from_parts(1456, "v", "c", "s").is_err());
+    }
+
+    #[test]
+    fn production_instances_share_one_credential_coordinator() {
+        let first = ChatgptOauth::new().unwrap();
+        let second = ChatgptOauth::new().unwrap();
+        assert!(Arc::ptr_eq(&first.credential_lock, &second.credential_lock));
     }
 
     #[test]
@@ -859,7 +904,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 response: json!({}),
             }),
-            refresh_lock: Arc::new(Mutex::new(())),
+            credential_lock: Arc::new(Mutex::new(())),
         };
         let error = match oauth.access().await {
             Ok(_) => panic!("missing credential unexpectedly produced an access grant"),
@@ -882,7 +927,7 @@ mod tests {
         let oauth = ChatgptOauth {
             store: CredentialStore::new(backend.clone()),
             exchange: exchange.clone(),
-            refresh_lock: Arc::new(Mutex::new(())),
+            credential_lock: Arc::new(Mutex::new(())),
         };
 
         let mut joins = Vec::new();
@@ -909,6 +954,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn logout_linearizes_after_inflight_refresh_without_resurrecting_token() {
+        let old = token("access-old", Some("refresh-old"), unix_now() + 30);
+        let backend = Arc::new(FakeBackend::with_token(&old));
+        let coordinator = Arc::new(Mutex::new(()));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let refresh = ChatgptOauth {
+            store: CredentialStore::new(backend.clone()),
+            exchange: Arc::new(BlockingExchange {
+                started: started.clone(),
+                release: release.clone(),
+                response: json!({"access_token":"access-new","expires_in":3600}),
+            }),
+            credential_lock: coordinator.clone(),
+        };
+        let logout = ChatgptOauth {
+            store: CredentialStore::new(backend.clone()),
+            exchange: Arc::new(FakeExchange {
+                calls: AtomicUsize::new(0),
+                response: json!({}),
+            }),
+            credential_lock: coordinator,
+        };
+
+        let refresh_task = tokio::spawn(async move { refresh.access().await });
+        started.notified().await;
+        let mut logout_task = tokio::spawn(async move { logout.logout().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut logout_task)
+                .await
+                .is_err()
+        );
+        release.notify_one();
+        refresh_task.await.unwrap().unwrap();
+        logout_task.await.unwrap().unwrap();
+        assert!(CredentialStore::new(backend)
+            .load()
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn complete_login_exchange_and_replace_use_the_credential_coordinator() {
+        let backend = Arc::new(FakeBackend {
+            value: StdMutex::new(None),
+            fail_replace: StdMutex::new(false),
+            deletes: AtomicUsize::new(0),
+        });
+        let coordinator = Arc::new(Mutex::new(()));
+        let exchange = Arc::new(FakeExchange {
+            calls: AtomicUsize::new(0),
+            response: json!({
+                "access_token":id_token("acct-login"),
+                "refresh_token":"refresh-login",
+                "expires_in":3600
+            }),
+        });
+        let oauth = ChatgptOauth {
+            store: CredentialStore::new(backend.clone()),
+            exchange: exchange.clone(),
+            credential_lock: coordinator.clone(),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let pending = PendingLogin {
+            listener,
+            attempt: LoginAttempt::from_parts(1455, "verifier", "challenge", "state").unwrap(),
+        };
+        let guard = coordinator.lock().await;
+        let mut login_task = tokio::spawn(async move { oauth.complete_login(pending).await });
+        let mut socket = TcpStream::connect(address).await.unwrap();
+        socket
+            .write_all(b"GET /auth/callback?code=code&state=state HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut login_task)
+                .await
+                .is_err()
+        );
+        assert_eq!(exchange.calls.load(Ordering::SeqCst), 0);
+        drop(guard);
+        login_task.await.unwrap().unwrap();
+        assert_eq!(
+            CredentialStore::new(backend)
+                .load()
+                .await
+                .unwrap()
+                .unwrap()
+                .account_id,
+            "acct-login"
+        );
+    }
+
+    #[tokio::test]
     async fn unauthorized_refreshes_and_retries_once_while_forbidden_stops() {
         for (first_status, expected_sends, expected_refreshes) in [
             (reqwest::StatusCode::UNAUTHORIZED, 2, 1),
@@ -923,7 +1064,7 @@ mod tests {
             let oauth = ChatgptOauth {
                 store: CredentialStore::new(backend),
                 exchange: exchange.clone(),
-                refresh_lock: Arc::new(Mutex::new(())),
+                credential_lock: Arc::new(Mutex::new(())),
             };
             let sends = Arc::new(AtomicUsize::new(0));
             let result = oauth
@@ -1032,6 +1173,19 @@ mod tests {
         let html = callback_html("<script>alert('x')</script>");
         assert!(!html.contains("<script>"));
         assert!(html.len() <= MAX_HTML_BYTES);
+    }
+
+    #[test]
+    fn validated_callback_code_survives_html_write_failure() {
+        let outcome = callback_outcome(
+            Ok("verified-code".to_string()),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "browser closed",
+            )),
+        )
+        .unwrap();
+        assert_eq!(outcome, "verified-code");
     }
 
     fn decode_urlsafe(value: &str) -> Vec<u8> {
