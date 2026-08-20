@@ -1367,7 +1367,8 @@ impl AppState {
 
     /// Recompute the maximum scroll from the exact wrapped paragraph height.
     pub fn update_viewport(&mut self, content_width: u16, content_height: u16) {
-        let line_count = Paragraph::new(self.output.as_str())
+        let theme = self.settings.theme.colors.clone();
+        let line_count = Paragraph::new(markdown_text(&self.output, &theme))
             .wrap(Wrap { trim: false })
             .line_count(content_width.max(1));
         self.max_scroll = line_count
@@ -1654,7 +1655,7 @@ fn render(frame: &mut Frame<'_>, state: &mut AppState) {
         .border_style(Style::default().fg(theme.border));
     let conversation_inner = conversation_block.inner(chunks[0]);
     state.update_viewport(conversation_inner.width, conversation_inner.height);
-    let conversation = Paragraph::new(state.output.as_str())
+    let conversation = Paragraph::new(markdown_text(state.output.as_str(), &theme))
         .block(conversation_block)
         .wrap(Wrap { trim: false })
         .scroll((state.scroll, 0));
@@ -1709,6 +1710,140 @@ fn render(frame: &mut Frame<'_>, state: &mut AppState) {
     if state.show_help {
         render_help_overlay(frame, state, &theme);
     }
+}
+
+fn markdown_text(source: &str, theme: &RenderTheme) -> Text<'static> {
+    use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+    let accent = Style::default().fg(theme.accent);
+    let muted = Style::default().fg(theme.muted);
+    let code_style = Style::default().fg(theme.prompt);
+    let mut text = Text::default();
+    let mut line: Vec<Span<'static>> = Vec::new();
+    let mut strong_depth = 0usize;
+    let mut emphasis_depth = 0usize;
+    let mut strike_depth = 0usize;
+    let mut heading_depth = 0usize;
+    let mut code_block: Option<String> = None;
+    let mut list_depth = 0usize;
+    let mut quote_depth = 0usize;
+
+    fn flush(line: &mut Vec<Span<'static>>, text: &mut Text) {
+        if !line.is_empty() {
+            text.push_line(Line::from(std::mem::take(line)));
+        }
+    }
+    fn current_style(
+        theme: &RenderTheme,
+        strong: usize,
+        emphasis: usize,
+        strike: usize,
+        heading: usize,
+        list: usize,
+        quote: usize,
+    ) -> Style {
+        let mut style = Style::default();
+        if heading > 0 || strong > 0 {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        if emphasis > 0 {
+            style = style.add_modifier(Modifier::ITALIC);
+        }
+        if strike > 0 {
+            style = style.add_modifier(Modifier::CROSSED_OUT);
+        }
+        if list > 0 {
+            style = style.fg(theme.accent);
+        }
+        if quote > 0 {
+            style = style.fg(theme.muted);
+        }
+        style
+    }
+
+    for event in Parser::new_ext(source, Options::empty()) {
+        match event {
+            Event::Start(Tag::Heading { .. }) => {
+                flush(&mut line, &mut text);
+                heading_depth += 1;
+                line.push(Span::styled("▍ ", accent));
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                heading_depth = heading_depth.saturating_sub(1);
+                flush(&mut line, &mut text);
+            }
+            Event::Start(Tag::CodeBlock(_)) => {
+                flush(&mut line, &mut text);
+                code_block = Some(String::new());
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                if let Some(code) = code_block.take() {
+                    for code_line in code.lines() {
+                        text.push_line(Line::from(Span::styled(
+                            format!("  {code_line}"),
+                            code_style,
+                        )));
+                    }
+                }
+                flush(&mut line, &mut text);
+            }
+            Event::Start(Tag::BlockQuote(_)) => quote_depth += 1,
+            Event::End(TagEnd::BlockQuote(_)) => quote_depth = quote_depth.saturating_sub(1),
+            Event::Start(Tag::List(_)) => list_depth += 1,
+            Event::End(TagEnd::List(_)) => list_depth = list_depth.saturating_sub(1),
+            Event::Start(Tag::Item) => {
+                flush(&mut line, &mut text);
+                line.push(Span::styled("  • ", accent));
+            }
+            Event::End(TagEnd::Item) => {
+                flush(&mut line, &mut text);
+            }
+            Event::Start(Tag::Strong) => strong_depth += 1,
+            Event::End(TagEnd::Strong) => strong_depth = strong_depth.saturating_sub(1),
+            Event::Start(Tag::Emphasis) => emphasis_depth += 1,
+            Event::End(TagEnd::Emphasis) => emphasis_depth = emphasis_depth.saturating_sub(1),
+            Event::Start(Tag::Strikethrough) => strike_depth += 1,
+            Event::End(TagEnd::Strikethrough) => strike_depth = strike_depth.saturating_sub(1),
+            Event::Start(Tag::Link { .. }) => {
+                line.push(Span::styled("[", accent));
+            }
+            Event::End(TagEnd::Link) => {
+                line.push(Span::styled("]", accent));
+            }
+            Event::Start(Tag::Paragraph) => {}
+            Event::Rule => {
+                flush(&mut line, &mut text);
+                text.push_line(Line::from(Span::styled("────", muted)));
+            }
+            Event::SoftBreak => {
+                flush(&mut line, &mut text);
+            }
+            Event::HardBreak | Event::End(TagEnd::Paragraph) => {
+                flush(&mut line, &mut text);
+            }
+            Event::Text(content) => {
+                if let Some(buffer) = &mut code_block {
+                    buffer.push_str(&content);
+                } else {
+                    let style = current_style(
+                        theme,
+                        strong_depth,
+                        emphasis_depth,
+                        strike_depth,
+                        heading_depth,
+                        list_depth,
+                        quote_depth,
+                    );
+                    line.push(Span::styled(content.to_string(), style));
+                }
+            }
+            Event::Code(content) => {
+                line.push(Span::styled(format!("`{content}`"), code_style));
+            }
+            _ => {}
+        }
+    }
+    flush(&mut line, &mut text);
+    text
 }
 
 fn render_task_line(frame: &mut Frame<'_>, state: &AppState, theme: &RenderTheme, area: Rect) {
@@ -2614,6 +2749,30 @@ mod tests {
             quitting.reduce_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             UiAction::Quit
         );
+    }
+
+    #[test]
+    fn markdown_renders_blocks_and_inline_styles() {
+        let theme = TuiTheme::from_config(&grey_core::TuiThemeConfig::default()).colors;
+        let text = markdown_text(
+            "# Title\n\nSome `code` and **bold**.\n\n```rs\nfn main() {}\n```\n\n- item one\n\n> quoted",
+            &theme,
+        );
+        let rendered: Vec<String> = text
+            .lines
+            .iter()
+            .map(|line| {
+                line.iter()
+                    .map(|span| span.content.as_ref().to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        let joined = rendered.join("\n");
+        assert!(joined.contains("▍ Title"), "heading: {joined:?}");
+        assert!(joined.contains("`code`"), "inline code: {joined:?}");
+        assert!(joined.contains("  fn main() {}"), "code block: {joined:?}");
+        assert!(joined.contains("• item one"), "list item: {joined:?}");
+        assert!(joined.contains("quoted"), "blockquote text: {joined:?}");
     }
 
     #[test]
