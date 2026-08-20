@@ -1602,6 +1602,7 @@ fn render(frame: &mut Frame<'_>, state: &mut AppState) {
     let input_lines = state.settings.layout.input_lines.max(1);
     let chunks = Layout::vertical([
         Constraint::Min(0),
+        Constraint::Length(1),
         Constraint::Length(input_lines),
         Constraint::Length(1),
     ])
@@ -1619,12 +1620,14 @@ fn render(frame: &mut Frame<'_>, state: &mut AppState) {
         .scroll((state.scroll, 0));
     frame.render_widget(conversation, chunks[0]);
 
+    render_task_line(frame, state, &theme, chunks[1]);
+
     let input_block = Block::default()
         .borders(Borders::ALL)
         .title(" input ")
         .border_style(Style::default().fg(theme.border))
         .style(Style::default().fg(theme.accent));
-    let input_inner = input_block.inner(chunks[1]);
+    let input_inner = input_block.inner(chunks[2]);
     let prompt = Span::styled(
         "> ",
         Style::default()
@@ -1648,7 +1651,7 @@ fn render(frame: &mut Frame<'_>, state: &mut AppState) {
         .style(Style::default().fg(Color::White))
         .wrap(Wrap { trim: false })
         .scroll((state.input_scroll, 0));
-    frame.render_widget(input, chunks[1]);
+    frame.render_widget(input, chunks[2]);
     if input_inner.width > 0 && input_inner.height > 0 {
         let (cursor_column, cursor_row) = state.input_cursor_position(input_width, prompt_width);
         let cursor_row = cursor_row.saturating_sub(usize::from(state.input_scroll));
@@ -1662,14 +1665,29 @@ fn render(frame: &mut Frame<'_>, state: &mut AppState) {
         frame.set_cursor_position((cursor_x, cursor_y));
     }
 
-    render_status_line(frame, state, &theme, chunks[2]);
+    render_status_line(frame, state, &theme, chunks[3]);
     if state.show_help {
         render_help_overlay(frame, state, &theme);
     }
 }
 
+fn render_task_line(frame: &mut Frame<'_>, state: &AppState, theme: &RenderTheme, area: Rect) {
+    let line = Line::from(vec![
+        Span::styled(
+            " task: ",
+            Style::default()
+                .fg(theme.status_fg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            state.current_task_label(),
+            Style::default().fg(theme.status_fg),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
 fn render_status_line(frame: &mut Frame<'_>, state: &AppState, theme: &RenderTheme, area: Rect) {
-    let stats = state.frame_stats();
     let labels = state.settings.keys.labels();
     let (total_input_tokens, total_output_tokens) = state.total_usage();
     let (provider_label, model_label) = state
@@ -1677,28 +1695,15 @@ fn render_status_line(frame: &mut Frame<'_>, state: &AppState, theme: &RenderThe
         .map_or(("-", "-"), |(provider, model)| (provider, model));
     let status = Line::from(vec![
         Span::styled(
-            " GREY ",
-            Style::default()
-                .fg(theme.status_fg)
-                .bg(theme.status_bg)
-                .add_modifier(Modifier::BOLD),
+            format!(" model:{provider_label}/{model_label} "),
+            Style::default().fg(theme.status_fg),
         ),
-        Span::raw(format!(
-            " {:5.1}ms {:4.0}fps frames:{} scroll {}/{} ",
-            stats.ema_frame_ms(),
-            stats.fps(),
-            stats.frames(),
-            state.scroll,
-            state.max_scroll,
-        )),
         Span::styled(
-            format!(
-                " task:{} model:{provider_label}/{model_label} branch:{} i:{} o:{} ",
-                state.current_task_label(),
-                state.branch_label(),
-                total_input_tokens,
-                total_output_tokens
-            ),
+            format!(" branch:{} ", state.branch_label()),
+            Style::default().fg(theme.status_fg),
+        ),
+        Span::styled(
+            format!(" i:{total_input_tokens} o:{total_output_tokens} "),
             Style::default().fg(theme.status_fg),
         ),
         if state.status_has_error() {
@@ -2287,7 +2292,9 @@ mod tests {
         assert_eq!(state.scroll(), 5);
         assert!(state.follows_output());
 
-        let backend = TestBackend::new(30, 10);
+        // 11 rows: 1 task + 3 input + 1 status leaves the conversation
+        // inner area 4 rows tall, matching the viewport used above.
+        let backend = TestBackend::new(30, 11);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
         let tail_row: String = terminal.backend().buffer().content[31..59]
@@ -2386,6 +2393,50 @@ mod tests {
         assert!(theme_config_is_valid(&config.theme));
         config.theme.overrides.error = Some("not-a-colour".into());
         assert!(!theme_config_is_valid(&config.theme));
+    }
+
+    fn rendered_rows(terminal: &Terminal<TestBackend>) -> Vec<String> {
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+        buffer
+            .content
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect()
+    }
+
+    #[test]
+    fn task_line_sits_above_input_and_status_is_decluttered() {
+        let mut state = AppState {
+            current_task: Some("refactor parser".into()),
+            ..Default::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        let rows = rendered_rows(&terminal);
+        let task_index = rows
+            .iter()
+            .position(|row| row.contains("task: refactor parser"))
+            .expect("task line rendered");
+        let prompt_index = rows
+            .iter()
+            .position(|row| row.contains("> "))
+            .expect("input prompt rendered");
+        let status_index = rows
+            .iter()
+            .position(|row| row.contains("model:") && row.contains("branch:"))
+            .expect("status bar rendered");
+        assert!(task_index < prompt_index, "task line above input");
+        assert!(prompt_index < status_index, "status below input");
+        assert!(
+            rows.iter()
+                .all(|row| !row.contains("fps") && !row.contains("GREY")),
+            "status bar is decluttered"
+        );
+        assert!(
+            rows[status_index].contains(" [OK] "),
+            "status keeps error indicator"
+        );
     }
 
     #[test]
