@@ -1,10 +1,12 @@
-# Grey
+<p align="center">
+  <img src="docs/assets/grey-logo-transparent.png" alt="Grey" height="170" />
+</p>
 
-> 一个轻量、高性能、可扩展的 Coding Agent Harness
-> 默认极简，一切按需扩展。快是特性，省是特性，顺是特性。
+<h1 align="center">Grey</h1>
 
 <p align="center">
-  <img src="docs/assets/grey-logo-transparent.png" alt="Grey" width="128" />
+  <em>一个轻量、高性能、可扩展的 Coding Agent Harness<br/>
+  默认极简，一切按需扩展。快是特性，省是特性，顺是特性。</em>
 </p>
 
 <p align="center">
@@ -14,6 +16,17 @@
   <img src="https://img.shields.io/badge/rust-1.97.1-orange" alt="Rust" />
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey" alt="Platform" />
 </p>
+
+<div align="center">
+  <a href="#快速开始">快速开始</a>
+  <span>&nbsp;&nbsp;•&nbsp;&nbsp;</span>
+  <a href="https://github.com/VonLan233/Grey/releases">Releases</a>
+  <span>&nbsp;&nbsp;•&nbsp;&nbsp;</span>
+  <a href="docs/阶段性开发文档.md">路线图</a>
+  <span>&nbsp;&nbsp;•&nbsp;&nbsp;</span>
+  <a href="LICENSE">License</a>
+  <br />
+</div>
 
 Grey 是一个用 Rust 写的 Coding Agent Harness：同一套 Core 同时服务单发 CLI 与交互式 TUI，
 模型可以流式回答、调用工作区工具、接收结果并继续推理，会话持久化到 SQLite。
