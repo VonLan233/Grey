@@ -35,6 +35,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use tokio::sync::{mpsc, watch};
+use unicode_width::UnicodeWidthChar;
 use unicode_width::UnicodeWidthStr;
 
 const DEMO_REPLY: &str = "Grey 是一个轻量、高性能、可扩展的代码 Agent Harness。\n\n这是 Spike A 的模拟流式输出：消息按小块持续流入 TUI 并增量渲染，状态栏实时显示帧耗时与渲染频率。输入内容后回车会触发一轮新的模拟回复，Esc、Ctrl-C 或空输入时按 q 退出。";
@@ -600,16 +601,85 @@ impl InputBuffer {
     }
 
     fn move_home(&mut self) -> bool {
-        let changed = self.cursor_chars != 0;
-        self.cursor_chars = 0;
-        changed
+        let line = self.cursor_line();
+        self.move_to(line, 0)
     }
 
     fn move_end(&mut self) -> bool {
-        let end = self.text.chars().count();
-        let changed = self.cursor_chars != end;
-        self.cursor_chars = end;
-        changed
+        let line = self.cursor_line();
+        let line_len = self.line_len(line);
+        self.move_to(line, line_len)
+    }
+
+    fn move_up(&mut self) -> bool {
+        let line = self.cursor_line();
+        if line == 0 {
+            return false;
+        }
+        self.move_to(line - 1, self.cursor_col())
+    }
+
+    fn move_down(&mut self) -> bool {
+        let line = self.cursor_line();
+        if line + 1 >= self.line_count() {
+            return false;
+        }
+        self.move_to(line + 1, self.cursor_col())
+    }
+
+    fn insert_newline(&mut self) -> bool {
+        self.insert('\n');
+        true
+    }
+
+    /// Pi-style fallback: a trailing `\` before Enter becomes a newline instead
+    /// of submitting, for terminals that cannot send Shift+Enter distinctly.
+    fn trailing_backslash_escape(&mut self) -> bool {
+        if self.cursor_chars == 0 || !self.text.ends_with('\\') {
+            return false;
+        }
+        self.text.pop();
+        self.cursor_chars -= 1;
+        self.insert_newline()
+    }
+
+    fn line_count(&self) -> usize {
+        self.text.matches('\n').count() + 1
+    }
+
+    fn cursor_line(&self) -> usize {
+        self.text[..self.cursor_byte()].matches('\n').count()
+    }
+
+    fn cursor_col(&self) -> usize {
+        self.text[..self.cursor_byte()]
+            .rsplit('\n')
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .count()
+    }
+
+    fn line_len(&self, line: usize) -> usize {
+        self.text
+            .split('\n')
+            .nth(line)
+            .map(|content| content.chars().count())
+            .unwrap_or(0)
+    }
+
+    fn move_to(&mut self, line: usize, column: usize) -> bool {
+        let lines: Vec<&str> = self.text.split('\n').collect();
+        let line = line.min(lines.len().saturating_sub(1));
+        let column = column.min(lines[line].chars().count());
+        let prefix_chars: usize = lines[..line]
+            .iter()
+            .map(|content| content.chars().count())
+            .sum();
+        let target = prefix_chars + line + column;
+        let old = self.cursor_chars;
+        self.cursor_chars = target.min(self.text.chars().count());
+        old != self.cursor_chars
     }
 
     fn take(&mut self) -> String {
@@ -635,6 +705,23 @@ fn next_char_byte(text: &str, start: usize) -> usize {
         .char_indices()
         .nth(1)
         .map_or(text.len(), |(relative, _)| start + relative)
+}
+
+fn input_wrapped_rows(content: &str, width: usize) -> usize {
+    if width == 0 {
+        return content.chars().count().saturating_add(1);
+    }
+    let mut rows = 1usize;
+    let mut column = 0usize;
+    for character in content.chars() {
+        let character_width = character.width().unwrap_or(0);
+        if column + character_width > width {
+            rows += 1;
+            column = 0;
+        }
+        column += character_width;
+    }
+    rows
 }
 
 /// Measurements for frames that were actually drawn.
@@ -705,6 +792,7 @@ pub struct AppState {
     scroll: u16,
     max_scroll: u16,
     follow_output: bool,
+    input_scroll: u16,
     dirty: bool,
     frame_stats: FrameStats,
     settings: TuiSettings,
@@ -735,6 +823,7 @@ impl Default for AppState {
             scroll: 0,
             max_scroll: 0,
             follow_output: true,
+            input_scroll: 0,
             dirty: true,
             frame_stats: FrameStats::default(),
             settings: TuiSettings::default(),
@@ -954,6 +1043,45 @@ impl AppState {
         self.input.cursor_display_column()
     }
 
+    /// (column, row) of the cursor inside the wrapped input text. The first
+    /// logical line renders with a `> ` prefix, so it wraps at `width -
+    /// prompt_width`; later lines wrap at `width`.
+    pub fn input_cursor_position(&self, width: usize, prompt_width: usize) -> (usize, usize) {
+        let text = self.input.text.as_str();
+        let cursor_byte = self.input.cursor_byte();
+        let before = &text[..cursor_byte];
+        let column = match before.rfind('\n') {
+            Some(last) => UnicodeWidthStr::width(&before[last + 1..]),
+            None => UnicodeWidthStr::width(before),
+        };
+        let row = match before.rfind('\n') {
+            Some(last) => before[..=last].split_inclusive('\n').enumerate().fold(
+                0usize,
+                |row, (index, line)| {
+                    let content = line.trim_end_matches('\n');
+                    let effective_width = if index == 0 {
+                        width.saturating_sub(prompt_width)
+                    } else {
+                        width
+                    };
+                    row.saturating_add(input_wrapped_rows(content, effective_width))
+                },
+            ),
+            None => 0,
+        };
+        (column, row)
+    }
+
+    /// Scroll the input so the cursor's wrapped row stays visible.
+    pub fn input_scroll(&mut self, width: usize, prompt_width: usize, visible_rows: usize) {
+        let (_, cursor_row) = self.input_cursor_position(width, prompt_width);
+        if cursor_row >= visible_rows {
+            self.input_scroll = (cursor_row - visible_rows + 1) as u16;
+        } else {
+            self.input_scroll = 0;
+        }
+    }
+
     /// Reduce one terminal key event into state and, optionally, an action.
     pub fn reduce_key(&mut self, key: KeyEvent) -> UiAction {
         if key.kind == KeyEventKind::Release {
@@ -1051,9 +1179,21 @@ impl AppState {
             KeyCode::Delete => self.input.delete(),
             KeyCode::Left => self.input.move_left(),
             KeyCode::Right => self.input.move_right(),
+            KeyCode::Up => self.input.move_up(),
+            KeyCode::Down => self.input.move_down(),
             KeyCode::Home => self.input.move_home(),
             KeyCode::End => self.input.move_end(),
             KeyCode::Enter => {
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+                {
+                    self.input.insert_newline();
+                    return UiAction::None;
+                }
+                if self.input.trailing_backslash_escape() {
+                    return UiAction::None;
+                }
                 if self.turn_started_at.is_some() {
                     self.note_prompt_busy(None);
                     return UiAction::None;
@@ -1491,21 +1631,35 @@ fn render(frame: &mut Frame<'_>, state: &mut AppState) {
             .fg(theme.prompt)
             .add_modifier(Modifier::BOLD),
     );
-    let input = Paragraph::new(Line::from(vec![
-        prompt,
-        Span::raw(state.input.text.as_str()),
-    ]))
-    .block(input_block)
-    .style(Style::default().fg(Color::White));
+    let prompt_width = UnicodeWidthStr::width("> ");
+    let input_width = usize::from(input_inner.width);
+    let input_visible_rows = usize::from(input_inner.height);
+    state.input_scroll(input_width, prompt_width, input_visible_rows);
+    let mut input_text = Text::default();
+    let mut input_lines = state.input.text.split('\n');
+    if let Some(first) = input_lines.next() {
+        input_text.push_line(Line::from(vec![prompt, Span::raw(first)]));
+    }
+    for rest in input_lines {
+        input_text.push_line(Line::from(Span::raw(rest)));
+    }
+    let input = Paragraph::new(input_text)
+        .block(input_block)
+        .style(Style::default().fg(Color::White))
+        .wrap(Wrap { trim: false })
+        .scroll((state.input_scroll, 0));
     frame.render_widget(input, chunks[1]);
     if input_inner.width > 0 && input_inner.height > 0 {
-        let prompt_width = UnicodeWidthStr::width("> ");
-        let cursor_offset = prompt_width.saturating_add(state.input_cursor_column());
-        let cursor_x = input_inner
-            .x
-            .saturating_add(cursor_offset.min(usize::from(u16::MAX)) as u16)
-            .min(input_inner.right().saturating_sub(1));
-        frame.set_cursor_position((cursor_x, input_inner.y));
+        let (cursor_column, cursor_row) = state.input_cursor_position(input_width, prompt_width);
+        let cursor_row = cursor_row.saturating_sub(usize::from(state.input_scroll));
+        let cursor_y = input_inner.y.saturating_add(
+            cursor_row.min(usize::from(input_inner.height.saturating_sub(1))) as u16,
+        );
+        let cursor_x = input_inner.x.saturating_add(
+            (prompt_width + cursor_column).min(usize::from(input_inner.width.saturating_sub(1)))
+                as u16,
+        );
+        frame.set_cursor_position((cursor_x, cursor_y));
     }
 
     render_status_line(frame, state, &theme, chunks[2]);
@@ -1841,6 +1995,10 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    fn key_with(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
     fn model_switch() -> watch::Sender<Option<String>> {
         let (sender, _) = watch::channel(None);
         sender
@@ -1976,6 +2134,68 @@ mod tests {
             }
         );
         assert_eq!(Command::parse("/wat"), Command::Unknown("wat".into()));
+    }
+
+    #[test]
+    fn multiline_input_supports_newlines_and_line_navigation() {
+        let mut state = AppState::default();
+        type_text(&mut state, "first");
+        assert_eq!(
+            state.reduce_key(key_with(KeyCode::Enter, KeyModifiers::SHIFT)),
+            UiAction::None
+        );
+        type_text(&mut state, "second");
+        assert_eq!(state.input(), "first\nsecond");
+
+        assert_eq!(
+            state.reduce_key(key_with(KeyCode::Enter, KeyModifiers::ALT)),
+            UiAction::None
+        );
+        type_text(&mut state, "third");
+        assert_eq!(state.input(), "first\nsecond\nthird");
+        assert_eq!(state.input_cursor_position(100, 2), (5, 2));
+
+        assert_eq!(state.reduce_key(key(KeyCode::Up)), UiAction::None);
+        assert_eq!(state.input_cursor_position(100, 2), (5, 1));
+        assert_eq!(state.reduce_key(key(KeyCode::Up)), UiAction::None);
+        assert_eq!(state.input_cursor_position(100, 2), (5, 0));
+        assert_eq!(state.reduce_key(key(KeyCode::Up)), UiAction::None);
+
+        assert_eq!(state.reduce_key(key(KeyCode::Home)), UiAction::None);
+        assert_eq!(state.input_cursor_position(100, 2), (0, 0));
+        assert_eq!(state.reduce_key(key(KeyCode::End)), UiAction::None);
+        assert_eq!(state.input_cursor_position(100, 2), (5, 0));
+
+        assert_eq!(
+            state.reduce_key(key(KeyCode::Enter)),
+            UiAction::Submit {
+                prompt: "first\nsecond\nthird".into(),
+                rejected_input: "first\nsecond\nthird".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn trailing_backslash_enters_newline_instead_of_submitting() {
+        let mut state = AppState::default();
+        type_text(&mut state, "path/to\\");
+        assert_eq!(state.reduce_key(key(KeyCode::Enter)), UiAction::None);
+        assert_eq!(state.input(), "path/to\n");
+        assert_eq!(
+            state.reduce_key(key(KeyCode::Enter)),
+            UiAction::Submit {
+                prompt: "path/to".into(),
+                rejected_input: "path/to\n".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn multiline_cursor_position_wraps_long_first_line() {
+        let mut state = AppState::default();
+        type_text(&mut state, "01234567890123456789012345\nsecond");
+        // width 10, prompt 2: first line effective width 8 -> 4 wrapped rows
+        assert_eq!(state.input_cursor_position(10, 2), (6, 4));
     }
 
     #[test]
