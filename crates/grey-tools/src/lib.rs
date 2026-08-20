@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use globset::{Glob, GlobMatcher};
 use grey_core::{
     process::{run_bounded, CommandSpec},
-    HookEvent, HookPayload, HookRunner, HookTool, McpToolConfig, PluginConfig, ToolCall,
-    ToolDefinition, ToolExecutor, ToolResult, ToolRisk,
+    HookEvent, HookPayload, HookRunner, HookTool, McpToolConfig, PluginConfig, PluginRuntime,
+    RuntimeConfig, ToolCall, ToolDefinition, ToolExecutor, ToolResult, ToolRisk, WasmPlugin,
 };
 use ignore::WalkBuilder;
 use regex::Regex;
@@ -719,6 +719,7 @@ struct PluginTool {
     description: String,
     timeout_ms: Option<u64>,
     risk: ToolRisk,
+    wasm: Option<WasmPlugin>,
 }
 
 #[derive(Clone)]
@@ -734,6 +735,23 @@ impl PluginTools {
         configured: Vec<PluginConfig>,
         approver: Arc<dyn Approver>,
     ) -> Self {
+        Self::new_with_runtime(
+            workspace,
+            configured,
+            approver,
+            &RuntimeConfig::default(),
+            workspace,
+        )
+        .expect("command plugin configuration must be valid")
+    }
+
+    pub fn new_with_runtime(
+        workspace: &Path,
+        configured: Vec<PluginConfig>,
+        approver: Arc<dyn Approver>,
+        runtime: &RuntimeConfig,
+        config_dir: &Path,
+    ) -> Result<Self> {
         let workspace = workspace.to_path_buf();
         let tools = configured
             .into_iter()
@@ -741,14 +759,27 @@ impl PluginTools {
                 plugin.enabled
                     && matches!(plugin.kind, grey_core::PluginKind::Tool)
                     && !plugin.id.trim().is_empty()
-                    && !plugin.command.trim().is_empty()
             })
-            .map(|plugin| {
+            .map(|plugin| -> Result<_> {
+                let wasm = if plugin.runtime == PluginRuntime::Wasm {
+                    Some(
+                        WasmPlugin::from_config(&plugin, config_dir, runtime).map_err(|error| {
+                            anyhow::anyhow!("invalid wasm tool plugin `{}`: {error}", plugin.id)
+                        })?,
+                    )
+                } else {
+                    anyhow::ensure!(
+                        !plugin.command.trim().is_empty(),
+                        "tool plugin `{}` has no command",
+                        plugin.id
+                    );
+                    None
+                };
                 let name = plugin
                     .name
                     .filter(|name| !name.trim().is_empty())
                     .unwrap_or_else(|| plugin.id.clone());
-                PluginTool {
+                Ok(PluginTool {
                     id: plugin.id,
                     name,
                     command: plugin.command,
@@ -758,14 +789,15 @@ impl PluginTools {
                         .unwrap_or_else(|| "Plugin tool".to_string()),
                     timeout_ms: plugin.timeout_ms,
                     risk: ToolRisk::Execute,
-                }
+                    wasm,
+                })
             })
-            .collect();
-        Self {
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
             workspace,
             approver,
             tools,
-        }
+        })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -809,15 +841,25 @@ impl ToolExecutor for PluginTools {
         })
         .to_string();
 
-        let raw = match execute_command_in_dir(
-            &tool.command,
-            &tool.args,
-            Some(&request),
-            tool.timeout_ms.unwrap_or(DEFAULT_TOOL_TIMEOUT),
-            &self.workspace,
-        )
-        .await
-        {
+        let raw_result: Result<String> = if let Some(wasm) = &tool.wasm {
+            match wasm.invoke(request.into_bytes()).await {
+                Ok(output) if output.stdout_truncated || output.stderr_truncated => Err(
+                    anyhow::anyhow!("wasm plugin output exceeds configured limit"),
+                ),
+                Ok(output) => String::from_utf8(output.stdout).map_err(Into::into),
+                Err(error) => Err(error.into()),
+            }
+        } else {
+            execute_command_in_dir(
+                &tool.command,
+                &tool.args,
+                Some(&request),
+                tool.timeout_ms.unwrap_or(DEFAULT_TOOL_TIMEOUT),
+                &self.workspace,
+            )
+            .await
+        };
+        let raw = match raw_result {
             Ok(output) => output,
             Err(error) => {
                 return ToolResult::failure(

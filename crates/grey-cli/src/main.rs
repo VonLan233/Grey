@@ -17,7 +17,7 @@ use grey_core::{
     process::{run_bounded, CommandSpec, DEFAULT_STDIN_LIMIT},
     Agent, AgentEvent, AgentOptions, AgentOutcome, CharApproxCounter, ChatMessage, ChatRequest,
     ContextManager, GreyConfig, HookEvent, HookPayload, HookRunner, PluginConfig, PluginKind,
-    Provider, Role, Session, SessionStore, SummaryEngine, ToolExecutor,
+    PluginRuntime, Provider, Role, Session, SessionStore, SummaryEngine, ToolExecutor, WasmPlugin,
 };
 use grey_provider::chatgpt_oauth::ChatgptOauth;
 use grey_provider::router::{enabled_provider_plugins, ProviderRouter};
@@ -1958,7 +1958,13 @@ fn build_agent_and_session(
     if !mcp.is_empty() {
         executors.push(Arc::new(mcp));
     }
-    let plugin_tools = PluginTools::new(workspace, config.plugins.clone(), Arc::new(AlwaysApprove));
+    let plugin_tools = PluginTools::new_with_runtime(
+        workspace,
+        config.plugins.clone(),
+        Arc::new(AlwaysApprove),
+        &config.runtime,
+        &config.plugin_config_dir,
+    )?;
     if !plugin_tools.is_empty() {
         executors.push(Arc::new(plugin_tools));
     }
@@ -2625,7 +2631,7 @@ async fn resolve_theme_plugin_config(
     let Some(plugin) = config.plugins.iter().find(|plugin| plugin.id == plugin_id) else {
         return Ok(config.tui.clone());
     };
-    if !plugin.enabled || plugin.kind != PluginKind::Theme || plugin.command.trim().is_empty() {
+    if !plugin.enabled || plugin.kind != PluginKind::Theme {
         return Ok(config.tui.clone());
     }
 
@@ -2642,27 +2648,49 @@ async fn resolve_theme_plugin_config(
     if stdin.len() > config.runtime.response_max_bytes.min(DEFAULT_STDIN_LIMIT) {
         return Ok(config.tui.clone());
     }
-    let output = run_bounded(
-        CommandSpec::direct(&plugin.command, plugin.args.iter().cloned())
-            .current_dir(workspace)
-            .env("GREY_PLUGIN_PROTOCOL", "grey.command-theme.v1")
-            .env("GREY_PLUGIN_KIND", "theme")
-            .env("GREY_PLUGIN_THEME_ID", &plugin.id)
-            .stdin(stdin)
-            .timeout(Duration::from_millis(
-                plugin.timeout_ms.unwrap_or(DEFAULT_THEME_PLUGIN_TIMEOUT_MS),
-            ))
-            .stdout_limit(config.runtime.command_stdout_max_bytes)
-            .stderr_limit(config.runtime.command_stderr_max_bytes),
-    )
-    .await;
-    let Ok(output) = output else {
-        return Ok(config.tui.clone());
+    let stdout = match plugin.runtime {
+        PluginRuntime::Command => {
+            if plugin.command.trim().is_empty() {
+                return Ok(config.tui.clone());
+            }
+            let output = run_bounded(
+                CommandSpec::direct(&plugin.command, plugin.args.iter().cloned())
+                    .current_dir(workspace)
+                    .env("GREY_PLUGIN_PROTOCOL", "grey.command-theme.v1")
+                    .env("GREY_PLUGIN_KIND", "theme")
+                    .env("GREY_PLUGIN_THEME_ID", &plugin.id)
+                    .stdin(stdin)
+                    .timeout(Duration::from_millis(
+                        plugin.timeout_ms.unwrap_or(DEFAULT_THEME_PLUGIN_TIMEOUT_MS),
+                    ))
+                    .stdout_limit(config.runtime.command_stdout_max_bytes)
+                    .stderr_limit(config.runtime.command_stderr_max_bytes),
+            )
+            .await;
+            let Ok(output) = output else {
+                return Ok(config.tui.clone());
+            };
+            if !output.status.success() || output.stdout_truncated || output.stderr_truncated {
+                return Ok(config.tui.clone());
+            }
+            output.stdout
+        }
+        PluginRuntime::Wasm => {
+            let Ok(wasm) =
+                WasmPlugin::from_config(plugin, &config.plugin_config_dir, &config.runtime)
+            else {
+                return Ok(config.tui.clone());
+            };
+            let Ok(output) = wasm.invoke(stdin).await else {
+                return Ok(config.tui.clone());
+            };
+            if output.stdout_truncated || output.stderr_truncated {
+                return Ok(config.tui.clone());
+            }
+            output.stdout
+        }
     };
-    if !output.status.success() || output.stdout_truncated || output.stderr_truncated {
-        return Ok(config.tui.clone());
-    }
-    let Ok(manifest) = serde_json::from_slice::<ThemePluginManifest>(&output.stdout) else {
+    let Ok(manifest) = serde_json::from_slice::<ThemePluginManifest>(&stdout) else {
         return Ok(config.tui.clone());
     };
     if manifest.schema_version != 1 {

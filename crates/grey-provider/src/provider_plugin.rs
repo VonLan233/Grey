@@ -6,8 +6,8 @@ use futures_util::stream;
 use futures_util::stream::BoxStream;
 use grey_core::{
     process::{run_bounded, CommandSpec, DEFAULT_STDIN_LIMIT},
-    ChatRequest, Provider, ProviderEvent, ProviderFailure, ProviderFailureKind, RuntimeConfig,
-    ToolCall, Usage,
+    ChatRequest, PluginConfig, PluginRuntime, Provider, ProviderEvent, ProviderFailure,
+    ProviderFailureKind, RuntimeConfig, ToolCall, Usage, WasmPlugin,
 };
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +24,7 @@ pub struct PluginProvider {
     timeout: Duration,
     runtime: RuntimeConfig,
     workspace: PathBuf,
+    wasm: Option<WasmPlugin>,
 }
 
 impl PluginProvider {
@@ -46,7 +47,44 @@ impl PluginProvider {
             ),
             runtime: runtime.clone(),
             workspace: workspace.into(),
+            wasm: None,
         }
+    }
+
+    pub fn from_plugin(
+        plugin: &PluginConfig,
+        runtime: &RuntimeConfig,
+        workspace: impl Into<PathBuf>,
+        config_dir: &std::path::Path,
+    ) -> anyhow::Result<Self> {
+        if plugin.runtime == PluginRuntime::Command {
+            return Ok(Self::new(
+                &plugin.id,
+                plugin.command.clone(),
+                plugin.args.clone(),
+                plugin.version.clone(),
+                plugin.timeout_ms,
+                runtime,
+                workspace,
+            ));
+        }
+        let wasm = WasmPlugin::from_config(plugin, config_dir, runtime).map_err(|error| {
+            anyhow::anyhow!("invalid wasm provider plugin `{}`: {error}", plugin.id)
+        })?;
+        Ok(Self {
+            id: plugin.id.clone(),
+            command: String::new(),
+            args: Vec::new(),
+            version: plugin.version.clone(),
+            timeout: Duration::from_millis(
+                plugin
+                    .timeout_ms
+                    .unwrap_or(DEFAULT_PROVIDER_PLUGIN_TIMEOUT_MS),
+            ),
+            runtime: runtime.clone(),
+            workspace: workspace.into(),
+            wasm: Some(wasm),
+        })
     }
 
     async fn run_plugin(&self, request: &ChatRequest) -> Result<PluginResponse, ProviderFailure> {
@@ -71,10 +109,33 @@ impl PluginProvider {
             ));
         }
 
-        let output = run_bounded(self.command_spec(payload))
-            .await
-            .map_err(|error| plugin_process_failure(&self.id, error))?;
-        if output.stdout_truncated || output.stderr_truncated {
+        let (stdout, truncated) = if let Some(wasm) = &self.wasm {
+            let output = wasm.invoke(payload).await.map_err(|error| {
+                ProviderFailure::new(
+                    ProviderFailureKind::Protocol,
+                    format!("wasm provider plugin `{}` could not run: {error}", self.id),
+                )
+            })?;
+            (
+                output.stdout,
+                output.stdout_truncated || output.stderr_truncated,
+            )
+        } else {
+            let output = run_bounded(self.command_spec(payload))
+                .await
+                .map_err(|error| plugin_process_failure(&self.id, error))?;
+            if !output.status.success() {
+                return Err(ProviderFailure::new(
+                    ProviderFailureKind::Protocol,
+                    format!("provider plugin `{}` exited unsuccessfully", self.id),
+                ));
+            }
+            (
+                output.stdout,
+                output.stdout_truncated || output.stderr_truncated,
+            )
+        };
+        if truncated {
             return Err(ProviderFailure::new(
                 ProviderFailureKind::Protocol,
                 format!(
@@ -83,19 +144,13 @@ impl PluginProvider {
                 ),
             ));
         }
-        if !output.status.success() {
-            return Err(ProviderFailure::new(
-                ProviderFailureKind::Protocol,
-                format!("provider plugin `{}` exited unsuccessfully", self.id),
-            ));
-        }
-        if output.stdout.len() > self.runtime.response_max_bytes {
+        if stdout.len() > self.runtime.response_max_bytes {
             return Err(ProviderFailure::new(
                 ProviderFailureKind::Protocol,
                 "provider plugin response exceeds configured response limit",
             ));
         }
-        serde_json::from_slice(&output.stdout).map_err(|error| {
+        serde_json::from_slice(&stdout).map_err(|error| {
             ProviderFailure::with_source(
                 ProviderFailureKind::Protocol,
                 format!("provider plugin `{}` returned invalid JSON", self.id),

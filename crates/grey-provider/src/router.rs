@@ -66,15 +66,12 @@ impl ProviderRouter {
             }
             providers.insert(
                 plugin.id.clone(),
-                Arc::new(PluginProvider::new(
-                    &plugin.id,
-                    plugin.command.clone(),
-                    plugin.args.clone(),
-                    plugin.version.clone(),
-                    plugin.timeout_ms,
+                Arc::new(PluginProvider::from_plugin(
+                    &plugin,
                     &cfg.runtime,
                     workspace,
-                )),
+                    &cfg.plugin_config_dir,
+                )?),
             );
         }
         for entry in &cfg.providers {
@@ -341,7 +338,8 @@ pub fn enabled_provider_plugins(plugins: &[PluginConfig]) -> Vec<PluginConfig> {
             plugin.enabled
                 && matches!(plugin.kind, PluginKind::Provider)
                 && !plugin.id.trim().is_empty()
-                && !plugin.command.trim().is_empty()
+                && (plugin.runtime == grey_core::PluginRuntime::Wasm
+                    || !plugin.command.trim().is_empty())
         })
         .cloned()
         .collect()

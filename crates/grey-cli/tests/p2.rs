@@ -221,7 +221,7 @@ enabled = true
 }
 
 #[test]
-fn providers_list_uses_the_same_provider_plugin_eligibility_as_router() {
+fn providers_list_rejects_an_enabled_command_plugin_without_a_command() {
     let env = temp_home();
     let config_dir = env.home.path().join(".config/grey");
     std::fs::create_dir_all(&config_dir).unwrap();
@@ -242,14 +242,8 @@ enabled = true
     )
     .unwrap();
     let output = env.command().args(["providers", "list"]).output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("valid"));
-    assert!(!stdout.contains("empty-command"));
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("must specify command"));
 }
 
 #[test]
