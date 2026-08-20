@@ -6,6 +6,7 @@ pub mod fallback;
 pub mod gemini;
 pub mod mock;
 pub mod openai;
+mod provider_plugin;
 pub mod responses;
 pub mod router;
 mod sse;

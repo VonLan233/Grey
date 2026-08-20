@@ -72,6 +72,326 @@ fn providers_list_shows_configured_providers() {
 }
 
 #[test]
+fn providers_list_includes_provider_plugins() {
+    let env = temp_home();
+    let config_dir = env.home.path().join(".config/grey");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("grey.toml"),
+        r#"
+default_provider = "mock"
+default_model = "m"
+
+[[plugins]]
+id = "provider-plugin"
+kind = "provider"
+command = "printf"
+args = ["{\"schema_version\":1,\"text\":\"provider plugin\"}"]
+enabled = true
+"#,
+    )
+    .unwrap();
+
+    let output = env.command().args(["providers", "list"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("provider-plugin"));
+    assert!(stdout.contains("protocol=plugin"));
+}
+
+#[test]
+fn providers_show_supports_provider_plugin_entry() {
+    let env = temp_home();
+    let config_dir = env.home.path().join(".config/grey");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("grey.toml"),
+        r#"
+default_provider = "provider-plugin"
+default_model = "m"
+
+[[plugins]]
+id = "provider-plugin"
+kind = "provider"
+command = "printf"
+args = ["{\"schema_version\":1,\"text\":\"provider plugin\"}"]
+enabled = true
+version = "0.1.0"
+"#,
+    )
+    .unwrap();
+
+    let show = env
+        .command()
+        .args(["providers", "show", "provider-plugin"])
+        .output()
+        .unwrap();
+    assert!(
+        show.status.success(),
+        "{}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&show.stdout);
+    assert!(stdout.contains("protocol: plugin"));
+    assert!(stdout.contains("version: 0.1.0"));
+}
+
+#[test]
+fn provider_plugin_entry_works_in_headless_flow() {
+    let env = temp_home();
+    let config_dir = env.home.path().join(".config/grey");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("grey.toml"),
+        r#"
+default_provider = "provider-plugin"
+default_model = "m"
+
+[[plugins]]
+id = "provider-plugin"
+kind = "provider"
+command = "printf"
+args = ["{\"schema_version\":1,\"text\":\"plugin response\",\"usage\":{\"input_tokens\":7,\"output_tokens\":9}}"]
+enabled = true
+"#,
+    )
+    .unwrap();
+
+    let output = env
+        .command()
+        .args([
+            "--provider",
+            "provider-plugin",
+            "--no-save",
+            "--format",
+            "json",
+            "hi",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let response = value["response"].as_str().unwrap();
+    assert!(response.contains("plugin response"));
+    assert_eq!(value["provider"].as_str().unwrap(), "provider-plugin");
+}
+
+#[test]
+fn provider_plugin_list_and_show_do_not_expose_command_or_args() {
+    let env = temp_home();
+    let config_dir = env.home.path().join(".config/grey");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("grey.toml"),
+        r#"
+default_provider = "provider-plugin"
+default_model = "m"
+
+[[plugins]]
+id = "provider-plugin"
+kind = "provider"
+command = "secret-command"
+args = ["secret-arg"]
+enabled = true
+"#,
+    )
+    .unwrap();
+    for args in [
+        &["providers", "list"][..],
+        &["providers", "show", "provider-plugin"][..],
+    ] {
+        let output = env.command().args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(!stdout.contains("secret-command"));
+        assert!(!stdout.contains("secret-arg"));
+    }
+}
+
+#[test]
+fn providers_list_uses_the_same_provider_plugin_eligibility_as_router() {
+    let env = temp_home();
+    let config_dir = env.home.path().join(".config/grey");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("grey.toml"),
+        r#"
+[[plugins]]
+id = "valid"
+kind = "provider"
+command = "printf"
+enabled = true
+
+[[plugins]]
+id = "empty-command"
+kind = "provider"
+enabled = true
+"#,
+    )
+    .unwrap();
+    let output = env.command().args(["providers", "list"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("valid"));
+    assert!(!stdout.contains("empty-command"));
+}
+
+#[test]
+fn providers_show_uses_the_provider_eligibility_set_on_id_collision() {
+    let env = temp_home();
+    let config_dir = env.home.path().join(".config/grey");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("grey.toml"),
+        r#"
+[[plugins]]
+id = "collision"
+kind = "theme"
+command = "theme-command"
+enabled = true
+version = "theme-version"
+
+[[plugins]]
+id = "collision"
+kind = "provider"
+command = "provider-command"
+enabled = true
+version = "provider-version"
+"#,
+    )
+    .unwrap();
+    let output = env
+        .command()
+        .args(["providers", "show", "collision"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("protocol: plugin"));
+    assert!(stdout.contains("version: provider-version"));
+}
+
+#[cfg(unix)]
+#[test]
+fn provider_plugin_runs_from_resolved_workspace() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let env = temp_home();
+    let workspace = tempfile::tempdir().unwrap();
+    let plugin = workspace.path().join("plugin");
+    std::fs::write(
+        &plugin,
+        "#!/bin/sh\nprintf '%s' '{\"schema_version\":1,\"text\":\"workspace plugin\"}'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let config_dir = env.home.path().join(".config/grey");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("grey.toml"),
+        r#"
+default_provider = "workspace-plugin"
+default_model = "m"
+
+[[plugins]]
+id = "workspace-plugin"
+kind = "provider"
+command = "./plugin"
+enabled = true
+"#,
+    )
+    .unwrap();
+    let output = env
+        .command()
+        .args([
+            "--workspace",
+            workspace.path().to_str().unwrap(),
+            "--provider",
+            "workspace-plugin",
+            "--no-save",
+            "workspace",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("workspace plugin"));
+}
+
+#[cfg(unix)]
+#[test]
+fn spike_c_provider_plugin_runs_from_resolved_workspace() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let env = temp_home();
+    let workspace = tempfile::tempdir().unwrap();
+    let plugin = workspace.path().join("plugin");
+    std::fs::write(
+        &plugin,
+        "#!/bin/sh\nprintf '%s' '{\"schema_version\":1,\"text\":\"spike workspace\"}'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let config_dir = env.home.path().join(".config/grey");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("grey.toml"),
+        r#"
+default_provider = "workspace-plugin"
+default_model = "m"
+
+[[plugins]]
+id = "workspace-plugin"
+kind = "provider"
+command = "./plugin"
+enabled = true
+"#,
+    )
+    .unwrap();
+    let output = env
+        .command()
+        .args([
+            "--workspace",
+            workspace.path().to_str().unwrap(),
+            "spike-c",
+            "--provider",
+            "workspace-plugin",
+            "workspace",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("spike workspace"));
+}
+
+#[test]
 fn providers_show_for_unknown_id_errors() {
     let env = temp_home();
     let output = env

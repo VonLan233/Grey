@@ -368,6 +368,23 @@ fn parse_color(input: &str) -> Option<Color> {
     }
 }
 
+/// Validates the limited theme manifest accepted from a command theme plugin.
+pub fn theme_config_is_valid(config: &grey_core::TuiThemeConfig) -> bool {
+    matches!(
+        config.preset.as_str(),
+        "default" | "slate" | "sunset" | "mono"
+    ) && [
+        &config.overrides.border,
+        &config.overrides.accent,
+        &config.overrides.prompt,
+        &config.overrides.status_fg,
+        &config.overrides.status_bg,
+        &config.overrides.muted,
+    ]
+    .into_iter()
+    .flatten()
+    .all(|color| parse_color(color).is_some())
+}
 fn apply_theme_override(theme: &mut RenderTheme, overrides: &grey_core::TuiColorOverrides) {
     if let Some(value) = &overrides.border {
         if let Some(color) = parse_color(value) {

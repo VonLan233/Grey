@@ -471,6 +471,9 @@ pub struct TuiThemeConfig {
     pub preset: String,
     #[serde(default)]
     pub overrides: TuiColorOverrides,
+    /// Exact id of an enabled `theme` plugin to invoke before starting the TUI.
+    #[serde(default)]
+    pub plugin: Option<String>,
 }
 
 impl Default for TuiThemeConfig {
@@ -478,6 +481,7 @@ impl Default for TuiThemeConfig {
         Self {
             preset: default_tui_theme(),
             overrides: TuiColorOverrides::default(),
+            plugin: None,
         }
     }
 }

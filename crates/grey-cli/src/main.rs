@@ -13,12 +13,14 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use futures_util::future::join_all;
 use grey_core::{
-    config, Agent, AgentEvent, AgentOptions, AgentOutcome, CharApproxCounter, ChatMessage,
-    ChatRequest, ContextManager, GreyConfig, HookEvent, HookPayload, HookRunner, PluginConfig,
-    PluginKind, Provider, Role, Session, SessionStore, SummaryEngine, ToolExecutor,
+    config,
+    process::{run_bounded, CommandSpec, DEFAULT_STDIN_LIMIT},
+    Agent, AgentEvent, AgentOptions, AgentOutcome, CharApproxCounter, ChatMessage, ChatRequest,
+    ContextManager, GreyConfig, HookEvent, HookPayload, HookRunner, PluginConfig, PluginKind,
+    Provider, Role, Session, SessionStore, SummaryEngine, ToolExecutor,
 };
 use grey_provider::chatgpt_oauth::ChatgptOauth;
-use grey_provider::router::ProviderRouter;
+use grey_provider::router::{enabled_provider_plugins, ProviderRouter};
 use grey_tools::{
     AlwaysApprove, Approver, BuiltinTools, DenySideEffects, HookedApprover, LspTools, McpTools,
     PluginTools, StdioApprover,
@@ -34,6 +36,7 @@ Inspect before changing anything. Use read_file, glob, and grep to gather eviden
 only with an exact old_string that occurs once. After edits, run the relevant tests with bash.
 Keep changes scoped to the user's request, report tool failures honestly, and never claim success
 without verification evidence."#;
+const DEFAULT_THEME_PLUGIN_TIMEOUT_MS: u64 = 10_000;
 const TUI_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Parser, Clone)]
@@ -510,7 +513,15 @@ async fn run_command(cli: &Cli, command: Command) -> Result<()> {
             model,
         } => {
             let config = config::load()?;
-            run_spike_c(&config, &prompt, provider.as_deref(), model.as_deref()).await
+            let workspace = resolve_workspace(cli.workspace.as_deref())?;
+            run_spike_c(
+                &config,
+                &workspace,
+                &prompt,
+                provider.as_deref(),
+                model.as_deref(),
+            )
+            .await
         }
         Command::Config { action } => run_config(action),
         Command::Sessions { action } => run_sessions(action),
@@ -1897,7 +1908,7 @@ fn build_agent_and_session(
         (1..=100).contains(&cli.max_steps),
         "max-steps must be between 1 and 100"
     );
-    let router = ProviderRouter::from_config(config)?;
+    let router = ProviderRouter::from_config_in_workspace(config, workspace)?;
     let resolved = if let Some(provider_id) = cli.provider.as_deref() {
         let model = cli
             .model
@@ -2237,6 +2248,7 @@ fn finish_tui_result(ui_result: Result<()>, cleanup_result: Result<()>) -> Resul
 }
 
 async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()> {
+    let tui_config = resolve_theme_plugin_config(config, workspace).await?;
     let hooks = HookRunner::new(&config.hooks, &config.plugins, &config.runtime);
     let (agent, store, existing) = build_agent_and_session(cli, config, workspace, true, &hooks)?;
     let usage_tracker = agent.usage_tracker();
@@ -2503,7 +2515,7 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
         let ui = grey_tui::run_agent_tui(
             events_rx,
             prompts_tx.clone(),
-            &config.tui,
+            &tui_config,
             &config.runtime,
             branch.as_deref(),
         );
@@ -2593,6 +2605,82 @@ async fn run_best_effort_hook(hooks: &HookRunner, payload: HookPayload<'_>) {
     if let Err(error) = hooks.run_best_effort(payload).await {
         eprintln!("{} hook failed: {error:#}", payload.event.as_str());
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct ThemePluginManifest {
+    schema_version: u32,
+    preset: String,
+    #[serde(default)]
+    overrides: grey_core::TuiColorOverrides,
+}
+
+async fn resolve_theme_plugin_config(
+    config: &GreyConfig,
+    workspace: &Path,
+) -> Result<grey_core::TuiConfig> {
+    let Some(plugin_id) = config.tui.theme.plugin.as_deref() else {
+        return Ok(config.tui.clone());
+    };
+    let Some(plugin) = config.plugins.iter().find(|plugin| plugin.id == plugin_id) else {
+        return Ok(config.tui.clone());
+    };
+    if !plugin.enabled || plugin.kind != PluginKind::Theme || plugin.command.trim().is_empty() {
+        return Ok(config.tui.clone());
+    }
+
+    let request = serde_json::json!({
+        "schema_version": 1,
+        "protocol": "grey.command-theme.v1",
+        "plugin_id": plugin.id,
+        "workspace": workspace,
+        "theme": config.tui.theme,
+    });
+    let Ok(stdin) = serde_json::to_vec(&request) else {
+        return Ok(config.tui.clone());
+    };
+    if stdin.len() > config.runtime.response_max_bytes.min(DEFAULT_STDIN_LIMIT) {
+        return Ok(config.tui.clone());
+    }
+    let output = run_bounded(
+        CommandSpec::direct(&plugin.command, plugin.args.iter().cloned())
+            .current_dir(workspace)
+            .env("GREY_PLUGIN_PROTOCOL", "grey.command-theme.v1")
+            .env("GREY_PLUGIN_KIND", "theme")
+            .env("GREY_PLUGIN_THEME_ID", &plugin.id)
+            .stdin(stdin)
+            .timeout(Duration::from_millis(
+                plugin.timeout_ms.unwrap_or(DEFAULT_THEME_PLUGIN_TIMEOUT_MS),
+            ))
+            .stdout_limit(config.runtime.command_stdout_max_bytes)
+            .stderr_limit(config.runtime.command_stderr_max_bytes),
+    )
+    .await;
+    let Ok(output) = output else {
+        return Ok(config.tui.clone());
+    };
+    if !output.status.success() || output.stdout_truncated || output.stderr_truncated {
+        return Ok(config.tui.clone());
+    }
+    let Ok(manifest) = serde_json::from_slice::<ThemePluginManifest>(&output.stdout) else {
+        return Ok(config.tui.clone());
+    };
+    if manifest.schema_version != 1 {
+        return Ok(config.tui.clone());
+    }
+    let theme = grey_core::TuiThemeConfig {
+        preset: manifest.preset,
+        overrides: manifest.overrides,
+        plugin: config.tui.theme.plugin.clone(),
+    };
+    if !grey_tui::theme_config_is_valid(&theme) {
+        return Ok(config.tui.clone());
+    }
+
+    Ok(grey_core::TuiConfig {
+        theme,
+        ..config.tui.clone()
+    })
 }
 
 fn run_config(action: ConfigAction) -> Result<()> {
@@ -2791,8 +2879,16 @@ fn show_raw_plugin(path: &Path, id: &str) -> Result<()> {
 fn run_providers(action: ProviderAction) -> Result<()> {
     let config = config::load()?;
     let router = ProviderRouter::from_config(&config)?;
+    let plugin_providers = enabled_provider_plugins(&config.plugins);
     match action {
         ProviderAction::List => {
+            for plugin in &plugin_providers {
+                println!(
+                    "{}\tprotocol=plugin\tcommand=(configured)\tmodels=[plugin], version={}",
+                    plugin.id,
+                    plugin.version.as_deref().unwrap_or("(not-set)")
+                );
+            }
             for provider in &config.providers {
                 let models = provider
                     .models
@@ -2811,26 +2907,42 @@ fn run_providers(action: ProviderAction) -> Result<()> {
             if !ids.contains(&id) {
                 bail!("provider not found: {id}");
             }
-            let provider = config
-                .provider(&id)
-                .with_context(|| format!("provider not found: {id}"))?;
-            println!("provider: {}", provider.id);
-            println!("protocol: {}", provider.protocol);
-            println!("base_url: {}", provider.base_url);
-            println!(
-                "api_key: {}",
-                if provider.api_key.is_empty() {
-                    "(none)"
-                } else {
-                    "***"
-                }
-            );
-            println!("models:");
-            for model in &provider.models {
+            if let Some(provider) = config.provider(&id) {
+                println!("provider: {}", provider.id);
+                println!("protocol: {}", provider.protocol);
+                println!("base_url: {}", provider.base_url);
                 println!(
-                    "  {}\t{}\tcontext={} output={}",
-                    model.id, model.name, model.context_limit, model.output_limit
+                    "api_key: {}",
+                    if provider.api_key.is_empty() {
+                        "(none)"
+                    } else {
+                        "***"
+                    }
                 );
+                println!("models:");
+                for model in &provider.models {
+                    println!(
+                        "  {}\t{}\tcontext={} output={}",
+                        model.id, model.name, model.context_limit, model.output_limit
+                    );
+                }
+                return Ok(());
+            }
+            let plugin = plugin_providers
+                .iter()
+                .find(|plugin| plugin.id == id)
+                .with_context(|| format!("provider not found: {id}"))?;
+            println!("provider: {}", plugin.id);
+            println!("protocol: plugin");
+            println!("command: (configured)");
+            println!(
+                "version: {}",
+                plugin.version.as_deref().unwrap_or("(not-set)")
+            );
+            if let Some(timeout_ms) = plugin.timeout_ms {
+                println!("timeout_ms: {timeout_ms}");
+            } else {
+                println!("timeout_ms: default");
             }
         }
     }
@@ -2920,11 +3032,12 @@ fn default_model_for_provider(config: &GreyConfig, provider_id: &str) -> String 
 
 async fn run_spike_c(
     config: &GreyConfig,
+    workspace: &Path,
     prompt: &str,
     provider_override: Option<&str>,
     model_override: Option<&str>,
 ) -> Result<()> {
-    let router = ProviderRouter::from_config(config)?;
+    let router = ProviderRouter::from_config_in_workspace(config, workspace)?;
     let resolved = match (provider_override, model_override) {
         (Some(pid), Some(mid)) => router.resolve_explicit(pid, mid)?,
         (Some(pid), None) => {
@@ -3365,5 +3478,58 @@ mod tests {
 
         assert!(!is_retriable_subagent_error("invalid api key"));
         assert!(!is_retriable_subagent_error("session not found"));
+    }
+
+    #[tokio::test]
+    async fn theme_plugin_uses_the_exact_selected_id() {
+        let mut config = GreyConfig::default();
+        config.tui.theme.plugin = Some("selected".into());
+        config.plugins = vec![
+            PluginConfig {
+                id: "other".into(),
+                kind: PluginKind::Theme,
+                enabled: true,
+                command: "false".into(),
+                ..Default::default()
+            },
+            PluginConfig {
+                id: "selected".into(),
+                kind: PluginKind::Theme,
+                enabled: true,
+                command: "printf".into(),
+                args: vec![
+                    r#"{"schema_version":1,"preset":"slate","overrides":{"accent":"cyan"}}"#.into(),
+                ],
+                ..Default::default()
+            },
+        ];
+        let resolved = resolve_theme_plugin_config(&config, Path::new("."))
+            .await
+            .unwrap();
+        assert_eq!(resolved.theme.preset, "slate");
+        assert_eq!(resolved.theme.overrides.accent.as_deref(), Some("cyan"));
+    }
+
+    #[tokio::test]
+    async fn missing_or_invalid_selected_theme_plugin_keeps_base_theme() {
+        let mut config = GreyConfig::default();
+        config.tui.theme.preset = "mono".into();
+        config.tui.theme.plugin = Some("missing".into());
+        let resolved = resolve_theme_plugin_config(&config, Path::new("."))
+            .await
+            .unwrap();
+        assert_eq!(resolved.theme.preset, "mono");
+        config.plugins.push(PluginConfig {
+            id: "missing".into(),
+            kind: PluginKind::Theme,
+            enabled: true,
+            command: "printf".into(),
+            args: vec![r#"{"schema_version":1,"preset":"unknown"}"#.into()],
+            ..Default::default()
+        });
+        let resolved = resolve_theme_plugin_config(&config, Path::new("."))
+            .await
+            .unwrap();
+        assert_eq!(resolved.theme.preset, "mono");
     }
 }

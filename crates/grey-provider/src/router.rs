@@ -1,17 +1,18 @@
 //! Provider router: resolve provider+model by task type or explicit override.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use futures_util::{stream::BoxStream, StreamExt};
 use grey_core::{
-    GreyConfig, Provider, ProviderCandidate, ProviderEvent, ProviderFailure, ProviderFailureKind,
-    ProviderModelRef, RouteRule, TaskKind,
+    GreyConfig, PluginConfig, PluginKind, Provider, ProviderCandidate, ProviderEvent,
+    ProviderFailure, ProviderFailureKind, ProviderModelRef, RouteRule, TaskKind,
 };
 
 use crate::fallback::FallbackChain;
-use crate::{anthropic, mock, openai, responses};
+use crate::{anthropic, mock, openai, provider_plugin::PluginProvider, responses};
 
 pub struct ProviderRouter {
     providers: HashMap<String, Arc<dyn Provider>>,
@@ -51,7 +52,31 @@ impl std::fmt::Debug for ResolvedProvider {
 
 impl ProviderRouter {
     pub fn from_config(cfg: &GreyConfig) -> Result<Self> {
+        Self::from_config_in_workspace(
+            cfg,
+            &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        )
+    }
+
+    pub fn from_config_in_workspace(cfg: &GreyConfig, workspace: &Path) -> Result<Self> {
         let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        for plugin in enabled_provider_plugins(&cfg.plugins) {
+            if providers.contains_key(&plugin.id) {
+                bail!("duplicate provider id `{}`", plugin.id);
+            }
+            providers.insert(
+                plugin.id.clone(),
+                Arc::new(PluginProvider::new(
+                    &plugin.id,
+                    plugin.command.clone(),
+                    plugin.args.clone(),
+                    plugin.version.clone(),
+                    plugin.timeout_ms,
+                    &cfg.runtime,
+                    workspace,
+                )),
+            );
+        }
         for entry in &cfg.providers {
             if providers.contains_key(&entry.id) {
                 bail!("duplicate provider id `{}`", entry.id);
@@ -309,6 +334,19 @@ impl ProviderRouter {
     }
 }
 
+pub fn enabled_provider_plugins(plugins: &[PluginConfig]) -> Vec<PluginConfig> {
+    plugins
+        .iter()
+        .filter(|plugin| {
+            plugin.enabled
+                && matches!(plugin.kind, PluginKind::Provider)
+                && !plugin.id.trim().is_empty()
+                && !plugin.command.trim().is_empty()
+        })
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +376,19 @@ mod tests {
         let resolved = router.resolve(&TaskKind::Default).unwrap();
         assert_eq!(resolved.provider_id, "mock");
         assert_eq!(resolved.model, "test-model");
+    }
+
+    #[test]
+    fn duplicate_provider_plugin_id_fails_closed() {
+        let mut cfg = config_with_mock();
+        cfg.plugins.push(PluginConfig {
+            id: "mock".into(),
+            kind: PluginKind::Provider,
+            enabled: true,
+            command: "printf".into(),
+            ..Default::default()
+        });
+        assert!(ProviderRouter::from_config(&cfg).is_err());
     }
 
     #[test]
