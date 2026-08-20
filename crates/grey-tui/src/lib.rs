@@ -86,6 +86,9 @@ struct RenderTheme {
     status_fg: Color,
     status_bg: Color,
     muted: Color,
+    error: Color,
+    success: Color,
+    warning: Color,
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +99,17 @@ struct TuiTheme {
 impl TuiTheme {
     fn from_config(config: &grey_core::TuiThemeConfig) -> Self {
         let mut theme = match config.preset.as_str() {
+            "grey_storm" => RenderTheme {
+                border: Color::Rgb(0x1d, 0x55, 0x5a),
+                accent: Color::Rgb(0x44, 0xe0, 0xd3),
+                prompt: Color::Rgb(0x89, 0xff, 0xf2),
+                status_fg: Color::Rgb(0xd7, 0xfa, 0xf7),
+                status_bg: Color::Rgb(0x12, 0x38, 0x3b),
+                muted: Color::Rgb(0x6f, 0x8f, 0x90),
+                error: Color::Rgb(0xff, 0x7b, 0x72),
+                success: Color::Green,
+                warning: Color::Yellow,
+            },
             "slate" => RenderTheme {
                 border: Color::Blue,
                 accent: Color::LightBlue,
@@ -103,6 +117,9 @@ impl TuiTheme {
                 status_fg: Color::White,
                 status_bg: Color::Blue,
                 muted: Color::DarkGray,
+                error: Color::LightRed,
+                success: Color::Green,
+                warning: Color::Yellow,
             },
             "sunset" => RenderTheme {
                 border: Color::DarkGray,
@@ -111,6 +128,9 @@ impl TuiTheme {
                 status_fg: Color::Black,
                 status_bg: Color::LightYellow,
                 muted: Color::Gray,
+                error: Color::LightRed,
+                success: Color::Green,
+                warning: Color::Yellow,
             },
             "mono" => RenderTheme {
                 border: Color::White,
@@ -119,6 +139,9 @@ impl TuiTheme {
                 status_fg: Color::Black,
                 status_bg: Color::White,
                 muted: Color::DarkGray,
+                error: Color::LightRed,
+                success: Color::Green,
+                warning: Color::Yellow,
             },
             _ => RenderTheme {
                 border: Color::Blue,
@@ -127,6 +150,9 @@ impl TuiTheme {
                 status_fg: Color::Yellow,
                 status_bg: Color::Blue,
                 muted: Color::DarkGray,
+                error: Color::LightRed,
+                success: Color::Green,
+                warning: Color::Yellow,
             },
         };
         apply_theme_override(&mut theme, &config.overrides);
@@ -372,7 +398,7 @@ fn parse_color(input: &str) -> Option<Color> {
 pub fn theme_config_is_valid(config: &grey_core::TuiThemeConfig) -> bool {
     matches!(
         config.preset.as_str(),
-        "default" | "slate" | "sunset" | "mono"
+        "default" | "grey_storm" | "slate" | "sunset" | "mono"
     ) && [
         &config.overrides.border,
         &config.overrides.accent,
@@ -380,11 +406,15 @@ pub fn theme_config_is_valid(config: &grey_core::TuiThemeConfig) -> bool {
         &config.overrides.status_fg,
         &config.overrides.status_bg,
         &config.overrides.muted,
+        &config.overrides.error,
+        &config.overrides.success,
+        &config.overrides.warning,
     ]
     .into_iter()
     .flatten()
     .all(|color| parse_color(color).is_some())
 }
+
 fn apply_theme_override(theme: &mut RenderTheme, overrides: &grey_core::TuiColorOverrides) {
     if let Some(value) = &overrides.border {
         if let Some(color) = parse_color(value) {
@@ -414,6 +444,21 @@ fn apply_theme_override(theme: &mut RenderTheme, overrides: &grey_core::TuiColor
     if let Some(value) = &overrides.muted {
         if let Some(color) = parse_color(value) {
             theme.muted = color;
+        }
+    }
+    if let Some(value) = &overrides.error {
+        if let Some(color) = parse_color(value) {
+            theme.error = color;
+        }
+    }
+    if let Some(value) = &overrides.success {
+        if let Some(color) = parse_color(value) {
+            theme.success = color;
+        }
+    }
+    if let Some(value) = &overrides.warning {
+        if let Some(color) = parse_color(value) {
+            theme.warning = color;
         }
     }
 }
@@ -1396,11 +1441,11 @@ fn render_status_line(frame: &mut Frame<'_>, state: &AppState, theme: &RenderThe
             Span::styled(
                 " [ERR] ",
                 Style::default()
-                    .fg(Color::LightRed)
+                    .fg(theme.error)
                     .add_modifier(Modifier::BOLD),
             )
         } else {
-            Span::styled(" [OK] ", Style::default().fg(Color::Green))
+            Span::styled(" [OK] ", Style::default().fg(theme.success))
         },
         Span::styled(
             format!(" {} ", state.status),
@@ -1410,7 +1455,7 @@ fn render_status_line(frame: &mut Frame<'_>, state: &AppState, theme: &RenderThe
             Span::styled(
                 " [HOLD] ",
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(theme.warning)
                     .add_modifier(Modifier::BOLD),
             )
         } else {
@@ -1869,6 +1914,88 @@ mod tests {
             model: "model".into(),
         });
         assert_eq!(state.take_completion_bell(), None);
+    }
+
+    #[test]
+    fn grey_storm_default_and_overrides_use_exact_tokens() {
+        let mut config = TuiConfig::default();
+        let theme = TuiTheme::from_config(&config.theme);
+        assert_eq!(theme.colors.border, Color::Rgb(0x1d, 0x55, 0x5a));
+        assert_eq!(theme.colors.accent, Color::Rgb(0x44, 0xe0, 0xd3));
+        assert_eq!(theme.colors.prompt, Color::Rgb(0x89, 0xff, 0xf2));
+        assert_eq!(theme.colors.status_fg, Color::Rgb(0xd7, 0xfa, 0xf7));
+        assert_eq!(theme.colors.status_bg, Color::Rgb(0x12, 0x38, 0x3b));
+        assert_eq!(theme.colors.muted, Color::Rgb(0x6f, 0x8f, 0x90));
+        assert_eq!(theme.colors.error, Color::Rgb(0xff, 0x7b, 0x72));
+        assert_eq!(theme.colors.success, Color::Green);
+        assert_eq!(theme.colors.warning, Color::Yellow);
+
+        config.theme.overrides.error = Some("#010203".into());
+        config.theme.overrides.success = Some("#040506".into());
+        config.theme.overrides.warning = Some("#070809".into());
+        assert_eq!(
+            TuiTheme::from_config(&config.theme).colors.error,
+            Color::Rgb(1, 2, 3)
+        );
+        assert_eq!(
+            TuiTheme::from_config(&config.theme).colors.success,
+            Color::Rgb(4, 5, 6)
+        );
+        assert_eq!(
+            TuiTheme::from_config(&config.theme).colors.warning,
+            Color::Rgb(7, 8, 9)
+        );
+    }
+
+    #[test]
+    fn legacy_presets_and_theme_manifest_validation_remain_compatible() {
+        let mut config = TuiConfig::default();
+        config.theme.preset = "slate".into();
+        let slate = TuiTheme::from_config(&config.theme);
+        assert_eq!(slate.colors.border, Color::Blue);
+        assert_eq!(slate.colors.error, Color::LightRed);
+        assert!(theme_config_is_valid(&config.theme));
+
+        config.theme.preset = "grey_storm".into();
+        config.theme.overrides.error = Some("#ff7b72".into());
+        assert!(theme_config_is_valid(&config.theme));
+        config.theme.overrides.error = Some("not-a-colour".into());
+        assert!(!theme_config_is_valid(&config.theme));
+    }
+
+    #[test]
+    fn status_indicators_render_theme_tokens() {
+        let mut state = AppState::default();
+        let mut terminal = Terminal::new(TestBackend::new(100, 10)).unwrap();
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        assert!(terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .any(|cell| cell.symbol() == "[" && cell.fg == Color::Green));
+
+        let mut config = TuiConfig::default();
+        config.completion.persistent = true;
+        let mut held = AppState::with_settings(TuiSettings::from(&config));
+        held.schedule_completion_notice("done".into());
+        terminal.draw(|frame| render(frame, &mut held)).unwrap();
+        assert!(terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .any(|cell| cell.symbol() == "[" && cell.fg == Color::Yellow));
+
+        state.reduce_agent_event(AgentEvent::Failed("boom".into()));
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        let error = Color::Rgb(0xff, 0x7b, 0x72);
+        assert!(terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .any(|cell| cell.symbol() == "[" && cell.fg == error));
     }
 
     #[test]

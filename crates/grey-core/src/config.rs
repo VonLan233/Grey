@@ -446,10 +446,16 @@ pub struct TuiColorOverrides {
     pub status_bg: Option<String>,
     #[serde(default)]
     pub muted: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub success: Option<String>,
+    #[serde(default)]
+    pub warning: Option<String>,
 }
 
 fn default_tui_theme() -> String {
-    "default".to_string()
+    "grey_storm".to_string()
 }
 
 fn default_tui_input_lines() -> u16 {
@@ -1540,7 +1546,7 @@ ttl_hours = 12
     fn parses_tui_config_section() {
         let toml_str = r##"
 [tui]
-theme = { preset = "slate", overrides = { border = "#1f2937", accent = "#60a5fa" } }
+theme = { preset = "slate", overrides = { border = "#1f2937", accent = "#60a5fa", error = "#ff7b72", success = "#00ff00", warning = "#ffff00" } }
 
 [tui.layout]
 input_lines = 6
@@ -1565,6 +1571,9 @@ scroll_down = "pagedown"
         assert_eq!(cfg.tui.theme.preset, "slate");
         assert_eq!(cfg.tui.theme.overrides.border.as_deref(), Some("#1f2937"));
         assert_eq!(cfg.tui.theme.overrides.accent.as_deref(), Some("#60a5fa"));
+        assert_eq!(cfg.tui.theme.overrides.error.as_deref(), Some("#ff7b72"));
+        assert_eq!(cfg.tui.theme.overrides.success.as_deref(), Some("#00ff00"));
+        assert_eq!(cfg.tui.theme.overrides.warning.as_deref(), Some("#ffff00"));
         assert_eq!(cfg.tui.layout.input_lines, 6);
         assert!(!cfg.tui.completion.enabled);
         assert_eq!(cfg.tui.completion.long_running_steps, 8);
@@ -1579,6 +1588,13 @@ scroll_down = "pagedown"
         assert_eq!(cfg.tui.keys.clear, "ctrl-l");
         assert_eq!(cfg.tui.keys.scroll_up, "pageup");
         assert_eq!(cfg.tui.keys.scroll_down, "pagedown");
+    }
+
+    #[test]
+    fn tui_defaults_to_grey_storm() {
+        let theme = TuiThemeConfig::default();
+        assert_eq!(theme.preset, "grey_storm");
+        assert_eq!(theme.overrides.error, None);
     }
 
     #[test]
