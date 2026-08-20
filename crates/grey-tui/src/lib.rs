@@ -507,6 +507,7 @@ enum SlashCommand {
     Clear,
     Quit,
     Model { model: String },
+    Usage,
     Unknown(String),
 }
 
@@ -522,6 +523,7 @@ impl SlashCommand {
             "model" => Self::Model {
                 model: argument.trim().to_owned(),
             },
+            "usage" | "tokens" => Self::Usage,
             other => Self::Unknown(other.to_owned()),
         }
     }
@@ -993,6 +995,17 @@ impl AppState {
                 self.status_error = false;
                 self.dirty = true;
                 UiAction::SwitchModel { model }
+            }
+            SlashCommand::Usage => {
+                self.input.take();
+                let (total_input_tokens, total_output_tokens) = self.total_usage();
+                self.append_output(&format!(
+                    "usage: {total_input_tokens} input / {total_output_tokens} output tokens\n\n"
+                ));
+                self.status = "usage reported".into();
+                self.status_error = false;
+                self.dirty = true;
+                UiAction::None
             }
             SlashCommand::Unknown(name) => {
                 self.status = format!("unknown command /{name}");
@@ -2401,6 +2414,8 @@ mod tests {
                 model: String::new()
             }
         );
+        assert_eq!(Command::parse("/usage"), Command::Usage);
+        assert_eq!(Command::parse("/tokens"), Command::Usage);
         assert_eq!(Command::parse("/wat"), Command::Unknown("wat".into()));
     }
 
