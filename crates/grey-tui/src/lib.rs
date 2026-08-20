@@ -808,6 +808,7 @@ pub struct AppState {
     completion: CompletionSettings,
     show_help: bool,
     leader_armed: bool,
+    show_splash: bool,
 }
 
 impl Default for AppState {
@@ -839,6 +840,7 @@ impl Default for AppState {
             completion: CompletionSettings::default(),
             show_help: false,
             leader_armed: false,
+            show_splash: false,
         }
     }
 }
@@ -1108,6 +1110,14 @@ impl AppState {
     /// Reduce one terminal key event into state and, optionally, an action.
     pub fn reduce_key(&mut self, key: KeyEvent) -> UiAction {
         if key.kind == KeyEventKind::Release {
+            return UiAction::None;
+        }
+        if self.show_splash {
+            if self.settings.keys.quit.matches(key) {
+                return UiAction::Quit;
+            }
+            self.show_splash = false;
+            self.dirty = true;
             return UiAction::None;
         }
         if self.show_help {
@@ -1437,7 +1447,8 @@ pub async fn run_agent_tui(
     let (mut input_thread, input_events) = InputThread::spawn(runtime_config.input_queue_capacity)?;
     let settings =
         TuiSettings::from(tui_config).with_git_branch(git_branch.map(ToString::to_string));
-    let state = AppState::with_runtime(settings, runtime_config);
+    let mut state = AppState::with_runtime(settings, runtime_config);
+    state.show_splash = true;
     let result = run_loop(
         &mut terminal,
         events,
@@ -1623,6 +1634,10 @@ fn trigger_completion_notification(_config: &CompletionSettings, message: String
 }
 
 fn render(frame: &mut Frame<'_>, state: &mut AppState) {
+    if state.show_splash {
+        render_splash(frame, state);
+        return;
+    }
     let theme = state.settings.theme.colors.clone();
     let input_lines = state.settings.layout.input_lines.max(1);
     let chunks = Layout::vertical([
@@ -1806,6 +1821,76 @@ fn render_help_overlay(frame: &mut Frame<'_>, state: &AppState, theme: &RenderTh
         Paragraph::new(body).block(block).wrap(Wrap { trim: false }),
         area,
     );
+}
+
+fn render_splash(frame: &mut Frame<'_>, state: &AppState) {
+    let theme = state.settings.theme.colors.clone();
+    let labels = state.settings.keys.labels();
+    let panel = centered_rect(70, 64, frame.area());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Grey ")
+        .border_style(Style::default().fg(theme.border));
+    let avatar = [
+        "        ▄▄▄▄▄▄▄▄▄        ",
+        "      ██ ▔     ▔ ██      ",
+        "      ██           ██      ",
+        "      ██     ◡     ██      ",
+        "        ▀▀▀▀▀▀▀▀▀        ",
+    ];
+    let accent = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(theme.muted);
+    let mut body = Text::default();
+    for line in avatar {
+        body.push_line(Line::from(Span::styled(line, accent)));
+    }
+    body.push_line(Line::from(""));
+    body.push_line(Line::from(Span::styled(
+        "Grey — 轻量、高性能、可扩展的 Coding Agent Harness",
+        accent,
+    )));
+    body.push_line(Line::from(Span::styled(
+        format!(
+            "v{} · 默认极简，一切按需扩展。快是特性，省是特性，顺是特性。",
+            env!("CARGO_PKG_VERSION")
+        ),
+        dim,
+    )));
+    body.push_line(Line::from(""));
+    body.push_line(Line::from(Span::styled("快捷键", accent)));
+    body.push_line(Line::from(Span::styled(
+        format!(
+            "  {} {}  帮助        {}  退出        {}  清空",
+            labels.leader, labels.help, labels.quit, labels.clear
+        ),
+        dim,
+    )));
+    body.push_line(Line::from(Span::styled(
+        "  滚轮 / PageUp / PageDown  滚动消息",
+        dim,
+    )));
+    body.push_line(Line::from(""));
+    body.push_line(Line::from(Span::styled("输入", accent)));
+    body.push_line(Line::from(Span::styled(
+        "  Enter 发送 · Shift+Enter / Alt+Enter 换行 · 行尾 \\ + Enter 换行",
+        dim,
+    )));
+    body.push_line(Line::from(""));
+    body.push_line(Line::from(Span::styled("斜杠命令", accent)));
+    body.push_line(Line::from(Span::styled(
+        "  /help  /clear  /quit  /exit  /model <name>",
+        dim,
+    )));
+    body.push_line(Line::from(""));
+    body.push_line(Line::from(Span::styled(
+        "按任意键开始",
+        Style::default()
+            .fg(theme.prompt)
+            .add_modifier(Modifier::BOLD),
+    )));
+    frame.render_widget(Paragraph::new(body).block(block), panel);
 }
 
 fn centered_rect(width_percent: u16, height_percent: u16, area: Rect) -> Rect {
@@ -2501,6 +2586,31 @@ mod tests {
         assert!(
             rows[status_index].contains(" [OK] "),
             "status keeps error indicator"
+        );
+    }
+
+    #[test]
+    fn splash_renders_and_dismisses_on_any_key() {
+        let mut state = AppState {
+            show_splash: true,
+            ..Default::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        let rows = rendered_rows(&terminal);
+        assert!(rows.iter().any(|row| row.contains("按任意键开始")));
+        assert!(rows.iter().any(|row| row.contains("/model <name>")));
+
+        assert_eq!(state.reduce_key(key(KeyCode::Char('x'))), UiAction::None);
+        assert!(!state.show_splash);
+
+        let mut quitting = AppState {
+            show_splash: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            quitting.reduce_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            UiAction::Quit
         );
     }
 
