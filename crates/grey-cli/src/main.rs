@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::future::Future;
 use std::io::{IsTerminal, Write};
@@ -16,6 +17,7 @@ use grey_core::{
     ChatRequest, ContextManager, GreyConfig, HookEvent, HookPayload, HookRunner, PluginConfig,
     PluginKind, Provider, Role, Session, SessionStore, SummaryEngine, ToolExecutor,
 };
+use grey_provider::chatgpt_oauth::ChatgptOauth;
 use grey_provider::router::ProviderRouter;
 use grey_tools::{
     AlwaysApprove, Approver, BuiltinTools, DenySideEffects, HookedApprover, LspTools, McpTools,
@@ -198,6 +200,11 @@ enum Command {
         #[command(subcommand)]
         action: UsageAction,
     },
+    /// Sign in to the OpenAI ChatGPT subscription service.
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
     /// Multi-agent orchestration: run sub-agents in parallel and synthesize.
     Orchestrate {
         prompt: String,
@@ -230,6 +237,21 @@ enum Command {
         #[arg(long, value_name = "TOKEN", default_value = "DONE")]
         done_when: String,
     },
+}
+
+#[derive(Subcommand, Clone)]
+enum AuthAction {
+    /// Open the system browser and sign in with ChatGPT.
+    Login { provider: AuthProvider },
+    /// Print non-secret ChatGPT sign-in metadata.
+    Status { provider: AuthProvider },
+    /// Remove the saved ChatGPT sign-in from the OS keyring.
+    Logout { provider: AuthProvider },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum AuthProvider {
+    Openai,
 }
 
 #[derive(Subcommand, Clone)]
@@ -496,6 +518,7 @@ async fn run_command(cli: &Cli, command: Command) -> Result<()> {
         Command::Plugins { action } => run_plugins(action),
         Command::Cache { action } => run_cache(action),
         Command::Usage { action } => run_usage(action),
+        Command::Auth { action } => run_auth(action).await,
         Command::Orchestrate {
             prompt,
             agent,
@@ -512,6 +535,78 @@ async fn run_command(cli: &Cli, command: Command) -> Result<()> {
             done_when,
         } => run_repeater(cli, RepeaterMode::Goal, goal, iterations, Some(done_when)).await,
     }
+}
+
+async fn run_auth(action: AuthAction) -> Result<()> {
+    let provider = match &action {
+        AuthAction::Login { provider }
+        | AuthAction::Status { provider }
+        | AuthAction::Logout { provider } => provider,
+    };
+    match provider {
+        AuthProvider::Openai => {}
+    }
+
+    let oauth = ChatgptOauth::new()?;
+    match action {
+        AuthAction::Login { .. } => {
+            let pending = oauth.begin_login().await?;
+            let url = pending.authorize_url();
+            println!("Open this URL to sign in with ChatGPT:\n{url}");
+            if let Err(error) = open_system_browser(url.as_str()).await {
+                eprintln!("Could not open the system browser: {error}. Paste the URL above into a browser.");
+            }
+            oauth.complete_login(pending).await?;
+            println!("ChatGPT subscription login complete.");
+        }
+        AuthAction::Status { .. } => {
+            let status = oauth.status().await?;
+            println!("logged_in: {}", status.logged_in);
+            println!(
+                "account_id: {}",
+                status.account_id.as_deref().unwrap_or("(none)")
+            );
+            println!(
+                "expires_at: {}",
+                status
+                    .expires_at
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "(none)".to_string())
+            );
+        }
+        AuthAction::Logout { .. } => {
+            oauth.logout().await?;
+            println!("ChatGPT subscription login removed.");
+        }
+    }
+    Ok(())
+}
+
+async fn open_system_browser(url: &str) -> Result<()> {
+    use grey_core::process::run_bounded;
+
+    let output = run_bounded(browser_opener_spec(url)?).await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "system browser opener exited with {}",
+        output.status
+    );
+    Ok(())
+}
+
+fn browser_opener_spec(url: &str) -> Result<grey_core::process::CommandSpec> {
+    use grey_core::process::CommandSpec;
+
+    #[cfg(target_os = "macos")]
+    let spec = CommandSpec::direct("/usr/bin/open", [OsString::from(url)]);
+    #[cfg(target_os = "linux")]
+    let spec = CommandSpec::direct("xdg-open", [OsString::from(url)])
+        .env("PATH", env::var_os("PATH").unwrap_or_default());
+    #[cfg(windows)]
+    let spec = CommandSpec::direct("explorer.exe", [OsString::from(url)]);
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    let spec = bail!("opening a browser is not supported on this platform");
+    Ok(spec.timeout(Duration::from_secs(10)))
 }
 
 const ORCHESTRATE_AGENT_TIMEOUT_SECS: u64 = 120;
@@ -2911,6 +3006,22 @@ fn duplicate_tool_names(tools: &[Arc<dyn ToolExecutor>]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn browser_opener_uses_the_native_binary_without_a_shell() {
+        let spec =
+            browser_opener_spec("https://auth.openai.com/oauth/authorize?state=test").unwrap();
+        assert_eq!(spec.program, OsString::from("/usr/bin/open"));
+        assert_eq!(
+            spec.args,
+            [OsString::from(
+                "https://auth.openai.com/oauth/authorize?state=test"
+            )]
+        );
+        assert!(spec.env.is_empty());
+        assert_eq!(spec.timeout, Duration::from_secs(10));
+    }
 
     #[tokio::test]
     async fn tui_cleanup_merges_idle_cancel_and_ui_error_into_session_end_once() {

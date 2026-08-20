@@ -171,6 +171,22 @@ impl ChatgptOauth {
         self.store.delete().await
     }
 
+    /// Returns only the account metadata that is safe to display in a CLI.
+    pub async fn status(&self) -> Result<ChatgptOauthStatus> {
+        Ok(match self.store.load().await? {
+            Some(token) => ChatgptOauthStatus {
+                logged_in: true,
+                account_id: Some(token.account_id),
+                expires_at: Some(token.expires_at),
+            },
+            None => ChatgptOauthStatus {
+                logged_in: false,
+                account_id: None,
+                expires_at: None,
+            },
+        })
+    }
+
     pub(crate) async fn access(&self) -> Result<AccessGrant> {
         let token = self.store.load().await?.ok_or_else(|| {
             ProviderFailure::new(
@@ -251,6 +267,13 @@ async fn bind_callback_listener(ports: &[u16]) -> Result<(TcpListener, u16)> {
 pub(crate) struct AccessGrant {
     pub(crate) access_token: String,
     pub(crate) account_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatgptOauthStatus {
+    pub logged_in: bool,
+    pub account_id: Option<String>,
+    pub expires_at: Option<u64>,
 }
 
 struct TokenCredential {
@@ -821,6 +844,55 @@ mod tests {
         let first = ChatgptOauth::new().unwrap();
         let second = ChatgptOauth::new().unwrap();
         assert!(Arc::ptr_eq(&first.credential_lock, &second.credential_lock));
+    }
+
+    #[tokio::test]
+    async fn status_projects_only_non_secret_credential_metadata() {
+        let credential = token("access-secret", Some("refresh-secret"), 1_700_000_000);
+        let oauth = ChatgptOauth {
+            store: CredentialStore::new(Arc::new(FakeBackend::with_token(&credential))),
+            exchange: Arc::new(FakeExchange {
+                calls: AtomicUsize::new(0),
+                response: json!({}),
+            }),
+            credential_lock: Arc::new(Mutex::new(())),
+        };
+
+        let status = oauth.status().await.unwrap();
+        assert_eq!(
+            status,
+            ChatgptOauthStatus {
+                logged_in: true,
+                account_id: Some("acct-1".into()),
+                expires_at: Some(1_700_000_000),
+            }
+        );
+        assert!(!format!("{status:?}").contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn status_reports_no_login_without_keyring_credential() {
+        let oauth = ChatgptOauth {
+            store: CredentialStore::new(Arc::new(FakeBackend {
+                value: StdMutex::new(None),
+                fail_replace: StdMutex::new(false),
+                deletes: AtomicUsize::new(0),
+            })),
+            exchange: Arc::new(FakeExchange {
+                calls: AtomicUsize::new(0),
+                response: json!({}),
+            }),
+            credential_lock: Arc::new(Mutex::new(())),
+        };
+
+        assert_eq!(
+            oauth.status().await.unwrap(),
+            ChatgptOauthStatus {
+                logged_in: false,
+                account_id: None,
+                expires_at: None,
+            }
+        );
     }
 
     #[test]

@@ -44,6 +44,21 @@ fn temp_home() -> TestEnv {
 }
 
 #[test]
+fn auth_help_lists_the_three_openai_oauth_actions() {
+    let output = grey().args(["auth", "--help"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Usage: grey auth [OPTIONS] <COMMAND>"));
+    for action in ["login", "status", "logout"] {
+        assert!(stdout.contains(action), "missing {action} in {stdout}");
+    }
+}
+
+#[test]
 fn providers_list_shows_configured_providers() {
     let env = temp_home();
     let output = env.command().args(["providers", "list"]).output().unwrap();
