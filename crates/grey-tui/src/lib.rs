@@ -1826,17 +1826,16 @@ fn render_help_overlay(frame: &mut Frame<'_>, state: &AppState, theme: &RenderTh
 fn render_splash(frame: &mut Frame<'_>, state: &AppState) {
     let theme = state.settings.theme.colors.clone();
     let labels = state.settings.keys.labels();
-    let panel = centered_rect(70, 64, frame.area());
+    let panel = centered_rect(76, 92, frame.area());
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Grey ")
         .border_style(Style::default().fg(theme.border));
     let avatar = [
-        "        ▄▄▄▄▄▄▄▄▄        ",
-        "      ██ ▔     ▔ ██      ",
-        "      ██           ██      ",
-        "      ██     ◡     ██      ",
-        "        ▀▀▀▀▀▀▀▀▀        ",
+        "      ▄▄▄▄▄▄▄      ",
+        "     █ ▔  ▔ █     ",
+        "     █   ◡  █     ",
+        "      ▀▀▀▀▀▀▀      ",
     ];
     let accent = Style::default()
         .fg(theme.accent)
@@ -2598,8 +2597,11 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
         let rows = rendered_rows(&terminal);
-        assert!(rows.iter().any(|row| row.contains("按任意键开始")));
-        assert!(rows.iter().any(|row| row.contains("/model <name>")));
+        assert!(
+            rows.iter().any(|row| row.contains("/model <name>")),
+            "splash renders slash-command hints"
+        );
+        assert!(rows.iter().any(|row| row.contains("Grey")));
 
         assert_eq!(state.reduce_key(key(KeyCode::Char('x'))), UiAction::None);
         assert!(!state.show_splash);
