@@ -1,0 +1,13 @@
+# Volcano Engine Coding Plan uses a dedicated OpenAI-compatible endpoint.
+# Source: https://www.volcengine.com/article/37669
+default_provider = "volcano-coding-plan"
+default_model = "ark-code-latest"
+
+[[providers]]
+id = "volcano-coding-plan"
+protocol = "openai"
+base_url = "https://ark.cn-beijing.volces.com/api/coding/v3"
+api_key = "${ARK_API_KEY}"
+models = [{ id = "ark-code-latest", name = "Ark Code Latest" }]
+
+# Override the selected model with ARK_MODEL, GREY_MODEL, or --model.

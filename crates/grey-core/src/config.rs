@@ -1035,9 +1035,19 @@ fn apply_env(cfg: &mut GreyConfig) -> Result<()> {
                 .parse::<bool>()
                 .with_context(|| format!("{prefix}INCLUDE_USAGE must be true or false"))?;
         }
-        if provider.id == "volcano" && provider.api_key.is_empty() {
+        if (provider.id == "volcano" || provider.id == "volcano-coding-plan")
+            && provider.api_key.is_empty()
+        {
             if let Some(value) = &fallback_ark_api_key {
                 provider.api_key = value.to_string_lossy().into_owned();
+            }
+        }
+    }
+    if cfg.default_provider == "volcano-coding-plan" && env::var_os("GREY_MODEL").is_none() {
+        if let Ok(model) = env::var("ARK_MODEL") {
+            if !model.trim().is_empty() {
+                cfg.model = model.clone();
+                cfg.default_model = model;
             }
         }
     }
@@ -1118,7 +1128,9 @@ pub fn is_secret_field(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::OnceLock;
+    use std::sync::{Mutex, OnceLock};
+
+    static ARK_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_dir() -> &'static Path {
         static DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -1593,6 +1605,7 @@ completion = ["printf 'complete'"]
 
     #[test]
     fn applies_ark_api_key_to_volcano_provider_when_unset() {
+        let _guard = ARK_ENV_LOCK.lock().unwrap();
         let mut cfg = GreyConfig::default();
         cfg.providers.push(ProviderEntry {
             id: "volcano".into(),
@@ -1619,16 +1632,25 @@ completion = ["printf 'complete'"]
 
     #[test]
     fn applies_volcano_api_key_to_volcano_provider_when_unset() {
+        let _guard = ARK_ENV_LOCK.lock().unwrap();
         let mut cfg = GreyConfig::default();
         cfg.providers.push(ProviderEntry {
             id: "volcano".into(),
             protocol: "openai".into(),
             ..Default::default()
         });
+        let previous_ark = env::var_os("ARK_API_KEY");
         let previous_volcano = env::var_os("VOLCANO_API_KEY");
-        unsafe { env::set_var("VOLCANO_API_KEY", "volcano-demo-key") };
+        unsafe {
+            env::remove_var("ARK_API_KEY");
+            env::set_var("VOLCANO_API_KEY", "volcano-demo-key");
+        }
         let result = apply_env(&mut cfg);
         unsafe {
+            match previous_ark {
+                Some(value) => env::set_var("ARK_API_KEY", value),
+                None => env::remove_var("ARK_API_KEY"),
+            }
             match previous_volcano {
                 Some(value) => env::set_var("VOLCANO_API_KEY", value),
                 None => env::remove_var("VOLCANO_API_KEY"),
@@ -1641,5 +1663,129 @@ completion = ["printf 'complete'"]
             .find(|provider| provider.id == "volcano")
             .expect("volcano provider should exist");
         assert_eq!(volcano.api_key, "volcano-demo-key");
+    }
+
+    #[test]
+    fn applies_ark_api_key_to_coding_plan_provider_when_unset() {
+        let _guard = ARK_ENV_LOCK.lock().unwrap();
+        let mut cfg = GreyConfig::default();
+        cfg.providers.push(ProviderEntry {
+            id: "volcano-coding-plan".into(),
+            protocol: "openai".into(),
+            ..Default::default()
+        });
+        let previous_ark = env::var_os("ARK_API_KEY");
+        let previous_volcano = env::var_os("VOLCANO_API_KEY");
+        unsafe {
+            env::set_var("ARK_API_KEY", "ark-coding-plan-key");
+            env::remove_var("VOLCANO_API_KEY");
+        }
+
+        let result = apply_env(&mut cfg);
+
+        unsafe {
+            match previous_ark {
+                Some(value) => env::set_var("ARK_API_KEY", value),
+                None => env::remove_var("ARK_API_KEY"),
+            }
+            match previous_volcano {
+                Some(value) => env::set_var("VOLCANO_API_KEY", value),
+                None => env::remove_var("VOLCANO_API_KEY"),
+            }
+        }
+        result.unwrap();
+        let provider = cfg
+            .providers
+            .iter()
+            .find(|provider| provider.id == "volcano-coding-plan")
+            .expect("Coding Plan provider should exist");
+        assert_eq!(provider.api_key, "ark-coding-plan-key");
+    }
+
+    #[test]
+    fn applies_ark_model_to_coding_plan_default() {
+        let _guard = ARK_ENV_LOCK.lock().unwrap();
+        let mut cfg = GreyConfig::default();
+        cfg.default_provider = "volcano-coding-plan".into();
+        let previous_model = env::var_os("ARK_MODEL");
+        let previous_grey_model = env::var_os("GREY_MODEL");
+        unsafe {
+            env::set_var("ARK_MODEL", "doubao-seed-2.0-code");
+            env::remove_var("GREY_MODEL");
+        }
+
+        let result = apply_env(&mut cfg);
+
+        unsafe {
+            match previous_model {
+                Some(value) => env::set_var("ARK_MODEL", value),
+                None => env::remove_var("ARK_MODEL"),
+            }
+            match previous_grey_model {
+                Some(value) => env::set_var("GREY_MODEL", value),
+                None => env::remove_var("GREY_MODEL"),
+            }
+        }
+        result.unwrap();
+        assert_eq!(cfg.default_model, "doubao-seed-2.0-code");
+        assert_eq!(cfg.model, "doubao-seed-2.0-code");
+    }
+
+    #[test]
+    fn grey_model_overrides_ark_model_for_coding_plan() {
+        let _guard = ARK_ENV_LOCK.lock().unwrap();
+        let mut cfg = GreyConfig::default();
+        cfg.default_provider = "volcano-coding-plan".into();
+        let previous_ark_model = env::var_os("ARK_MODEL");
+        let previous_grey_model = env::var_os("GREY_MODEL");
+        unsafe {
+            env::set_var("ARK_MODEL", "ark-model");
+            env::set_var("GREY_MODEL", "grey-model");
+        }
+
+        let result = apply_env(&mut cfg);
+
+        unsafe {
+            match previous_ark_model {
+                Some(value) => env::set_var("ARK_MODEL", value),
+                None => env::remove_var("ARK_MODEL"),
+            }
+            match previous_grey_model {
+                Some(value) => env::set_var("GREY_MODEL", value),
+                None => env::remove_var("GREY_MODEL"),
+            }
+        }
+        result.unwrap();
+        assert_eq!(cfg.default_model, "grey-model");
+        assert_eq!(cfg.model, "grey-model");
+    }
+
+    #[test]
+    fn empty_ark_model_does_not_clear_coding_plan_default() {
+        let _guard = ARK_ENV_LOCK.lock().unwrap();
+        let mut cfg = GreyConfig::default();
+        cfg.default_provider = "volcano-coding-plan".into();
+        cfg.default_model = "ark-code-latest".into();
+        let previous_ark_model = env::var_os("ARK_MODEL");
+        let previous_grey_model = env::var_os("GREY_MODEL");
+        unsafe {
+            env::set_var("ARK_MODEL", "");
+            env::remove_var("GREY_MODEL");
+        }
+
+        let result = apply_env(&mut cfg);
+
+        unsafe {
+            match previous_ark_model {
+                Some(value) => env::set_var("ARK_MODEL", value),
+                None => env::remove_var("ARK_MODEL"),
+            }
+            match previous_grey_model {
+                Some(value) => env::set_var("GREY_MODEL", value),
+                None => env::remove_var("GREY_MODEL"),
+            }
+        }
+        result.unwrap();
+        assert_eq!(cfg.default_model, "ark-code-latest");
     }
 }

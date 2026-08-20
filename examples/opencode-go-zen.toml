@@ -1,0 +1,37 @@
+# OpenCode Go and Zen templates. Keep protocol selection explicit per endpoint.
+# Sources: https://opencode.ai/zen/go/v1/models and https://opencode.ai/docs/zen
+
+[[providers]]
+id = "opencode-go"
+protocol = "openai"
+base_url = "https://opencode.ai/zen/go/v1"
+api_key = "${OPENCODE_API_KEY}"
+models = [{ id = "mimo-v2.5-pro", name = "MiMo V2.5 Pro" }]
+
+[[providers]]
+id = "opencode-zen-responses"
+protocol = "openai_responses"
+base_url = "https://opencode.ai/zen/v1"
+api_key = "${OPENCODE_API_KEY}"
+models = [{ id = "gpt-5.3-codex", name = "GPT 5.3 Codex" }]
+
+[[providers]]
+id = "opencode-zen-chat"
+protocol = "openai"
+base_url = "https://opencode.ai/zen/v1"
+api_key = "${OPENCODE_API_KEY}"
+models = [{ id = "glm-5", name = "GLM 5" }]
+
+[[providers]]
+id = "opencode-zen-anthropic"
+protocol = "anthropic"
+base_url = "https://opencode.ai/zen/v1"
+api_key = "${OPENCODE_API_KEY}"
+models = [{ id = "claude-sonnet-4-6", name = "Claude Sonnet 4.6" }]
+
+[[providers]]
+id = "opencode-zen-gemini"
+protocol = "gemini"
+base_url = "https://opencode.ai/zen/v1"
+api_key = "${OPENCODE_API_KEY}"
+models = [{ id = "gemini-3.1-pro", name = "Gemini 3.1 Pro" }]
