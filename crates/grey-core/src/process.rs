@@ -427,6 +427,7 @@ mod tests {
 
     #[tokio::test]
     async fn default_environment_does_not_inherit_parent_profile() {
+        let _lock = crate::test_support::test_env_lock();
         assert!(std::env::var_os(PARENT_ENV).is_some());
         let output = run_bounded(helper("print-parent-env")).await.unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -589,6 +590,7 @@ mod tests {
 
     #[test]
     fn process_test_helper() {
+        let _lock = crate::test_support::test_env_lock();
         let Some(mode) = std::env::var_os(MODE_ENV) else {
             return;
         };

@@ -1129,15 +1129,7 @@ pub fn is_secret_field(name: &str) -> bool {
 mod tests {
     use super::*;
     use std::ffi::OsString;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    fn env_test_lock() -> MutexGuard<'static, ()> {
-        ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
+    use std::sync::OnceLock;
 
     struct EnvRestore(Vec<(&'static str, Option<OsString>)>);
 
@@ -1185,7 +1177,7 @@ mod tests {
 
     #[test]
     fn bounded_runtime_defaults_and_file_values_are_clamped() {
-        let _lock = env_test_lock();
+        let _lock = crate::test_support::test_env_lock();
         let defaults = GreyConfig::default();
         assert_eq!(defaults.runtime.event_queue_capacity, 256);
         assert_eq!(defaults.runtime.input_queue_capacity, 256);
@@ -1248,7 +1240,7 @@ skill_max_bytes = {max}
 
     #[test]
     fn env_override_file() {
-        let _lock = env_test_lock();
+        let _lock = crate::test_support::test_env_lock();
         let _restore = EnvRestore::capture(&["GREY_OPENAI_BASE_URL"]);
         let dir = test_dir().join("env-override");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1299,7 +1291,7 @@ skill_max_bytes = {max}
 
     #[test]
     fn expand_refs() {
-        let _lock = env_test_lock();
+        let _lock = crate::test_support::test_env_lock();
         let _restore = EnvRestore::capture(&["GREY_TEST_REF"]);
         unsafe { env::set_var("GREY_TEST_REF", "hello") };
         assert_eq!(expand_env_refs("${GREY_TEST_REF}").unwrap(), "hello");
@@ -1308,7 +1300,7 @@ skill_max_bytes = {max}
 
     #[test]
     fn invalid_anthropic_token_limit_and_missing_secret_reference_are_errors() {
-        let _lock = env_test_lock();
+        let _lock = crate::test_support::test_env_lock();
         let _restore = EnvRestore::capture(&[
             "GREY_ANTHROPIC_MAX_TOKENS",
             "GREY_ANTHROPIC_API_KEY",
@@ -1460,7 +1452,7 @@ scroll_down = "pagedown"
 
     #[test]
     fn parses_plugins_and_expands_refs() {
-        let _lock = env_test_lock();
+        let _lock = crate::test_support::test_env_lock();
         let _restore = EnvRestore::capture(&["GREY_TEST_PLUGIN_CMD", "GREY_TEST_PLUGIN_ARG"]);
         let toml_str = r#"
 [[plugins]]
@@ -1500,7 +1492,7 @@ hook_event = "pre_prompt"
 
     #[test]
     fn parses_hook_and_provider_plugin_kinds() {
-        let _lock = env_test_lock();
+        let _lock = crate::test_support::test_env_lock();
         let _restore = EnvRestore::capture(&["PLUGIN_VERSION"]);
         let toml_str = r#"
 [[plugins]]
@@ -1586,7 +1578,7 @@ completion = ["printf 'complete'"]
 
     #[test]
     fn mcp_tool_env_refs_are_expanded() {
-        let _lock = env_test_lock();
+        let _lock = crate::test_support::test_env_lock();
         let _restore = EnvRestore::capture(&[
             "GREY_ANTHROPIC_MAX_TOKENS",
             "GREY_TEST_MCP_CMD",
@@ -1612,7 +1604,7 @@ completion = ["printf 'complete'"]
 
     #[test]
     fn applies_ark_api_key_to_volcano_provider_when_unset() {
-        let _lock = env_test_lock();
+        let _lock = crate::test_support::test_env_lock();
         let _restore = EnvRestore::capture(&["ARK_API_KEY"]);
         let mut cfg = GreyConfig::default();
         cfg.providers.push(ProviderEntry {
@@ -1633,7 +1625,7 @@ completion = ["printf 'complete'"]
 
     #[test]
     fn applies_volcano_api_key_to_volcano_provider_when_unset() {
-        let _lock = env_test_lock();
+        let _lock = crate::test_support::test_env_lock();
         let _restore = EnvRestore::capture(&["ARK_API_KEY", "VOLCANO_API_KEY"]);
         let mut cfg = GreyConfig::default();
         cfg.providers.push(ProviderEntry {
@@ -1657,7 +1649,7 @@ completion = ["printf 'complete'"]
 
     #[test]
     fn applies_ark_api_key_to_coding_plan_provider_when_unset() {
-        let _lock = env_test_lock();
+        let _lock = crate::test_support::test_env_lock();
         let _restore = EnvRestore::capture(&["ARK_API_KEY", "VOLCANO_API_KEY"]);
         let mut cfg = GreyConfig::default();
         cfg.providers.push(ProviderEntry {
@@ -1683,7 +1675,7 @@ completion = ["printf 'complete'"]
 
     #[test]
     fn applies_ark_model_to_coding_plan_default() {
-        let _lock = env_test_lock();
+        let _lock = crate::test_support::test_env_lock();
         let _restore = EnvRestore::capture(&["ARK_MODEL", "GREY_MODEL"]);
         let mut cfg = GreyConfig::default();
         cfg.default_provider = "volcano-coding-plan".into();
@@ -1701,7 +1693,7 @@ completion = ["printf 'complete'"]
 
     #[test]
     fn grey_model_overrides_ark_model_for_coding_plan() {
-        let _lock = env_test_lock();
+        let _lock = crate::test_support::test_env_lock();
         let _restore = EnvRestore::capture(&["ARK_MODEL", "GREY_MODEL"]);
         let mut cfg = GreyConfig::default();
         cfg.default_provider = "volcano-coding-plan".into();
@@ -1719,7 +1711,7 @@ completion = ["printf 'complete'"]
 
     #[test]
     fn empty_ark_model_does_not_clear_coding_plan_default() {
-        let _lock = env_test_lock();
+        let _lock = crate::test_support::test_env_lock();
         let _restore = EnvRestore::capture(&["ARK_MODEL", "GREY_MODEL"]);
         let mut cfg = GreyConfig::default();
         cfg.default_provider = "volcano-coding-plan".into();

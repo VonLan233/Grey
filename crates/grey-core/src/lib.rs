@@ -17,6 +17,19 @@ pub mod token;
 pub mod tool;
 pub mod usage;
 
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::{Mutex, MutexGuard};
+
+    static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    pub(crate) fn test_env_lock() -> MutexGuard<'static, ()> {
+        TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 pub use agent::{Agent, AgentEvent, AgentOptions, AgentOutcome, ProviderCandidate, ProviderHealth};
 pub use cache::{CacheStats, CachedResponse, RequestCache};
 pub use config::{
