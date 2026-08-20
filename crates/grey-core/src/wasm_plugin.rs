@@ -2,9 +2,8 @@
 
 use std::{
     fmt, fs,
+    io::Read,
     path::{Path, PathBuf},
-    sync::mpsc,
-    thread,
     time::Duration,
 };
 
@@ -23,6 +22,9 @@ use crate::{
 pub const WASM_PLUGIN_PROTOCOL: &str = "grey.wasm-plugin.v1";
 pub const WASM_PLUGIN_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_WASM_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_WASM_TIMEOUT: Duration = Duration::from_secs(300);
+const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
+const MAX_MODULE_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WasmPluginErrorKind {
@@ -58,23 +60,48 @@ impl fmt::Display for WasmPluginError {
 
 impl std::error::Error for WasmPluginError {}
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WasmPluginOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
 }
 
-#[derive(Debug, Clone)]
+impl fmt::Debug for WasmPluginOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WasmPluginOutput")
+            .field("stdout_bytes", &self.stdout.len())
+            .field("stderr_bytes", &self.stderr.len())
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub struct WasmPlugin {
     id: String,
     kind: PluginKind,
-    module: PathBuf,
+    engine: Engine,
+    module: Module,
     timeout: Duration,
     stdout_limit: usize,
     stderr_limit: usize,
     stdin_limit: usize,
     memory_bytes: usize,
     fuel: u64,
+}
+
+impl fmt::Debug for WasmPlugin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WasmPlugin")
+            .field("id", &self.id)
+            .field("kind", &self.kind)
+            .field("timeout", &self.timeout)
+            .field("stdout_limit", &self.stdout_limit)
+            .field("stderr_limit", &self.stderr_limit)
+            .field("stdin_limit", &self.stdin_limit)
+            .field("memory_bytes", &self.memory_bytes)
+            .field("fuel", &self.fuel)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -111,6 +138,7 @@ impl WasmPlugin {
                 "plugin is not configured for the wasm runtime",
             ));
         }
+        let runtime = normalized_runtime(runtime);
 
         let config_dir = regular_directory(config_dir)?;
         let manifest_path = resolve_relative_file(
@@ -135,21 +163,40 @@ impl WasmPlugin {
                 "invalid wasm plugin manifest",
             )
         })?;
-        let module = resolve_relative_file(module_base, &manifest.module)?;
+        let module_path = resolve_relative_file(module_base, &manifest.module)?;
+        let module_bytes = read_bounded_file(&module_path, MAX_MODULE_BYTES, "wasm plugin module")?;
         let timeout =
             Duration::from_millis(plugin.timeout_ms.unwrap_or(
                 u64::try_from(DEFAULT_WASM_TIMEOUT.as_millis()).expect("timeout fits u64"),
-            ));
+            ))
+            .min(MAX_WASM_TIMEOUT);
         if timeout.is_zero() {
             return Err(WasmPluginError::new(
                 WasmPluginErrorKind::Config,
                 "wasm plugin timeout must be greater than zero",
             ));
         }
+        let mut config = Config::new();
+        config.consume_fuel(true);
+        config.epoch_interruption(true);
+        let engine = Engine::new(&config).map_err(|_| {
+            WasmPluginError::new(
+                WasmPluginErrorKind::Runtime,
+                "could not initialize wasm runtime",
+            )
+        })?;
+        // ponytail: fixed 4MiB module input ceiling bounds startup compilation; raise only after a measured plugin need.
+        let module = Module::from_binary(&engine, &module_bytes).map_err(|_| {
+            WasmPluginError::new(
+                WasmPluginErrorKind::Runtime,
+                "could not compile wasm plugin module",
+            )
+        })?;
         Ok(Self {
             id: plugin.id.clone(),
             kind: plugin.kind,
             module,
+            engine,
             timeout,
             stdout_limit: runtime.command_stdout_max_bytes,
             stderr_limit: runtime.command_stderr_max_bytes,
@@ -176,27 +223,48 @@ impl WasmPlugin {
                 "wasm plugin input exceeds configured limit",
             ));
         }
-        let module = self.module.clone();
-        let timeout = self.timeout;
-        let stdout_limit = self.stdout_limit;
-        let stderr_limit = self.stderr_limit;
-        let memory_bytes = self.memory_bytes;
-        let fuel = self.fuel;
-        tokio::task::spawn_blocking(move || {
-            invoke_blocking(
-                module,
+        let ticker = EpochTicker::start(self.engine.clone());
+        let result = tokio::time::timeout(
+            self.timeout,
+            invoke_async(
+                self.engine.clone(),
+                self.module.clone(),
                 input,
-                timeout,
-                stdout_limit,
-                stderr_limit,
-                memory_bytes,
-                fuel,
+                self.stdout_limit,
+                self.stderr_limit,
+                self.memory_bytes,
+                self.fuel,
+            ),
+        )
+        .await;
+        drop(ticker);
+        result.map_err(|_| {
+            WasmPluginError::new(
+                WasmPluginErrorKind::Runtime,
+                "wasm plugin execution timed out",
             )
-        })
-        .await
-        .map_err(|_| {
-            WasmPluginError::new(WasmPluginErrorKind::Runtime, "wasm plugin task failed")
         })?
+    }
+}
+
+fn normalized_runtime(runtime: &RuntimeConfig) -> RuntimeConfig {
+    RuntimeConfig {
+        wasm_memory_bytes: runtime.wasm_memory_bytes.clamp(
+            crate::config::RUNTIME_WASM_MEMORY_MIN,
+            crate::config::RUNTIME_WASM_MEMORY_MAX,
+        ),
+        wasm_fuel: runtime.wasm_fuel.clamp(
+            crate::config::RUNTIME_WASM_FUEL_MIN,
+            crate::config::RUNTIME_WASM_FUEL_MAX,
+        ),
+        command_stdout_max_bytes: runtime
+            .command_stdout_max_bytes
+            .clamp(1024, 64 * 1024 * 1024),
+        command_stderr_max_bytes: runtime
+            .command_stderr_max_bytes
+            .clamp(1024, 64 * 1024 * 1024),
+        response_max_bytes: runtime.response_max_bytes.clamp(1024, 64 * 1024 * 1024),
+        ..RuntimeConfig::default()
     }
 }
 
@@ -253,12 +321,7 @@ fn resolve_relative_file(base: &Path, relative: &str) -> Result<PathBuf, WasmPlu
 }
 
 fn parse_manifest(path: &Path) -> Result<WasmPluginManifest, WasmPluginError> {
-    let bytes = fs::read(path).map_err(|_| {
-        WasmPluginError::new(
-            WasmPluginErrorKind::Manifest,
-            "could not read wasm plugin manifest",
-        )
-    })?;
+    let bytes = read_bounded_file(path, MAX_MANIFEST_BYTES, "wasm plugin manifest")?;
     serde_json::from_slice(&bytes).map_err(|_| {
         WasmPluginError::new(
             WasmPluginErrorKind::Manifest,
@@ -267,32 +330,80 @@ fn parse_manifest(path: &Path) -> Result<WasmPluginManifest, WasmPluginError> {
     })
 }
 
-fn invoke_blocking(
-    module_path: PathBuf,
+fn read_bounded_file(path: &Path, max_bytes: u64, label: &str) -> Result<Vec<u8>, WasmPluginError> {
+    let mut file = fs::File::open(path).map_err(|_| {
+        WasmPluginError::new(
+            WasmPluginErrorKind::Manifest,
+            format!("could not open {label}"),
+        )
+    })?;
+    let metadata = file.metadata().map_err(|_| {
+        WasmPluginError::new(
+            WasmPluginErrorKind::Manifest,
+            format!("could not inspect {label}"),
+        )
+    })?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        return Err(WasmPluginError::new(
+            WasmPluginErrorKind::Manifest,
+            format!("{label} exceeds the sealed size limit"),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    file.by_ref()
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|_| {
+            WasmPluginError::new(
+                WasmPluginErrorKind::Manifest,
+                format!("could not read {label}"),
+            )
+        })?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(WasmPluginError::new(
+            WasmPluginErrorKind::Manifest,
+            format!("{label} exceeds the sealed size limit"),
+        ));
+    }
+    Ok(bytes)
+}
+
+struct EpochTicker(Option<tokio::sync::oneshot::Sender<()>>);
+
+impl EpochTicker {
+    fn start(engine: Engine) -> Self {
+        let (stop, mut stopped) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(1)) => engine.increment_epoch(),
+                    _ = &mut stopped => return,
+                }
+            }
+        });
+        Self(Some(stop))
+    }
+}
+
+impl Drop for EpochTicker {
+    fn drop(&mut self) {
+        if let Some(stop) = self.0.take() {
+            let _ = stop.send(());
+        }
+    }
+}
+
+async fn invoke_async(
+    engine: Engine,
+    module: Module,
     input: Vec<u8>,
-    timeout: Duration,
     stdout_limit: usize,
     stderr_limit: usize,
     memory_bytes: usize,
     fuel: u64,
 ) -> Result<WasmPluginOutput, WasmPluginError> {
-    let mut config = Config::new();
-    config.consume_fuel(true);
-    config.epoch_interruption(true);
-    let engine = Engine::new(&config).map_err(|_| {
-        WasmPluginError::new(
-            WasmPluginErrorKind::Runtime,
-            "could not initialize wasm runtime",
-        )
-    })?;
-    let module = Module::from_file(&engine, &module_path).map_err(|_| {
-        WasmPluginError::new(
-            WasmPluginErrorKind::Runtime,
-            "could not load wasm plugin module",
-        )
-    })?;
-    let stdout = MemoryOutputPipe::new(stdout_limit);
-    let stderr = MemoryOutputPipe::new(stderr_limit);
+    let stdout = MemoryOutputPipe::new(stdout_limit.saturating_add(1));
+    let stderr = MemoryOutputPipe::new(stderr_limit.saturating_add(1));
     let mut builder = WasiCtxBuilder::new();
     builder
         .stdin(MemoryInputPipe::new(input))
@@ -316,42 +427,37 @@ fn invoke_blocking(
             "could not set wasm fuel limit",
         )
     })?;
-    store.set_epoch_deadline(1);
-    store.epoch_deadline_trap();
-    let (done_tx, done_rx) = mpsc::channel();
-    let timer_engine = engine.clone();
-    let timer = thread::spawn(move || {
-        if done_rx.recv_timeout(timeout).is_err() {
-            timer_engine.increment_epoch();
-        }
-    });
-    let result = (|| {
-        let mut linker = Linker::new(&engine);
-        p1::add_to_linker_sync(&mut linker, |state: &mut WasiState| &mut state.wasi).map_err(
-            |_| WasmPluginError::new(WasmPluginErrorKind::Runtime, "could not link wasm plugin"),
-        )?;
-        let instance = linker.instantiate(&mut store, &module).map_err(|_| {
+    store.epoch_deadline_async_yield_and_update(1);
+    let mut linker = Linker::new(&engine);
+    p1::add_to_linker_async(&mut linker, |state: &mut WasiState| &mut state.wasi).map_err(
+        |_| WasmPluginError::new(WasmPluginErrorKind::Runtime, "could not link wasm plugin"),
+    )?;
+    let instance = linker
+        .instantiate_async(&mut store, &module)
+        .await
+        .map_err(|_| {
             WasmPluginError::new(WasmPluginErrorKind::Runtime, "could not start wasm plugin")
         })?;
-        let start = instance
-            .get_typed_func::<(), ()>(&mut store, "_start")
-            .map_err(|_| {
-                WasmPluginError::new(
-                    WasmPluginErrorKind::Runtime,
-                    "wasm plugin has no _start entrypoint",
-                )
-            })?;
-        start.call(&mut store, ()).map_err(|_| {
-            WasmPluginError::new(WasmPluginErrorKind::Runtime, "wasm plugin execution failed")
-        })
-    })();
-    let _ = done_tx.send(());
-    let _ = timer.join();
-    result?;
-    Ok(WasmPluginOutput {
-        stdout: stdout.contents().to_vec(),
-        stderr: stderr.contents().to_vec(),
-    })
+    let start = instance
+        .get_typed_func::<(), ()>(&mut store, "_start")
+        .map_err(|_| {
+            WasmPluginError::new(
+                WasmPluginErrorKind::Runtime,
+                "wasm plugin has no _start entrypoint",
+            )
+        })?;
+    start.call_async(&mut store, ()).await.map_err(|_| {
+        WasmPluginError::new(WasmPluginErrorKind::Runtime, "wasm plugin execution failed")
+    })?;
+    let stdout = stdout.contents().to_vec();
+    let stderr = stderr.contents().to_vec();
+    if stdout.len() > stdout_limit || stderr.len() > stderr_limit {
+        return Err(WasmPluginError::new(
+            WasmPluginErrorKind::Runtime,
+            "wasm plugin output exceeds configured limit",
+        ));
+    }
+    Ok(WasmPluginOutput { stdout, stderr })
 }
 
 #[cfg(test)]
@@ -464,6 +570,31 @@ mod tests {
         assert_eq!(error.kind(), WasmPluginErrorKind::Manifest);
     }
 
+    #[test]
+    fn manifest_rejects_each_identity_contract_mismatch() {
+        let root = write_fixture(ECHO);
+        let manifest = root.path().join("plugins/echo/plugin.json");
+        for value in [
+            serde_json::json!({"schema_version":2,"id":"echo","kind":"tool","protocol":WASM_PLUGIN_PROTOCOL,"wasi":"preview1-stdio","module":"module.wasm"}),
+            serde_json::json!({"schema_version":1,"id":"other","kind":"tool","protocol":WASM_PLUGIN_PROTOCOL,"wasi":"preview1-stdio","module":"module.wasm"}),
+            serde_json::json!({"schema_version":1,"id":"echo","kind":"theme","protocol":WASM_PLUGIN_PROTOCOL,"wasi":"preview1-stdio","module":"module.wasm"}),
+            serde_json::json!({"schema_version":1,"id":"echo","kind":"tool","protocol":"other","wasi":"preview1-stdio","module":"module.wasm"}),
+            serde_json::json!({"schema_version":1,"id":"echo","kind":"tool","protocol":WASM_PLUGIN_PROTOCOL,"wasi":"preview2","module":"module.wasm"}),
+        ] {
+            fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+            assert_eq!(
+                WasmPlugin::from_config(
+                    &plugin("plugins/echo/plugin.json"),
+                    root.path(),
+                    &RuntimeConfig::default(),
+                )
+                .unwrap_err()
+                .kind(),
+                WasmPluginErrorKind::Manifest
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn manifest_rejects_symlinked_plugin_files() {
@@ -510,6 +641,127 @@ mod tests {
         assert_eq!(
             wasm.invoke(Vec::new()).await.unwrap_err().kind(),
             WasmPluginErrorKind::Runtime
+        );
+    }
+
+    #[test]
+    fn bounded_loader_rejects_oversized_manifest_and_module() {
+        let root = write_fixture(ECHO);
+        let manifest = root.path().join("plugins/echo/plugin.json");
+        fs::write(&manifest, vec![b'x'; (MAX_MANIFEST_BYTES + 1) as usize]).unwrap();
+        assert_eq!(
+            WasmPlugin::from_config(
+                &plugin("plugins/echo/plugin.json"),
+                root.path(),
+                &RuntimeConfig::default(),
+            )
+            .unwrap_err()
+            .kind(),
+            WasmPluginErrorKind::Manifest
+        );
+
+        let module = root.path().join("plugins/echo/module.wasm");
+        fs::write(&module, b"too large").unwrap();
+        assert_eq!(
+            read_bounded_file(&module, 1, "wasm plugin module")
+                .unwrap_err()
+                .kind(),
+            WasmPluginErrorKind::Manifest
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_an_infinite_invocation_cancels_without_waiting_for_plugin_timeout() {
+        let looped = write_fixture(r#"(module (func (export "_start") (loop br 0)))"#);
+        let mut loop_plugin = plugin("plugins/echo/plugin.json");
+        loop_plugin.timeout_ms = Some(60_000);
+        let wasm = WasmPlugin::from_config(&loop_plugin, looped.path(), &RuntimeConfig::default())
+            .unwrap();
+        let task = tokio::spawn(async move { wasm.invoke(Vec::new()).await });
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn runtime_limits_and_stdio_output_cap_cannot_be_bypassed_by_handbuilt_config() {
+        let root = write_fixture(ECHO);
+        let runtime = RuntimeConfig {
+            response_max_bytes: 0,
+            command_stdout_max_bytes: usize::MAX,
+            command_stderr_max_bytes: 0,
+            wasm_memory_bytes: usize::MAX,
+            wasm_fuel: u64::MAX,
+            ..RuntimeConfig::default()
+        };
+        let wasm =
+            WasmPlugin::from_config(&plugin("plugins/echo/plugin.json"), root.path(), &runtime)
+                .unwrap();
+        assert_eq!(wasm.memory_bytes, crate::config::RUNTIME_WASM_MEMORY_MAX);
+        assert_eq!(wasm.fuel, crate::config::RUNTIME_WASM_FUEL_MAX);
+        assert_eq!(wasm.stdout_limit, 64 * 1024 * 1024);
+        assert_eq!(wasm.stderr_limit, 1024);
+        assert_eq!(wasm.stdin_limit, 1024);
+        assert_eq!(
+            wasm.invoke(vec![b'x'; 1025]).await.unwrap_err().kind(),
+            WasmPluginErrorKind::Runtime
+        );
+    }
+
+    #[tokio::test]
+    async fn stdio_and_entrypoint_failures_are_bounded() {
+        let root = write_fixture(ECHO);
+        let runtime = RuntimeConfig {
+            response_max_bytes: 2_048,
+            command_stdout_max_bytes: 1_024,
+            ..RuntimeConfig::default()
+        };
+        let wasm =
+            WasmPlugin::from_config(&plugin("plugins/echo/plugin.json"), root.path(), &runtime)
+                .unwrap();
+        let output = wasm.invoke(vec![b'x'; 1_025]).await.unwrap();
+        assert_eq!(output.stdout.len(), 1_024);
+
+        let no_start = write_fixture("(module)");
+        let wasm = WasmPlugin::from_config(
+            &plugin("plugins/echo/plugin.json"),
+            no_start.path(),
+            &RuntimeConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            wasm.invoke(Vec::new()).await.unwrap_err().kind(),
+            WasmPluginErrorKind::Runtime
+        );
+    }
+
+    #[tokio::test]
+    async fn wasi_runtime_exposes_no_arguments_environment_or_preopened_directories() {
+        let root = write_fixture(
+            r#"(module
+                (import "wasi_snapshot_preview1" "args_sizes_get" (func $args (param i32 i32) (result i32)))
+                (import "wasi_snapshot_preview1" "environ_sizes_get" (func $env (param i32 i32) (result i32)))
+                (import "wasi_snapshot_preview1" "fd_prestat_get" (func $prestat (param i32 i32) (result i32)))
+                (import "wasi_snapshot_preview1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
+                (memory 1) (export "memory" (memory 0))
+                (func (export "_start")
+                  i32.const 0 i32.const 4 call $args drop
+                  i32.const 8 i32.const 12 call $env drop
+                  i32.const 16 i32.const 3 i32.const 20 call $prestat i32.store
+                  i32.const 32 i32.const 0 i32.store
+                  i32.const 36 i32.const 20 i32.store
+                  i32.const 1 i32.const 32 i32.const 1 i32.const 40 call $write drop))"#,
+        );
+        let wasm = WasmPlugin::from_config(
+            &plugin("plugins/echo/plugin.json"),
+            root.path(),
+            &RuntimeConfig::default(),
+        )
+        .unwrap();
+        let output = wasm.invoke(Vec::new()).await.unwrap();
+        assert_eq!(&output.stdout[..16], [0; 16]);
+        assert_ne!(
+            u32::from_le_bytes(output.stdout[16..20].try_into().unwrap()),
+            0
         );
     }
 }
