@@ -9,6 +9,7 @@ fn single_prompt_has_scriptable_json_output_without_network() {
     let workspace = tempfile::tempdir().unwrap();
     let output = grey()
         .current_dir(workspace.path())
+        .env("HOME", workspace.path())
         .args(["--no-save", "--format", "json", "hello"])
         .output()
         .unwrap();
@@ -41,6 +42,7 @@ fn sessions_can_be_saved_listed_shown_and_resumed() {
     let database = directory.path().join("sessions.db");
     let first = grey()
         .current_dir(directory.path())
+        .env("HOME", directory.path())
         .env("GREY_SESSION_DB", &database)
         .args(["--format", "json", "first prompt"])
         .output()
@@ -71,6 +73,7 @@ fn sessions_can_be_saved_listed_shown_and_resumed() {
 
     let second = grey()
         .current_dir(directory.path())
+        .env("HOME", directory.path())
         .env("GREY_SESSION_DB", &database)
         .args(["--session", session_id, "--format", "json", "second prompt"])
         .output()
