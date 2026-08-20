@@ -34,7 +34,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
     Frame, Terminal,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use unicode_width::UnicodeWidthStr;
 
 const DEMO_REPLY: &str = "Grey 是一个轻量、高性能、可扩展的代码 Agent Harness。\n\n这是 Spike A 的模拟流式输出：消息按小块持续流入 TUI 并增量渲染，状态栏实时显示帧耗时与渲染频率。输入内容后回车会触发一轮新的模拟回复，Esc、Ctrl-C 或空输入时按 q 退出。";
@@ -489,7 +489,37 @@ pub enum UiAction {
         prompt: String,
         rejected_input: String,
     },
+    SwitchModel {
+        model: String,
+    },
     Quit,
+}
+
+/// A `/`-prefixed command parsed from the input line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SlashCommand {
+    Help,
+    Clear,
+    Quit,
+    Model { model: String },
+    Unknown(String),
+}
+
+impl SlashCommand {
+    fn parse(input: &str) -> Self {
+        let body = input.strip_prefix('/').unwrap_or(input).trim();
+        let (name, argument) = body.split_once(char::is_whitespace).unwrap_or((body, ""));
+        let name = name.trim().to_ascii_lowercase();
+        match name.as_str() {
+            "help" | "?" => Self::Help,
+            "clear" => Self::Clear,
+            "quit" | "exit" => Self::Quit,
+            "model" => Self::Model {
+                model: argument.trim().to_owned(),
+            },
+            other => Self::Unknown(other.to_owned()),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -824,6 +854,60 @@ impl AppState {
         self.dirty = true;
     }
 
+    fn clear_output(&mut self) {
+        self.clear_completion_notice();
+        self.output.clear();
+        self.pending_completion_bell = None;
+        self.status = "output cleared".into();
+        self.scroll = 0;
+        self.max_scroll = 0;
+        self.status_error = false;
+        self.dirty = true;
+    }
+
+    fn apply_slash_command(&mut self) -> UiAction {
+        let input = self.input.text.clone();
+        match SlashCommand::parse(&input) {
+            SlashCommand::Help => {
+                self.input.take();
+                self.show_help = true;
+                self.status = "help".into();
+                self.dirty = true;
+                UiAction::None
+            }
+            SlashCommand::Clear => {
+                self.input.take();
+                self.clear_output();
+                UiAction::None
+            }
+            SlashCommand::Quit => {
+                self.input.take();
+                self.clear_completion_notice();
+                self.leader_armed = false;
+                UiAction::Quit
+            }
+            SlashCommand::Model { model } if model.is_empty() => {
+                self.status = "usage: /model <name>".into();
+                self.status_error = true;
+                self.dirty = true;
+                UiAction::None
+            }
+            SlashCommand::Model { model } => {
+                self.input.take();
+                self.status = format!("switching model to {model}");
+                self.status_error = false;
+                self.dirty = true;
+                UiAction::SwitchModel { model }
+            }
+            SlashCommand::Unknown(name) => {
+                self.status = format!("unknown command /{name}");
+                self.status_error = true;
+                self.dirty = true;
+                UiAction::None
+            }
+        }
+    }
+
     fn completion_notice(&self) -> Option<&str> {
         self.persistent_completion_message.as_deref()
     }
@@ -897,14 +981,7 @@ impl AppState {
         }
 
         if self.settings.keys.clear.matches(key) {
-            self.clear_completion_notice();
-            self.output.clear();
-            self.pending_completion_bell = None;
-            self.status = "output cleared".into();
-            self.scroll = 0;
-            self.max_scroll = 0;
-            self.status_error = false;
-            self.dirty = true;
+            self.clear_output();
             return UiAction::None;
         }
 
@@ -980,6 +1057,9 @@ impl AppState {
                 if self.turn_started_at.is_some() {
                     self.note_prompt_busy(None);
                     return UiAction::None;
+                }
+                if self.input.text.starts_with('/') {
+                    return self.apply_slash_command();
                 }
                 let rejected_input = self.input.take();
                 let prompt = rejected_input.trim().to_owned();
@@ -1182,6 +1262,7 @@ fn utf8_suffix_start(text: &str, max_bytes: usize) -> usize {
 pub async fn run_agent_tui(
     events: mpsc::Receiver<AgentEvent>,
     prompts: PromptSender,
+    model_switch: watch::Sender<Option<String>>,
     tui_config: &TuiConfig,
     runtime_config: &RuntimeConfig,
     git_branch: Option<&str>,
@@ -1198,6 +1279,7 @@ pub async fn run_agent_tui(
         &mut terminal,
         events,
         prompts,
+        model_switch,
         input_events,
         state,
         trigger_completion_notification,
@@ -1219,9 +1301,11 @@ pub async fn run_stream_demo() -> Result<()> {
     let (agent_sender, agent_events) = mpsc::channel(runtime.event_queue_capacity);
     let (prompt_sender, prompt_receiver) = mpsc::channel(runtime.prompt_queue_capacity);
     let demo = tokio::spawn(run_demo_driver(agent_sender, prompt_receiver));
+    let (model_switch, _) = watch::channel(None);
     let result = run_agent_tui(
         agent_events,
         prompt_sender,
+        model_switch,
         &TuiConfig::default(),
         &runtime,
         None,
@@ -1235,6 +1319,7 @@ async fn run_loop<B: Backend>(
     terminal: &mut Terminal<B>,
     mut agent_events: mpsc::Receiver<AgentEvent>,
     prompts: PromptSender,
+    model_switch: watch::Sender<Option<String>>,
     mut input_events: mpsc::Receiver<InputMessage>,
     mut state: AppState,
     notify: fn(&CompletionSettings, String) -> Result<()>,
@@ -1249,7 +1334,7 @@ async fn run_loop<B: Backend>(
                 match input.context("terminal input thread stopped")? {
                     InputMessage::Key(key) => {
                         let action = state.reduce_key(key);
-                        if dispatch_action(action, &prompts, &mut state)? {
+                        if dispatch_action(action, &prompts, &model_switch, &mut state)? {
                             return Ok(());
                         }
                     }
@@ -1310,10 +1395,20 @@ fn draw_if_dirty<B: Backend>(terminal: &mut Terminal<B>, state: &mut AppState) -
     Ok(true)
 }
 
-fn dispatch_action(action: UiAction, prompts: &PromptSender, state: &mut AppState) -> Result<bool> {
+fn dispatch_action(
+    action: UiAction,
+    prompts: &PromptSender,
+    model_switch: &watch::Sender<Option<String>>,
+    state: &mut AppState,
+) -> Result<bool> {
     match action {
         UiAction::None => Ok(false),
         UiAction::Quit => Ok(true),
+        UiAction::SwitchModel { model } => {
+            model_switch.send_replace(Some(model.clone()));
+            state.current_model = Some(model);
+            Ok(false)
+        }
         UiAction::Submit {
             prompt,
             rejected_input,
@@ -1746,6 +1841,11 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    fn model_switch() -> watch::Sender<Option<String>> {
+        let (sender, _) = watch::channel(None);
+        sender
+    }
+
     #[test]
     fn input_reducer_edits_submits_and_handles_every_exit_key() {
         let mut state = AppState::default();
@@ -1786,6 +1886,96 @@ mod tests {
         released.kind = KeyEventKind::Release;
         assert_eq!(state.reduce_key(released), UiAction::None);
         assert_eq!(state.input(), "");
+    }
+
+    fn type_text(state: &mut AppState, text: &str) {
+        for character in text.chars() {
+            assert_eq!(
+                state.reduce_key(key(KeyCode::Char(character))),
+                UiAction::None
+            );
+        }
+    }
+
+    #[test]
+    fn slash_commands_dispatch_locally_or_switch_model() {
+        let mut help = AppState::default();
+        type_text(&mut help, "/help");
+        assert_eq!(help.reduce_key(key(KeyCode::Enter)), UiAction::None);
+        assert!(help.show_help);
+        assert_eq!(help.input(), "");
+
+        let mut clear = AppState::default();
+        clear.output.push_str("old transcript");
+        type_text(&mut clear, "/clear");
+        assert_eq!(clear.reduce_key(key(KeyCode::Enter)), UiAction::None);
+        assert!(clear.output.is_empty());
+
+        assert_eq!(
+            AppState::default().reduce_key(key(KeyCode::Enter)),
+            UiAction::None,
+            "empty input stays inert"
+        );
+
+        for command in ["/quit", "/exit"] {
+            let mut quitting = AppState::default();
+            type_text(&mut quitting, command);
+            assert_eq!(quitting.reduce_key(key(KeyCode::Enter)), UiAction::Quit);
+        }
+
+        let mut model = AppState::default();
+        type_text(&mut model, "/model deepseek-v4-flash-ga-260731");
+        assert_eq!(
+            model.reduce_key(key(KeyCode::Enter)),
+            UiAction::SwitchModel {
+                model: "deepseek-v4-flash-ga-260731".into()
+            }
+        );
+        assert_eq!(model.input(), "");
+
+        let mut missing = AppState::default();
+        type_text(&mut missing, "/model");
+        assert_eq!(missing.reduce_key(key(KeyCode::Enter)), UiAction::None);
+        assert!(missing.status_error);
+        assert_eq!(missing.input(), "/model", "kept for editing");
+
+        let mut unknown = AppState::default();
+        type_text(&mut unknown, "/nope");
+        assert_eq!(unknown.reduce_key(key(KeyCode::Enter)), UiAction::None);
+        assert!(unknown.status.contains("unknown command /nope"));
+        assert_eq!(unknown.input(), "/nope", "kept for editing");
+
+        let mut normal = AppState::default();
+        type_text(&mut normal, "not a command");
+        assert_eq!(
+            normal.reduce_key(key(KeyCode::Enter)),
+            UiAction::Submit {
+                prompt: "not a command".into(),
+                rejected_input: "not a command".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn slash_command_parse_normalizes_names_and_arguments() {
+        use SlashCommand as Command;
+        assert_eq!(Command::parse("/HELP"), Command::Help);
+        assert_eq!(Command::parse("/?"), Command::Help);
+        assert_eq!(Command::parse("/clear   "), Command::Clear);
+        assert_eq!(Command::parse("/exit"), Command::Quit);
+        assert_eq!(
+            Command::parse("/model  deepseek-v4"),
+            Command::Model {
+                model: "deepseek-v4".into()
+            }
+        );
+        assert_eq!(
+            Command::parse("/model"),
+            Command::Model {
+                model: String::new()
+            }
+        );
+        assert_eq!(Command::parse("/wat"), Command::Unknown("wat".into()));
     }
 
     #[test]
@@ -2140,13 +2330,13 @@ mod tests {
             state.reduce_key(key(KeyCode::Char(character)));
         }
         let first = state.reduce_key(key(KeyCode::Enter));
-        assert!(!dispatch_action(first, &sender, &mut state).unwrap());
+        assert!(!dispatch_action(first, &sender, &model_switch(), &mut state).unwrap());
 
         for character in "retry".chars() {
             state.reduce_key(key(KeyCode::Char(character)));
         }
         let second = state.reduce_key(key(KeyCode::Enter));
-        assert!(!dispatch_action(second, &sender, &mut state).unwrap());
+        assert!(!dispatch_action(second, &sender, &model_switch(), &mut state).unwrap());
 
         assert_eq!(state.input(), "retry");
         assert!(state.status().contains("busy"));
@@ -2166,6 +2356,7 @@ mod tests {
                 rejected_input: "retry me".into(),
             },
             &sender,
+            &model_switch(),
             &mut state,
         )
         .unwrap());
@@ -2184,7 +2375,7 @@ mod tests {
         }
 
         let action = state.reduce_key(key(KeyCode::Enter));
-        assert!(!dispatch_action(action, &sender, &mut state).unwrap());
+        assert!(!dispatch_action(action, &sender, &model_switch(), &mut state).unwrap());
 
         assert_eq!(state.input(), " retry ");
     }
@@ -2199,6 +2390,7 @@ mod tests {
                 rejected_input: "turn-a".into(),
             },
             &sender,
+            &model_switch(),
             &mut state,
         )
         .unwrap();
@@ -2218,7 +2410,7 @@ mod tests {
             model: "model".into(),
         });
         let turn_b = state.reduce_key(key(KeyCode::Enter));
-        dispatch_action(turn_b, &sender, &mut state).unwrap();
+        dispatch_action(turn_b, &sender, &model_switch(), &mut state).unwrap();
         assert_eq!(receiver.recv().await.as_deref(), Some("turn-b"));
 
         state.reduce_agent_event(AgentEvent::Warning("completion hook failed".into()));
@@ -2262,6 +2454,7 @@ mod tests {
             &mut terminal,
             agent_events,
             prompt_sender,
+            model_switch(),
             input_events,
             state,
             count_notification,
@@ -2311,11 +2504,12 @@ mod tests {
                 rejected_input: "inspect".into(),
             },
             &sender,
+            &model_switch(),
             &mut state,
         )
         .unwrap());
         assert_eq!(receiver.recv().await.as_deref(), Some("inspect"));
-        assert!(dispatch_action(UiAction::Quit, &sender, &mut state).unwrap());
+        assert!(dispatch_action(UiAction::Quit, &sender, &model_switch(), &mut state).unwrap());
     }
 
     static RESTORE_CALLS: AtomicUsize = AtomicUsize::new(0);

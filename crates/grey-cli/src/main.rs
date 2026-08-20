@@ -2652,6 +2652,7 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
     let (prompts_tx, mut prompts_rx) =
         mpsc::channel::<String>(config.runtime.prompt_queue_capacity);
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let (model_switch_tx, mut model_switch_rx) = watch::channel::<Option<String>>(None);
     let workspace_for_worker = workspace.to_path_buf();
     let workspace_name_for_worker = workspace_for_worker.to_string_lossy().into_owned();
     let workspace_for_cleanup = workspace_for_worker.clone();
@@ -2662,6 +2663,7 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
     let worker_hooks = hooks.clone();
     let hook_workspace_for_worker = workspace_for_worker.clone();
     let worker = tokio::spawn(async move {
+        let mut agent = agent;
         let mut session = existing;
         let mut summary = TuiWorkerSummary::new(initial_provider, initial_model);
         'worker: loop {
@@ -2670,6 +2672,15 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
                 changed = shutdown_rx.changed() => {
                     if changed.is_err() || *shutdown_rx.borrow() {
                         break;
+                    }
+                    continue;
+                }
+                changed = model_switch_rx.changed() => {
+                    if let Ok(()) = changed {
+                        if let Some(model) = model_switch_rx.borrow().clone() {
+                            agent.set_model(&model);
+                            summary.model = model;
+                        }
                     }
                     continue;
                 }
@@ -2899,6 +2910,7 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
         let ui = grey_tui::run_agent_tui(
             events_rx,
             prompts_tx.clone(),
+            model_switch_tx,
             &tui_config,
             &config.runtime,
             branch.as_deref(),
