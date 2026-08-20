@@ -212,6 +212,12 @@ impl Agent {
         &self.options.model
     }
 
+    /// Switches the model used by subsequent turns without rebuilding the agent.
+    /// The bound provider stays unchanged, so the model must be served by it.
+    pub fn set_model(&mut self, model: impl Into<String>) {
+        self.options.model = model.into();
+    }
+
     pub async fn run_new(
         &self,
         system_prompt: impl Into<String>,
@@ -970,6 +976,18 @@ mod tests {
             ContextManager::default(),
             options,
         )
+    }
+
+    #[test]
+    fn set_model_switches_the_model_for_subsequent_turns() {
+        let provider = Arc::new(ScriptedProvider {
+            turns: Mutex::new(VecDeque::new()),
+            requests: Mutex::new(Vec::new()),
+        });
+        let mut agent = agent(provider, 1);
+        assert_eq!(agent.model(), "model");
+        agent.set_model("deepseek-v4-flash-ga-260731");
+        assert_eq!(agent.model(), "deepseek-v4-flash-ga-260731");
     }
 
     #[tokio::test]
