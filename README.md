@@ -4,7 +4,7 @@
 > 默认极简，一切按需扩展。快是特性，省是特性，顺是特性。
 
 <p align="center">
-  <img src="docs/assets/grey-logo.png" alt="Grey" width="128" />
+  <img src="docs/assets/grey-logo-transparent.png" alt="Grey" width="128" />
 </p>
 
 <p align="center">
