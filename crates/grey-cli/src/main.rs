@@ -133,6 +133,21 @@ enum PluginKindArg {
     Theme,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum PluginRuntimeArg {
+    Command,
+    Wasm,
+}
+
+impl PluginRuntimeArg {
+    fn to_core(self) -> PluginRuntime {
+        match self {
+            Self::Command => PluginRuntime::Command,
+            Self::Wasm => PluginRuntime::Wasm,
+        }
+    }
+}
+
 impl PluginKindArg {
     fn to_core(self) -> PluginKind {
         match self {
@@ -192,6 +207,11 @@ enum Command {
     Plugins {
         #[command(subcommand)]
         action: PluginAction,
+    },
+    /// Hook extension management (P10).
+    Hooks {
+        #[command(subcommand)]
+        action: HookAction,
     },
     /// Request cache management.
     Cache {
@@ -291,11 +311,18 @@ enum ProviderAction {
 }
 
 #[derive(Subcommand, Clone)]
+#[allow(clippy::large_enum_variant)] // clap owns this short-lived parsed command value.
 enum PluginAction {
     /// List configured plugins.
     List,
     /// Show plugin details by id.
     Show { id: String },
+    /// Find plugins by id, command, or description.
+    Find {
+        query: String,
+        #[arg(long, value_enum)]
+        kind: Option<PluginKindArg>,
+    },
     /// Add or update a plugin entry.
     Add {
         id: String,
@@ -322,6 +349,15 @@ enum PluginAction {
         /// Command timeout override in milliseconds.
         #[arg(long)]
         timeout_ms: Option<u64>,
+        /// Plugin execution runtime.
+        #[arg(long, value_enum, default_value_t = PluginRuntimeArg::Command)]
+        runtime: PluginRuntimeArg,
+        /// Sealed WASM plugin manifest path.
+        #[arg(long)]
+        manifest: Option<String>,
+        /// SHA-256 of the sealed WASM manifest.
+        #[arg(long)]
+        manifest_sha256: Option<String>,
         /// Enable plugin immediately.
         #[arg(long, default_value_t = true)]
         enabled: bool,
@@ -332,6 +368,51 @@ enum PluginAction {
     Enable { id: String },
     /// Disable an existing plugin.
     Disable { id: String },
+}
+
+#[derive(Subcommand, Clone)]
+enum HookAction {
+    /// List configured hook plugins and legacy hooks.
+    List,
+    /// Show a configured hook plugin by id.
+    Show {
+        id: String,
+    },
+    /// Find hook plugins by id, command, or description.
+    Find {
+        query: String,
+    },
+    /// Add or update a command hook plugin.
+    Add {
+        id: String,
+        #[arg(long)]
+        event: String,
+        #[arg(long)]
+        command: String,
+        #[arg(long = "arg")]
+        args: Vec<String>,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long)]
+        version: Option<String>,
+        #[arg(long)]
+        timeout_ms: Option<u64>,
+        #[arg(long, value_enum, default_value_t = PluginRuntimeArg::Command)]
+        runtime: PluginRuntimeArg,
+        #[arg(long, default_value_t = true)]
+        enabled: bool,
+    },
+    Remove {
+        id: String,
+    },
+    Enable {
+        id: String,
+    },
+    Disable {
+        id: String,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -527,6 +608,7 @@ async fn run_command(cli: &Cli, command: Command) -> Result<()> {
         Command::Sessions { action } => run_sessions(action),
         Command::Providers { action } => run_providers(action),
         Command::Plugins { action } => run_plugins(action),
+        Command::Hooks { action } => run_hooks(action),
         Command::Cache { action } => run_cache(action),
         Command::Usage { action } => run_usage(action),
         Command::Auth { action } => run_auth(action).await,
@@ -2763,28 +2845,21 @@ fn run_plugins(action: PluginAction) -> Result<()> {
     match action {
         PluginAction::List => {
             let plugins = read_raw_plugins(&config_path)?;
-            if plugins.is_empty() {
-                println!("(no plugins configured)");
-                return Ok(());
-            }
-            for plugin in &plugins {
-                let kind = format_plugin_kind(plugin.kind);
-                println!(
-                    "{}\t{}\t{}\t{}",
-                    plugin.id,
-                    kind,
-                    if plugin.enabled {
-                        "enabled"
-                    } else {
-                        "disabled"
-                    },
-                    plugin.hook_event.as_deref().unwrap_or("-")
-                );
-            }
+            print_plugins(&plugins, None);
             Ok(())
         }
         PluginAction::Show { id } => {
             show_raw_plugin(&config_path, &id)?;
+            Ok(())
+        }
+        PluginAction::Find { query, kind } => {
+            let mut plugins = read_raw_plugins(&config_path)?;
+            plugins.retain(|plugin| {
+                kind.is_none_or(|kind| plugin.kind == kind.to_core())
+                    && plugin_matches(plugin, &query)
+            });
+            plugins.sort_by(|left, right| left.id.cmp(&right.id));
+            print_plugins(&plugins, None);
             Ok(())
         }
         PluginAction::Add {
@@ -2797,12 +2872,13 @@ fn run_plugins(action: PluginAction) -> Result<()> {
             hook_event,
             version,
             timeout_ms,
+            runtime,
+            manifest,
+            manifest_sha256,
             enabled,
         } => {
             let kind = kind.to_core();
-            if kind == PluginKind::Hook && hook_event.is_none() {
-                bail!("--hook-event is required for hook plugins");
-            }
+            let runtime = runtime.to_core();
             let mut updated = false;
             let output_id = id.clone();
             grey_core::raw_config::edit_file(&config_path, |doc| {
@@ -2814,9 +2890,14 @@ fn run_plugins(action: PluginAction) -> Result<()> {
                     kind,
                     enabled,
                     description: description.clone(),
-                    command: command.clone().or(existing_command).with_context(|| {
-                        format!("--command is required when adding plugin {id}")
-                    })?,
+                    command: match runtime {
+                        PluginRuntime::Command => {
+                            command.clone().or(existing_command).with_context(|| {
+                                format!("--command is required when adding plugin {id}")
+                            })?
+                        }
+                        PluginRuntime::Wasm => command.clone().unwrap_or_default(),
+                    },
                     args: args.clone(),
                     timeout_ms,
                     version: version.clone(),
@@ -2825,10 +2906,17 @@ fn run_plugins(action: PluginAction) -> Result<()> {
                     } else {
                         None
                     },
-                    runtime: grey_core::PluginRuntime::Command,
-                    manifest: None,
-                    manifest_sha256: None,
+                    runtime,
+                    manifest: manifest.clone(),
+                    manifest_sha256: manifest_sha256.clone(),
                 };
+                if kind == PluginKind::Hook && plugin.hook_event.is_none() {
+                    bail!("--hook-event is required for hook plugins");
+                }
+                if kind == PluginKind::Hook {
+                    validate_hook_event(plugin.hook_event.as_deref())?;
+                }
+                config::validate_plugin_config(&plugin)?;
                 grey_core::raw_config::upsert_plugin(doc, &plugin)
             })?;
             if updated {
@@ -2859,6 +2947,168 @@ fn run_plugins(action: PluginAction) -> Result<()> {
             println!("disabled plugin {id}");
             Ok(())
         }
+    }
+}
+
+fn run_hooks(action: HookAction) -> Result<()> {
+    let config_path = grey_core::raw_config::mutation_target()?;
+    match action {
+        HookAction::List => {
+            let plugins = read_raw_plugins(&config_path)?;
+            print_plugins(&plugins, Some(PluginKind::Hook));
+            if has_legacy_hooks(&config_path)? {
+                println!("legacy\tconfig\tlegacy [hooks] entries (not managed here)");
+            }
+            Ok(())
+        }
+        HookAction::Show { id } => {
+            ensure_plugin_kind(&config_path, &id, PluginKind::Hook)?;
+            show_raw_plugin(&config_path, &id)
+        }
+        HookAction::Find { query } => {
+            let mut plugins = read_raw_plugins(&config_path)?;
+            plugins
+                .retain(|plugin| plugin.kind == PluginKind::Hook && plugin_matches(plugin, &query));
+            plugins.sort_by(|left, right| left.id.cmp(&right.id));
+            print_plugins(&plugins, Some(PluginKind::Hook));
+            Ok(())
+        }
+        HookAction::Add {
+            id,
+            event,
+            command,
+            args,
+            name,
+            description,
+            version,
+            timeout_ms,
+            runtime,
+            enabled,
+        } => {
+            if runtime != PluginRuntimeArg::Command {
+                bail!("hook plugins only support --runtime command");
+            }
+            validate_hook_event(Some(&event))?;
+            grey_core::raw_config::edit_file(&config_path, |doc| {
+                if let Some(kind) = grey_core::raw_config::plugin_kind_for_id(doc, &id)? {
+                    anyhow::ensure!(
+                        kind == "hook",
+                        "plugin {id} is not a hook; use plugins add to change its kind"
+                    );
+                }
+                let plugin = PluginConfig {
+                    id: id.clone(),
+                    name: name.clone(),
+                    kind: PluginKind::Hook,
+                    enabled,
+                    description: description.clone(),
+                    command: command.clone(),
+                    args: args.clone(),
+                    timeout_ms,
+                    version: version.clone(),
+                    hook_event: Some(event.clone()),
+                    runtime: PluginRuntime::Command,
+                    manifest: None,
+                    manifest_sha256: None,
+                };
+                config::validate_plugin_config(&plugin)?;
+                grey_core::raw_config::upsert_plugin(doc, &plugin)
+            })?;
+            println!("added hook {id}");
+            Ok(())
+        }
+        HookAction::Remove { id } => {
+            ensure_plugin_kind(&config_path, &id, PluginKind::Hook)?;
+            grey_core::raw_config::edit_file(&config_path, |doc| {
+                grey_core::raw_config::remove_plugin(doc, &id)
+            })?;
+            println!("removed hook {id}");
+            Ok(())
+        }
+        HookAction::Enable { id } => set_hook_enabled(&config_path, &id, true),
+        HookAction::Disable { id } => set_hook_enabled(&config_path, &id, false),
+    }
+}
+
+fn set_hook_enabled(path: &Path, id: &str, enabled: bool) -> Result<()> {
+    ensure_plugin_kind(path, id, PluginKind::Hook)?;
+    grey_core::raw_config::edit_file(path, |doc| {
+        grey_core::raw_config::set_enabled(doc, "plugins", id, enabled)
+    })?;
+    println!("{} hook {id}", if enabled { "enabled" } else { "disabled" });
+    Ok(())
+}
+
+fn validate_hook_event(event: Option<&str>) -> Result<()> {
+    let event = event.context("--event is required for hook plugins")?;
+    if HookEvent::ALL.iter().any(|known| known.as_str() == event) {
+        Ok(())
+    } else {
+        bail!("invalid hook event: {event}")
+    }
+}
+
+fn ensure_plugin_kind(path: &Path, id: &str, expected: PluginKind) -> Result<()> {
+    let plugin = read_raw_plugins(path)?
+        .into_iter()
+        .find(|plugin| plugin.id == id)
+        .with_context(|| format!("plugin not found: {id}"))?;
+    anyhow::ensure!(
+        plugin.kind == expected,
+        "plugin {id} is not a {}",
+        format_plugin_kind(expected)
+    );
+    Ok(())
+}
+
+fn has_legacy_hooks(path: &Path) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let source = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let value: toml::Value =
+        toml::from_str(&source).with_context(|| format!("parsing {}", path.display()))?;
+    Ok(value.get("hooks").is_some())
+}
+
+fn plugin_matches(plugin: &PluginConfig, query: &str) -> bool {
+    let query = query.to_lowercase();
+    [
+        Some(plugin.id.as_str()),
+        Some(plugin.command.as_str()),
+        plugin.description.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|field| field.to_lowercase().contains(&query))
+}
+
+fn print_plugins(plugins: &[PluginConfig], kind: Option<PluginKind>) {
+    let mut any = false;
+    for plugin in plugins
+        .iter()
+        .filter(|plugin| kind.is_none_or(|kind| plugin.kind == kind))
+    {
+        any = true;
+        println!(
+            "{}\t{}\t{}\truntime={}\tevent={}\tmanifest={}",
+            plugin.id,
+            format_plugin_kind(plugin.kind),
+            if plugin.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            match plugin.runtime {
+                PluginRuntime::Command => "command",
+                PluginRuntime::Wasm => "wasm",
+            },
+            plugin.hook_event.as_deref().unwrap_or("-"),
+            plugin.manifest.as_deref().unwrap_or("-")
+        );
+    }
+    if !any {
+        println!("(no plugins configured)");
     }
 }
 

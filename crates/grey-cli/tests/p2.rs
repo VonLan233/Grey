@@ -890,6 +890,228 @@ fn plugins_enable_disable_updates_state_without_reordering() {
 }
 
 #[test]
+fn plugins_manage_sealed_wasm_and_find_without_leaking_args() {
+    let env = temp_home();
+    let add = env
+        .command()
+        .args([
+            "plugins",
+            "add",
+            "wasm-search",
+            "--kind",
+            "tool",
+            "--runtime",
+            "wasm",
+            "--manifest",
+            "plugins/search/plugin.json",
+            "--manifest-sha256",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--description",
+            "Search provider",
+            "--arg",
+            "must-reject",
+        ])
+        .output()
+        .unwrap();
+    assert!(!add.status.success());
+
+    let add = env
+        .command()
+        .args([
+            "plugins",
+            "add",
+            "wasm-search",
+            "--kind",
+            "tool",
+            "--runtime",
+            "wasm",
+            "--manifest",
+            "plugins/search/plugin.json",
+            "--manifest-sha256",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--description",
+            "Search provider",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        add.status.success(),
+        "{}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let find = env
+        .command()
+        .args(["plugins", "find", "SEARCH", "--kind", "tool"])
+        .output()
+        .unwrap();
+    assert!(
+        find.status.success(),
+        "{}",
+        String::from_utf8_lossy(&find.stderr)
+    );
+    assert!(String::from_utf8_lossy(&find.stdout).contains("wasm-search"));
+    let show = env
+        .command()
+        .args(["plugins", "show", "wasm-search"])
+        .output()
+        .unwrap();
+    assert!(
+        show.status.success(),
+        "{}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&show.stdout);
+    assert!(stdout.contains("wasm"));
+    assert!(stdout.contains("manifest_sha256"));
+    assert!(!stdout.contains("must-reject"));
+
+    let missing_hash = env
+        .command()
+        .args([
+            "plugins",
+            "add",
+            "broken",
+            "--runtime",
+            "wasm",
+            "--manifest",
+            "plugins/broken.json",
+        ])
+        .output()
+        .unwrap();
+    assert!(!missing_hash.status.success());
+}
+
+#[test]
+fn hooks_manage_direct_command_plugins_and_reject_invalid_inputs() {
+    let env = temp_home();
+    let add = env
+        .command()
+        .args([
+            "hooks",
+            "add",
+            "audit",
+            "--event",
+            "session_start",
+            "--command",
+            "printf",
+            "--arg",
+            "private",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        add.status.success(),
+        "{}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let find = env
+        .command()
+        .args(["hooks", "find", "AUDIT"])
+        .output()
+        .unwrap();
+    assert!(
+        find.status.success(),
+        "{}",
+        String::from_utf8_lossy(&find.stderr)
+    );
+    assert!(String::from_utf8_lossy(&find.stdout).contains("audit"));
+    let show = env
+        .command()
+        .args(["hooks", "show", "audit"])
+        .output()
+        .unwrap();
+    assert!(
+        show.status.success(),
+        "{}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&show.stdout).contains("private"));
+
+    let invalid_event = env
+        .command()
+        .args([
+            "hooks",
+            "add",
+            "bad-event",
+            "--event",
+            "nope",
+            "--command",
+            "printf",
+        ])
+        .output()
+        .unwrap();
+    assert!(!invalid_event.status.success());
+    let wasm = env
+        .command()
+        .args([
+            "hooks",
+            "add",
+            "bad-runtime",
+            "--event",
+            "session_start",
+            "--runtime",
+            "wasm",
+            "--command",
+            "printf",
+        ])
+        .output()
+        .unwrap();
+    assert!(!wasm.status.success());
+
+    let plugin = env
+        .command()
+        .args(["plugins", "add", "not-a-hook", "--command", "printf"])
+        .output()
+        .unwrap();
+    assert!(plugin.status.success());
+    let conflict = env
+        .command()
+        .args([
+            "hooks",
+            "add",
+            "not-a-hook",
+            "--event",
+            "session_start",
+            "--command",
+            "printf",
+        ])
+        .output()
+        .unwrap();
+    assert!(!conflict.status.success());
+}
+
+#[test]
+fn extension_management_help_and_legacy_hook_notice_are_explicit() {
+    let plugins = grey().args(["plugins", "--help"]).output().unwrap();
+    assert!(plugins.status.success());
+    let plugin_help = String::from_utf8_lossy(&plugins.stdout);
+    assert!(plugin_help.contains("find"));
+
+    let hooks = grey().args(["hooks", "--help"]).output().unwrap();
+    assert!(hooks.status.success());
+    let hook_help = String::from_utf8_lossy(&hooks.stdout);
+    for action in ["list", "show", "find", "add", "remove", "enable", "disable"] {
+        assert!(hook_help.contains(action), "missing {action}");
+    }
+
+    let env = temp_home();
+    let config = env.home.path().join("legacy.toml");
+    std::fs::write(&config, "[hooks]\nsession_start = [\"printf legacy\"]\n").unwrap();
+    let output = env
+        .command()
+        .env("GREY_CONFIG", config)
+        .args(["hooks", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("legacy [hooks] entries"));
+}
+
+#[test]
 fn loop_mode_runs_and_reports_iteration_count() {
     let env = temp_home();
     let output = env

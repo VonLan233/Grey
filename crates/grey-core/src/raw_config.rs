@@ -105,7 +105,7 @@ pub fn upsert_plugin(doc: &mut DocumentMut, plugin: &PluginConfig) -> Result<()>
     };
     entry["id"] = value(plugin.id.as_str());
     set_optional_string(entry, "name", plugin.name.as_deref());
-    entry["kind"] = value(plugin_kind(plugin));
+    entry["kind"] = value(plugin_kind_name(plugin));
     entry["enabled"] = value(plugin.enabled);
     set_optional_string(entry, "description", plugin.description.as_deref());
     entry["command"] = value(plugin.command.as_str());
@@ -131,6 +131,21 @@ pub fn plugin_command(doc: &DocumentMut, id: &str) -> Result<Option<String>> {
         .iter()
         .find(|entry| entry.get("id").and_then(Item::as_str) == Some(id))
         .and_then(|entry| entry.get("command").and_then(Item::as_str))
+        .map(str::to_owned))
+}
+
+pub fn plugin_kind_for_id(doc: &DocumentMut, id: &str) -> Result<Option<String>> {
+    let Some(plugins) = doc
+        .as_table()
+        .get("plugins")
+        .and_then(Item::as_array_of_tables)
+    else {
+        return Ok(None);
+    };
+    Ok(plugins
+        .iter()
+        .find(|entry| entry.get("id").and_then(Item::as_str) == Some(id))
+        .and_then(|entry| entry.get("kind").and_then(Item::as_str))
         .map(str::to_owned))
 }
 
@@ -175,7 +190,7 @@ fn value_array(values: &[String]) -> Array {
     array
 }
 
-fn plugin_kind(plugin: &PluginConfig) -> &'static str {
+fn plugin_kind_name(plugin: &PluginConfig) -> &'static str {
     match plugin.kind {
         crate::config::PluginKind::Tool => "tool",
         crate::config::PluginKind::Provider => "provider",
