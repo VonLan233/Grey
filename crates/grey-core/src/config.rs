@@ -1972,8 +1972,10 @@ command = "printf"
     fn applies_ark_model_to_coding_plan_default() {
         let _lock = crate::test_support::test_env_lock();
         let _restore = EnvRestore::capture(&["ARK_MODEL", "GREY_MODEL"]);
-        let mut cfg = GreyConfig::default();
-        cfg.default_provider = "volcano-coding-plan".into();
+        let mut cfg = GreyConfig {
+            default_provider: "volcano-coding-plan".into(),
+            ..Default::default()
+        };
         unsafe {
             env::set_var("ARK_MODEL", "doubao-seed-2.0-code");
             env::remove_var("GREY_MODEL");
@@ -1990,8 +1992,10 @@ command = "printf"
     fn grey_model_overrides_ark_model_for_coding_plan() {
         let _lock = crate::test_support::test_env_lock();
         let _restore = EnvRestore::capture(&["ARK_MODEL", "GREY_MODEL"]);
-        let mut cfg = GreyConfig::default();
-        cfg.default_provider = "volcano-coding-plan".into();
+        let mut cfg = GreyConfig {
+            default_provider: "volcano-coding-plan".into(),
+            ..Default::default()
+        };
         unsafe {
             env::set_var("ARK_MODEL", "ark-model");
             env::set_var("GREY_MODEL", "grey-model");
@@ -2008,9 +2012,11 @@ command = "printf"
     fn empty_ark_model_does_not_clear_coding_plan_default() {
         let _lock = crate::test_support::test_env_lock();
         let _restore = EnvRestore::capture(&["ARK_MODEL", "GREY_MODEL"]);
-        let mut cfg = GreyConfig::default();
-        cfg.default_provider = "volcano-coding-plan".into();
-        cfg.default_model = "ark-code-latest".into();
+        let mut cfg = GreyConfig {
+            default_provider: "volcano-coding-plan".into(),
+            default_model: "ark-code-latest".into(),
+            ..Default::default()
+        };
         unsafe {
             env::set_var("ARK_MODEL", "");
             env::remove_var("GREY_MODEL");
