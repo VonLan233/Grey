@@ -7,6 +7,7 @@ pub mod agent;
 pub mod cache;
 pub mod config;
 pub mod context;
+pub mod hook;
 pub mod process;
 pub mod provider;
 pub mod raw_config;
@@ -25,6 +26,7 @@ pub use config::{
     TuiKeysConfig, TuiLayoutConfig, TuiThemeConfig, UsageConfig,
 };
 pub use context::{ContextAudit, ContextManager};
+pub use hook::{HookEvent, HookPayload, HookRunner, HookTool};
 pub use provider::{
     checked_utf8_bytes, collect, redact_provider_secrets, ChatMessage, ChatRequest, Provider,
     ProviderEvent, ProviderFailure, ProviderFailureKind, ProviderModelRef, Role, ToolCall, Usage,

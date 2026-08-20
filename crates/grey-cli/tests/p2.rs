@@ -345,18 +345,16 @@ fn session_start_completion_and_end_hooks_run_in_headless_mode() {
     std::fs::write(&end_marker, "").unwrap();
     std::fs::write(
         config_dir.join("grey.toml"),
-        r#"[hooks]
-session_start = ["printf start > \"$GREY_SESSION_START_MARKER\""]
-completion = ["printf completion > \"$GREY_SESSION_COMPLETION_MARKER\""]
-session_end = ["printf end > \"$GREY_SESSION_END_MARKER\""]
-"#,
+        format!(
+            "[hooks]\nsession_start = [\"printf start > '{}'\"]\ncompletion = [\"printf completion > '{}'\"]\nsession_end = [\"printf end > '{}'\"]\n",
+            start_marker.display(),
+            completion_marker.display(),
+            end_marker.display(),
+        ),
     )
     .unwrap();
     let output = env
         .command()
-        .env("GREY_SESSION_START_MARKER", &start_marker)
-        .env("GREY_SESSION_COMPLETION_MARKER", &completion_marker)
-        .env("GREY_SESSION_END_MARKER", &end_marker)
         .args(["--no-save", "--format", "json", "hello hooks"])
         .output()
         .unwrap();
@@ -587,6 +585,44 @@ fn loop_mode_runs_and_reports_iteration_count() {
     assert_eq!(value["prompt"].as_str().unwrap(), "check this task");
     assert_eq!(value["iterations"].as_u64().unwrap(), 2);
     assert!(value["response"].as_str().unwrap().contains("（mock"));
+}
+
+#[test]
+fn repeater_prompt_hook_failure_emits_completion_before_session_end() {
+    let env = temp_home();
+    let marker = env.home.path().join("repeater-hooks.log");
+    let config_dir = env.home.path().join(".config/grey");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("grey.toml"),
+        format!(
+            r#"[hooks]
+pre_message_send = ["exit 7"]
+completion = ["printf 'completion\\n' >> '{}'"]
+session_end = ["printf 'session_end\\n' >> '{}'"]
+"#,
+            marker.display(),
+            marker.display()
+        ),
+    )
+    .unwrap();
+
+    let output = env
+        .command()
+        .args([
+            "--no-save",
+            "loop",
+            "fails before provider",
+            "--iterations",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        std::fs::read_to_string(marker).unwrap(),
+        "completion\nsession_end\n"
+    );
 }
 
 #[test]
@@ -1028,4 +1064,269 @@ fn plugin_config_raw_editor_preserves_text_and_redacts_json() {
     let mut value = serde_json::json!({"nested": {"authorization": "hidden"}});
     grey_core::raw_config::redact(&mut value);
     assert_eq!(value["nested"]["authorization"], "***");
+}
+
+#[cfg(unix)]
+fn serve_openai_tool_turns() -> (String, std::thread::JoinHandle<Vec<Vec<u8>>>) {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let responses = [
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-private-id\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"printf tool-argument-secret\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n",
+            "data: [DONE]\n\n"
+        ),
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"finished\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n",
+            "data: [DONE]\n\n"
+        ),
+    ];
+    let task = std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        for response_body in responses {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = socket.read(&mut buffer).unwrap();
+                assert!(read > 0, "client closed before request body completed");
+                request.extend_from_slice(&buffer[..read]);
+                let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let content_length = String::from_utf8_lossy(&request[..header_end])
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            requests.push(request);
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            )
+            .unwrap();
+        }
+        requests
+    });
+    (format!("http://{address}/v1"), task)
+}
+
+#[cfg(unix)]
+#[test]
+fn hook_plugin_all_events_are_ordered_typed_and_sanitized() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let env = temp_home();
+    let config_dir = env.home.path().join(".config/grey");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let history = env
+        .command()
+        .current_dir(env.home.path())
+        .args(["--format", "json", "history-secret-must-not-leak"])
+        .output()
+        .unwrap();
+    assert!(history.status.success());
+    let history_json: serde_json::Value = serde_json::from_slice(&history.stdout).unwrap();
+    let session_id = history_json["session_id"].as_str().unwrap().to_string();
+    let hook_log = env.home.path().join("hook-events.jsonl");
+    let hook_script = env.home.path().join("hook.sh");
+    std::fs::write(
+        &hook_script,
+        r#"#!/bin/sh
+kind="$1"
+event="$2"
+log="$3"
+payload=$(cat)
+printf '%s:%s\t%s\n' "$kind" "$event" "$payload" >> "$log"
+case "$event" in
+  pre_message_send)
+    if [ "$kind" = plugin ]; then
+      printf '{"prompt":"rewritten prompt"}'
+    fi
+    ;;
+  permission_decision) printf true ;;
+  post_tool_call)
+    if [ "$kind" = plugin ]; then
+      exit 19
+    fi
+    ;;
+esac
+"#,
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&hook_script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&hook_script, permissions).unwrap();
+    let (base_url, server) = serve_openai_tool_turns();
+    let script = hook_script.display();
+    let log = hook_log.display();
+    let events = [
+        "pre_message_send",
+        "pre_prompt",
+        "permission_decision",
+        "pre_tool_call",
+        "post_tool_call",
+        "session_start",
+        "completion",
+        "session_end",
+    ];
+    let mut config = format!(
+        r#"default_provider = "fixture"
+default_model = "fixture-model"
+
+[[providers]]
+id = "fixture"
+protocol = "openai"
+base_url = "{base_url}"
+api_key = "api-secret-must-not-leak"
+include_usage = true
+
+[hooks]
+"#
+    );
+    for event in events {
+        config.push_str(&format!(
+            "{event} = [\"'{}' config {event} '{}'\"]\n",
+            script, log
+        ));
+    }
+    for event in events {
+        config.push_str(&format!(
+            r#"
+[[plugins]]
+id = "plugin-{event}"
+kind = "hook"
+command = "{script}"
+args = ["plugin", "{event}", "{log}"]
+enabled = true
+hook_event = "{event}"
+"#
+        ));
+    }
+    std::fs::write(config_dir.join("grey.toml"), config).unwrap();
+
+    let output = env
+        .command()
+        .current_dir(env.home.path())
+        .args([
+            "--auto-approve",
+            "--no-save",
+            "--session",
+            &session_id,
+            "--format",
+            "json",
+            "history-free prompt",
+        ])
+        .output()
+        .unwrap();
+    let early_records = std::fs::read_to_string(&hook_log).unwrap_or_default();
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}\nhooks={early_records}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 2);
+    let second_request = String::from_utf8_lossy(&requests[1]);
+    assert!(
+        second_request.contains(r#"\"success\":true"#),
+        "post hook failure changed tool result: {second_request}"
+    );
+
+    let records = std::fs::read_to_string(&hook_log).unwrap();
+    let parsed = records
+        .lines()
+        .map(|line| {
+            let (label, payload) = line.split_once('\t').unwrap();
+            (
+                label.to_string(),
+                serde_json::from_str::<serde_json::Value>(payload).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let expected_events = [
+        "session_start",
+        "pre_message_send",
+        "pre_prompt",
+        "permission_decision",
+        "pre_tool_call",
+        "post_tool_call",
+        "completion",
+        "session_end",
+    ];
+    let expected = expected_events
+        .into_iter()
+        .flat_map(|event| [format!("config:{event}"), format!("plugin:{event}")])
+        .collect::<Vec<_>>();
+    assert_eq!(
+        parsed.iter().map(|(label, _)| label).collect::<Vec<_>>(),
+        expected.iter().collect::<Vec<_>>()
+    );
+    for (label, payload) in &parsed {
+        assert_eq!(payload["schema_version"], 1, "{label}: {payload}");
+        let event = label.split_once(':').unwrap().1;
+        assert_eq!(payload["event"], event);
+        assert!(payload["workspace"].as_str().is_some());
+        let mut expected_fields = vec!["event", "schema_version", "workspace"];
+        match event {
+            "session_start" | "session_end" => {
+                expected_fields.extend(["model", "provider"]);
+                if event == "session_end" {
+                    expected_fields.push("success");
+                }
+            }
+            "pre_message_send" | "pre_prompt" => {
+                expected_fields.extend(["model", "prompt", "provider"]);
+            }
+            "permission_decision" | "pre_tool_call" => {
+                expected_fields.extend(["model", "provider", "tool"]);
+            }
+            "post_tool_call" => {
+                expected_fields.extend(["model", "provider", "success", "tool"]);
+            }
+            "completion" => {
+                expected_fields.extend(["model", "prompt", "provider", "success"]);
+            }
+            other => panic!("unexpected hook event {other}"),
+        }
+        expected_fields.sort_unstable();
+        let mut actual_fields = payload
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        actual_fields.sort_unstable();
+        assert_eq!(actual_fields, expected_fields, "{label}: {payload}");
+        for forbidden in [
+            "api-secret-must-not-leak",
+            "history-secret-must-not-leak",
+            "call-private-id",
+            "tool-argument-secret",
+            "\"arguments\"",
+            "\"messages\"",
+            "\"history\"",
+            "\"id\"",
+        ] {
+            assert!(
+                !payload.to_string().contains(forbidden),
+                "{label} leaked {forbidden}: {payload}"
+            );
+        }
+    }
 }

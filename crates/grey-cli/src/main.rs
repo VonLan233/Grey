@@ -12,11 +12,9 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use futures_util::future::join_all;
 use grey_core::{
-    config,
-    process::{run_bounded, CommandSpec},
-    Agent, AgentEvent, AgentOptions, AgentOutcome, CharApproxCounter, ChatMessage, ChatRequest,
-    ContextManager, GreyConfig, PluginConfig, PluginKind, Provider, Role, Session, SessionStore,
-    SummaryEngine, ToolExecutor,
+    config, Agent, AgentEvent, AgentOptions, AgentOutcome, CharApproxCounter, ChatMessage,
+    ChatRequest, ContextManager, GreyConfig, HookEvent, HookPayload, HookRunner, PluginConfig,
+    PluginKind, Provider, Role, Session, SessionStore, SummaryEngine, ToolExecutor,
 };
 use grey_provider::router::ProviderRouter;
 use grey_tools::{
@@ -25,7 +23,6 @@ use grey_tools::{
 };
 use grey_tools::{CombinedTools, HookedTools};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
@@ -35,7 +32,6 @@ Inspect before changing anything. Use read_file, glob, and grep to gather eviden
 only with an exact old_string that occurs once. After edits, run the relevant tests with bash.
 Keep changes scoped to the user's request, report tool failures honestly, and never claim success
 without verification evidence."#;
-const DEFAULT_HOOK_TIMEOUT_MS: u64 = 10_000;
 const TUI_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Parser, Clone)]
@@ -531,6 +527,83 @@ async fn run_orchestrate(
     let config = config::load()?;
     let workspace = resolve_workspace(cli.workspace.as_deref())?;
     let config = Arc::new(config);
+    let hooks = Arc::new(HookRunner::new(
+        &config.hooks,
+        &config.plugins,
+        &config.runtime,
+    ));
+    let provider = cli
+        .provider
+        .as_deref()
+        .unwrap_or(&config.default_provider)
+        .to_string();
+    let model = cli
+        .model
+        .clone()
+        .unwrap_or_else(|| default_model_for_provider(&config, &provider));
+    run_best_effort_hook(
+        &hooks,
+        lifecycle_hook_payload(HookEvent::SessionStart, &workspace, &provider, &model),
+    )
+    .await;
+    let mut task = task;
+    let result = async {
+        task = apply_prompt_hook(
+            &hooks,
+            HookEvent::PreMessageSend,
+            &workspace,
+            &provider,
+            &model,
+            &task,
+        )
+        .await?;
+        task = apply_prompt_hook(
+            &hooks,
+            HookEvent::PrePrompt,
+            &workspace,
+            &provider,
+            &model,
+            &task,
+        )
+        .await?;
+        run_orchestrate_session(
+            cli,
+            task.clone(),
+            raw_specs,
+            share_context,
+            config,
+            workspace.clone(),
+            hooks.clone(),
+        )
+        .await
+    }
+    .await;
+    let error = result.as_ref().err().map(|error| error.to_string());
+    let mut completion =
+        lifecycle_hook_payload(HookEvent::Completion, &workspace, &provider, &model);
+    completion.prompt = Some(&task);
+    completion.success = Some(result.is_ok());
+    completion.error = error.as_deref();
+    run_best_effort_hook(&hooks, completion).await;
+    let mut session_end =
+        lifecycle_hook_payload(HookEvent::SessionEnd, &workspace, &provider, &model);
+    session_end.success = Some(result.is_ok());
+    session_end.error = error.as_deref();
+    run_best_effort_hook(&hooks, session_end).await;
+    result
+}
+
+// Orchestration children are internal turns in one user-visible session. They share
+// tool/permission hooks, while only this outer boundary emits lifecycle events.
+async fn run_orchestrate_session(
+    cli: &Cli,
+    task: String,
+    raw_specs: Vec<String>,
+    share_context: Vec<OrchestrateShareContext>,
+    config: Arc<GreyConfig>,
+    workspace: PathBuf,
+    hooks: Arc<HookRunner>,
+) -> Result<()> {
     let subagents = parse_orchestrate_agents(raw_specs)?;
     let shared_context = build_orchestrate_shared_context(&task, &share_context, cli, &workspace)?;
 
@@ -541,6 +614,7 @@ async fn run_orchestrate(
         let workspace = workspace.clone();
         let task = task.clone();
         let shared_context = shared_context.clone();
+        let hooks = hooks.clone();
         futures.push(run_orchestrate_subagent(
             child_cli,
             config,
@@ -548,6 +622,7 @@ async fn run_orchestrate(
             agent,
             task,
             shared_context,
+            hooks,
         ));
     }
 
@@ -558,7 +633,7 @@ async fn run_orchestrate(
     coordinator_cli.read_only = true;
     coordinator_cli.auto_approve = false;
     let (coordinator, store, existing) =
-        build_agent_and_session(&coordinator_cli, &config, &workspace, false)?;
+        build_agent_and_session(&coordinator_cli, &config, &workspace, false, &hooks)?;
     let coordinator_prompt = build_coordinator_prompt(&task, &subagent_results);
     let synthesis_outcome = coordinator
         .run_new(
@@ -650,38 +725,25 @@ async fn run_repeater(
     let config = config::load()?;
     let workspace = resolve_workspace(cli.workspace.as_deref())?;
     let workspace_text = workspace.to_string_lossy();
-    let (agent, store, existing) = build_agent_and_session(cli, &config, &workspace, false)?;
+    let hooks = HookRunner::new(&config.hooks, &config.plugins, &config.runtime);
+    let (agent, store, existing) =
+        build_agent_and_session(cli, &config, &workspace, false, &hooks)?;
     let usage_tracker = agent.usage_tracker();
-    let pre_message_hooks = hook_chain_with_plugins(
-        &config.hooks.pre_message_send,
-        &config.plugins,
-        "pre_message_send",
-    );
-    let pre_prompt_hooks =
-        hook_chain_with_plugins(&config.hooks.pre_prompt, &config.plugins, "pre_prompt");
-    let completion_hooks =
-        hook_chain_with_plugins(&config.hooks.completion, &config.plugins, "completion");
-    let session_start_hooks = hook_chain_with_plugins(
-        &config.hooks.session_start,
-        &config.plugins,
-        "session_start",
-    );
-    let session_end_hooks =
-        hook_chain_with_plugins(&config.hooks.session_end, &config.plugins, "session_end");
+    let active_provider = agent.provider_id().to_string();
+    let active_model = agent.model().to_string();
 
     let stop_token = stop_when.as_deref().unwrap_or("DONE");
 
-    let session_start_payload = serde_json::json!({
-        "event": "session_start",
-        "workspace": workspace_text,
-        "provider": agent.provider_id(),
-        "model": agent.model(),
-        "mode": match mode {
-            RepeaterMode::Loop => "loop",
-            RepeaterMode::Goal => "goal",
-        },
-    });
-    run_hook_chain(&session_start_hooks, &session_start_payload).await?;
+    run_best_effort_hook(
+        &hooks,
+        lifecycle_hook_payload(
+            HookEvent::SessionStart,
+            &workspace,
+            &active_provider,
+            &active_model,
+        ),
+    )
+    .await;
 
     let mut session = existing;
     let mut last_outcome: Option<AgentOutcome> = None;
@@ -708,9 +770,53 @@ async fn run_repeater(
                 }
             }
         };
-        let next_prompt =
-            apply_pre_message_send_hooks(&pre_message_hooks, &iteration_prompt).await?;
-        let next_prompt = apply_pre_prompt_hooks(&pre_prompt_hooks, &next_prompt).await?;
+        let next_prompt = async {
+            let next = apply_prompt_hook(
+                &hooks,
+                HookEvent::PreMessageSend,
+                &workspace,
+                &active_provider,
+                &active_model,
+                &iteration_prompt,
+            )
+            .await?;
+            apply_prompt_hook(
+                &hooks,
+                HookEvent::PrePrompt,
+                &workspace,
+                &active_provider,
+                &active_model,
+                &next,
+            )
+            .await
+        }
+        .await;
+        let next_prompt = match next_prompt {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                let error_text = error.to_string();
+                let mut completion = lifecycle_hook_payload(
+                    HookEvent::Completion,
+                    &workspace,
+                    &active_provider,
+                    &active_model,
+                );
+                completion.prompt = Some(&iteration_prompt);
+                completion.success = Some(false);
+                completion.error = Some(&error_text);
+                run_best_effort_hook(&hooks, completion).await;
+                let mut session_end = lifecycle_hook_payload(
+                    HookEvent::SessionEnd,
+                    &workspace,
+                    &active_provider,
+                    &active_model,
+                );
+                session_end.success = Some(false);
+                session_end.error = Some(&error_text);
+                run_best_effort_hook(&hooks, session_end).await;
+                return Err(error);
+            }
+        };
 
         let result = if let Some(session) = &session {
             agent
@@ -724,16 +830,15 @@ async fn run_repeater(
 
         match result {
             Ok(outcome) => {
-                let completion = completion_hook_payload(
-                    true,
-                    &next_prompt,
-                    Some(&outcome),
-                    None,
-                    &workspace_text,
+                let mut completion = lifecycle_hook_payload(
+                    HookEvent::Completion,
+                    &workspace,
+                    &outcome.provider_id,
+                    &outcome.model,
                 );
-                if let Err(error) = run_hook_chain(&completion_hooks, &completion).await {
-                    last_error = Some(format!("completion hook failed: {error}"));
-                }
+                completion.prompt = Some(&next_prompt);
+                completion.success = Some(true);
+                run_best_effort_hook(&hooks, completion).await;
 
                 loop_usage.add_assign(&outcome.usage);
 
@@ -762,6 +867,15 @@ async fn run_repeater(
                 }
 
                 if let Some(last_error) = last_error.clone() {
+                    let mut session_end = lifecycle_hook_payload(
+                        HookEvent::SessionEnd,
+                        &workspace,
+                        &outcome.provider_id,
+                        &outcome.model,
+                    );
+                    session_end.success = Some(false);
+                    session_end.error = Some(&last_error);
+                    run_best_effort_hook(&hooks, session_end).await;
                     return Err(anyhow::anyhow!(last_error));
                 }
 
@@ -776,18 +890,26 @@ async fn run_repeater(
                 }
             }
             Err(error) => {
-                let completion = completion_hook_payload(
-                    false,
-                    &next_prompt,
-                    None,
-                    Some(&error.to_string()),
-                    &workspace_text,
+                let error_text = error.to_string();
+                let mut completion = lifecycle_hook_payload(
+                    HookEvent::Completion,
+                    &workspace,
+                    &active_provider,
+                    &active_model,
                 );
-                if let Err(hook_error) = run_hook_chain(&completion_hooks, &completion).await {
-                    return Err(anyhow::anyhow!(format!(
-                        "completion failed: {error}, hook error: {hook_error}"
-                    )));
-                }
+                completion.prompt = Some(&next_prompt);
+                completion.success = Some(false);
+                completion.error = Some(&error_text);
+                run_best_effort_hook(&hooks, completion).await;
+                let mut session_end = lifecycle_hook_payload(
+                    HookEvent::SessionEnd,
+                    &workspace,
+                    &active_provider,
+                    &active_model,
+                );
+                session_end.success = Some(false);
+                session_end.error = Some(&error_text);
+                run_best_effort_hook(&hooks, session_end).await;
                 return Err(error);
             }
         }
@@ -796,23 +918,15 @@ async fn run_repeater(
     let outcome = last_outcome
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("no iterations executed"))?;
-    let session_end_payload = serde_json::json!({
-        "event": "session_end",
-        "workspace": workspace_text,
-        "prompts_processed": prompt_count,
-        "success": last_error.is_none(),
-        "error": last_error.unwrap_or_default(),
-        "provider": outcome.provider_id,
-        "model": outcome.model,
-        "iterations": iterations,
-        "stopped": stopped,
-    });
-    if let Some(error) = run_hook_chain(&session_end_hooks, &session_end_payload)
-        .await
-        .err()
-    {
-        eprintln!("session_end hook failed: {error}");
-    }
+    let mut session_end = lifecycle_hook_payload(
+        HookEvent::SessionEnd,
+        &workspace,
+        &outcome.provider_id,
+        &outcome.model,
+    );
+    session_end.success = Some(last_error.is_none());
+    session_end.error = last_error.as_deref();
+    run_best_effort_hook(&hooks, session_end).await;
 
     let session_id = session.as_ref().map(|session| session.id.clone());
     let tracked_cost = session_id
@@ -927,6 +1041,7 @@ async fn run_orchestrate_subagent(
     agent: OrchestrateAgent,
     task: String,
     shared_context: String,
+    hooks: Arc<HookRunner>,
 ) -> OrchestrateAgentResult {
     cli.no_save = true;
     cli.read_only = true;
@@ -942,7 +1057,7 @@ async fn run_orchestrate_subagent(
             .unwrap_or_else(|| default_model_for_provider(&config, &resolved_provider))
     };
     let (agent_client, _store, existing) =
-        match build_agent_and_session(&cli, &config, &workspace, false) {
+        match build_agent_and_session(&cli, &config, &workspace, false, &hooks) {
             Ok((agent_client, _store, existing)) => (agent_client, _store, existing),
             Err(error) => {
                 return OrchestrateAgentResult {
@@ -1507,105 +1622,83 @@ async fn run_headless(
     workspace: &Path,
     prompt: &str,
 ) -> Result<()> {
-    let session_start_hooks = hook_chain_with_plugins(
-        &config.hooks.session_start,
-        &config.plugins,
-        "session_start",
-    );
-    let pre_message_hooks = hook_chain_with_plugins(
-        &config.hooks.pre_message_send,
-        &config.plugins,
-        "pre_message_send",
-    );
-    let pre_prompt_hooks =
-        hook_chain_with_plugins(&config.hooks.pre_prompt, &config.plugins, "pre_prompt");
-    let completion_hooks =
-        hook_chain_with_plugins(&config.hooks.completion, &config.plugins, "completion");
-    let session_end_hooks =
-        hook_chain_with_plugins(&config.hooks.session_end, &config.plugins, "session_end");
-    let (agent, store, existing) = build_agent_and_session(cli, config, workspace, false)?;
+    let hooks = HookRunner::new(&config.hooks, &config.plugins, &config.runtime);
+    let (agent, store, existing) = build_agent_and_session(cli, config, workspace, false, &hooks)?;
     let usage_tracker = agent.usage_tracker();
     let active_provider = agent.provider_id().to_string();
     let active_model = agent.model().to_string();
-    run_hook_chain(
-        &session_start_hooks,
-        &serde_json::json!({
-            "event": "session_start",
-            "workspace": workspace.to_string_lossy(),
-            "provider": &active_provider,
-            "model": &active_model,
-        }),
+    run_best_effort_hook(
+        &hooks,
+        lifecycle_hook_payload(
+            HookEvent::SessionStart,
+            workspace,
+            &active_provider,
+            &active_model,
+        ),
     )
-    .await?;
+    .await;
 
-    let prompt = apply_pre_message_send_hooks(&pre_message_hooks, prompt).await?;
-    let prompt = apply_pre_prompt_hooks(&pre_prompt_hooks, &prompt).await?;
-    let run_result = if cli.format == OutputFormat::Text {
-        run_with_text_events(
-            &agent,
-            existing.as_ref(),
+    let mut prompt = prompt.to_string();
+    let run_result = async {
+        prompt = apply_prompt_hook(
+            &hooks,
+            HookEvent::PreMessageSend,
+            workspace,
+            &active_provider,
+            &active_model,
             &prompt,
-            config.runtime.event_queue_capacity,
         )
-        .await
-    } else {
-        run_with_cancellation(&agent, existing.as_ref(), &prompt, None).await
-    };
+        .await?;
+        prompt = apply_prompt_hook(
+            &hooks,
+            HookEvent::PrePrompt,
+            workspace,
+            &active_provider,
+            &active_model,
+            &prompt,
+        )
+        .await?;
+        if cli.format == OutputFormat::Text {
+            run_with_text_events(
+                &agent,
+                existing.as_ref(),
+                &prompt,
+                config.runtime.event_queue_capacity,
+            )
+            .await
+        } else {
+            run_with_cancellation(&agent, existing.as_ref(), &prompt, None).await
+        }
+    }
+    .await;
     let result = match run_result {
         Ok(outcome) => outcome,
         Err(error) => {
-            let completion_payload = completion_hook_payload(
-                false,
-                &prompt,
-                None,
-                Some(&error.to_string()),
-                &workspace.to_string_lossy(),
+            let error_text = error.to_string();
+            let mut completion = lifecycle_hook_payload(
+                HookEvent::Completion,
+                workspace,
+                &active_provider,
+                &active_model,
             );
-            if let Err(hook_error) = run_hook_chain(&completion_hooks, &completion_payload).await {
-                eprintln!("completion hook failed: {hook_error}");
-            }
-            let session_end = serde_json::json!({
-                "event": "session_end",
-                "workspace": workspace.to_string_lossy(),
-                "success": false,
-                "provider": active_provider,
-                "model": active_model,
-                "steps": 0,
-                "cached": false,
-                "error": error.to_string(),
-            });
-            if let Err(hook_error) = run_hook_chain(&session_end_hooks, &session_end).await {
-                eprintln!("session_end hook failed: {hook_error}");
-            }
+            completion.prompt = Some(&prompt);
+            completion.success = Some(false);
+            completion.error = Some(&error_text);
+            run_best_effort_hook(&hooks, completion).await;
+            let mut session_end = lifecycle_hook_payload(
+                HookEvent::SessionEnd,
+                workspace,
+                &active_provider,
+                &active_model,
+            );
+            session_end.success = Some(false);
+            session_end.error = Some(&error_text);
+            run_best_effort_hook(&hooks, session_end).await;
             return Err(error);
         }
     };
 
-    let completion_payload = completion_hook_payload(
-        true,
-        &prompt,
-        Some(&result),
-        None,
-        &workspace.to_string_lossy(),
-    );
-    if let Err(error) = run_hook_chain(&completion_hooks, &completion_payload).await {
-        eprintln!("completion hook failed: {error}");
-    }
-    let completion_result = serde_json::json!({
-        "event": "session_end",
-        "workspace": workspace.to_string_lossy(),
-        "success": true,
-        "provider": result.provider_id,
-        "model": result.model,
-        "steps": result.steps,
-        "cached": result.cached,
-        "error": Value::Null,
-    });
-    if let Err(error) = run_hook_chain(&session_end_hooks, &completion_result).await {
-        eprintln!("session_end hook failed: {error}");
-    }
-
-    let session_id = persist_outcome(
+    let session_id = match persist_outcome(
         store.as_ref(),
         existing,
         &result,
@@ -1613,7 +1706,48 @@ async fn run_headless(
         workspace,
         cli.no_save,
         usage_tracker.as_deref(),
-    )?;
+    ) {
+        Ok(session_id) => session_id,
+        Err(error) => {
+            let error_text = error.to_string();
+            let mut completion = lifecycle_hook_payload(
+                HookEvent::Completion,
+                workspace,
+                &result.provider_id,
+                &result.model,
+            );
+            completion.prompt = Some(&prompt);
+            completion.success = Some(true);
+            run_best_effort_hook(&hooks, completion).await;
+            let mut session_end = lifecycle_hook_payload(
+                HookEvent::SessionEnd,
+                workspace,
+                &result.provider_id,
+                &result.model,
+            );
+            session_end.success = Some(false);
+            session_end.error = Some(&error_text);
+            run_best_effort_hook(&hooks, session_end).await;
+            return Err(error);
+        }
+    };
+    let mut completion = lifecycle_hook_payload(
+        HookEvent::Completion,
+        workspace,
+        &result.provider_id,
+        &result.model,
+    );
+    completion.prompt = Some(&prompt);
+    completion.success = Some(true);
+    run_best_effort_hook(&hooks, completion).await;
+    let mut session_end = lifecycle_hook_payload(
+        HookEvent::SessionEnd,
+        workspace,
+        &result.provider_id,
+        &result.model,
+    );
+    session_end.success = Some(true);
+    run_best_effort_hook(&hooks, session_end).await;
     let tracked_cost = usage_tracker
         .as_ref()
         .and_then(|tracker| {
@@ -1662,6 +1796,7 @@ fn build_agent_and_session(
     config: &GreyConfig,
     workspace: &Path,
     tui_mode: bool,
+    hooks: &HookRunner,
 ) -> Result<(Agent, Option<SessionStore>, Option<Session>)> {
     anyhow::ensure!(
         (1..=100).contains(&cli.max_steps),
@@ -1693,7 +1828,7 @@ fn build_agent_and_session(
     let resolved_provider_id = resolved.provider_id.clone();
     let provider: Arc<dyn Provider> = resolved.provider;
     let model = resolved.model;
-    let approver: Arc<dyn Approver> = if cli.auto_approve {
+    let base_approver: Arc<dyn Approver> = if cli.auto_approve {
         Arc::new(AlwaysApprove)
     } else if cli.read_only || tui_mode {
         Arc::new(DenySideEffects)
@@ -1701,10 +1836,13 @@ fn build_agent_and_session(
         Arc::new(StdioApprover)
     };
     let approver = Arc::new(HookedApprover::new(
-        approver,
-        config.hooks.permission_decision.clone(),
+        base_approver,
+        hooks.clone(),
+        workspace,
+        &resolved_provider_id,
+        &model,
     ));
-    let builtin = Arc::new(BuiltinTools::new(workspace, approver.clone())?);
+    let builtin = Arc::new(BuiltinTools::new(workspace, Arc::new(AlwaysApprove))?);
     let mut executors: Vec<Arc<dyn ToolExecutor>> = vec![builtin];
     let lsp_binary = config.lsp.rust_analyzer.clone();
     if !lsp_binary.trim().is_empty() {
@@ -1714,7 +1852,7 @@ fn build_agent_and_session(
     if !mcp.is_empty() {
         executors.push(Arc::new(mcp));
     }
-    let plugin_tools = PluginTools::new(workspace, config.plugins.clone(), approver.clone());
+    let plugin_tools = PluginTools::new(workspace, config.plugins.clone(), Arc::new(AlwaysApprove));
     if !plugin_tools.is_empty() {
         executors.push(Arc::new(plugin_tools));
     }
@@ -1724,8 +1862,11 @@ fn build_agent_and_session(
     }
     let tools: Arc<dyn ToolExecutor> = Arc::new(HookedTools::new(
         Arc::new(CombinedTools::new(executors)),
-        config.hooks.pre_tool_call.clone(),
-        config.hooks.post_tool_call.clone(),
+        approver,
+        hooks.clone(),
+        workspace,
+        &resolved_provider_id,
+        &model,
     ));
     let mut options = AgentOptions::new(model.clone());
     options.max_steps = cli.max_steps;
@@ -2001,32 +2142,20 @@ fn finish_tui_result(ui_result: Result<()>, cleanup_result: Result<()>) -> Resul
 }
 
 async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()> {
-    let session_start_hooks = hook_chain_with_plugins(
-        &config.hooks.session_start,
-        &config.plugins,
-        "session_start",
-    );
-    let pre_prompt_hooks =
-        hook_chain_with_plugins(&config.hooks.pre_prompt, &config.plugins, "pre_prompt");
-    let pre_message_send_hooks = hook_chain_with_plugins(
-        &config.hooks.pre_message_send,
-        &config.plugins,
-        "pre_message_send",
-    );
-    let completion_hooks =
-        hook_chain_with_plugins(&config.hooks.completion, &config.plugins, "completion");
-    let session_end_hooks =
-        hook_chain_with_plugins(&config.hooks.session_end, &config.plugins, "session_end");
-    let (agent, store, existing) = build_agent_and_session(cli, config, workspace, true)?;
+    let hooks = HookRunner::new(&config.hooks, &config.plugins, &config.runtime);
+    let (agent, store, existing) = build_agent_and_session(cli, config, workspace, true, &hooks)?;
     let usage_tracker = agent.usage_tracker();
 
-    let session_start_payload = serde_json::json!({
-        "event": "session_start",
-        "workspace": workspace.to_string_lossy(),
-        "provider": agent.provider_id(),
-        "model": agent.model(),
-    });
-    run_hook_chain(&session_start_hooks, &session_start_payload).await?;
+    run_best_effort_hook(
+        &hooks,
+        lifecycle_hook_payload(
+            HookEvent::SessionStart,
+            workspace,
+            agent.provider_id(),
+            agent.model(),
+        ),
+    )
+    .await;
 
     let (events_tx, events_rx) = mpsc::channel(config.runtime.event_queue_capacity);
     let (prompts_tx, mut prompts_rx) =
@@ -2034,11 +2163,13 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let workspace_for_worker = workspace.to_path_buf();
     let workspace_name_for_worker = workspace_for_worker.to_string_lossy().into_owned();
-    let workspace_name_for_cleanup = workspace_name_for_worker.clone();
+    let workspace_for_cleanup = workspace_for_worker.clone();
     let no_save = cli.no_save;
     let initial_provider = agent.provider_id().to_string();
     let initial_model = agent.model().to_string();
     let fallback_summary = TuiWorkerSummary::new(&initial_provider, &initial_model);
+    let worker_hooks = hooks.clone();
+    let hook_workspace_for_worker = workspace_for_worker.clone();
     let worker = tokio::spawn(async move {
         let mut session = existing;
         let mut summary = TuiWorkerSummary::new(initial_provider, initial_model);
@@ -2056,21 +2187,72 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
                     None => break,
                 },
             };
-            let prompt = match apply_pre_message_send_hooks(&pre_message_send_hooks, &prompt).await
+            let prompt = match apply_prompt_hook(
+                &worker_hooks,
+                HookEvent::PreMessageSend,
+                &hook_workspace_for_worker,
+                &summary.provider,
+                &summary.model,
+                &prompt,
+            )
+            .await
             {
                 Ok(prompt) => prompt,
                 Err(error) => {
-                    summary.last_error = Some(error.to_string());
+                    let error_text = error.to_string();
+                    summary.last_error = Some(error_text.clone());
+                    let mut payload = lifecycle_hook_payload(
+                        HookEvent::Completion,
+                        &hook_workspace_for_worker,
+                        &summary.provider,
+                        &summary.model,
+                    );
+                    payload.prompt = Some(&prompt);
+                    payload.success = Some(false);
+                    payload.error = Some(&error_text);
+                    if let Err(hook_error) = worker_hooks.run_best_effort(payload).await {
+                        let _ = events_tx
+                            .send(AgentEvent::Warning(format!(
+                                "completion hook failed: {hook_error:#}"
+                            )))
+                            .await;
+                    }
                     let _ = events_tx
                         .send(AgentEvent::Failed(format!("{error:#}")))
                         .await;
                     continue;
                 }
             };
-            let prompt = match apply_pre_prompt_hooks(&pre_prompt_hooks, &prompt).await {
+            let prompt = match apply_prompt_hook(
+                &worker_hooks,
+                HookEvent::PrePrompt,
+                &hook_workspace_for_worker,
+                &summary.provider,
+                &summary.model,
+                &prompt,
+            )
+            .await
+            {
                 Ok(prompt) => prompt,
                 Err(error) => {
-                    summary.last_error = Some(error.to_string());
+                    let error_text = error.to_string();
+                    summary.last_error = Some(error_text.clone());
+                    let mut payload = lifecycle_hook_payload(
+                        HookEvent::Completion,
+                        &hook_workspace_for_worker,
+                        &summary.provider,
+                        &summary.model,
+                    );
+                    payload.prompt = Some(&prompt);
+                    payload.success = Some(false);
+                    payload.error = Some(&error_text);
+                    if let Err(hook_error) = worker_hooks.run_best_effort(payload).await {
+                        let _ = events_tx
+                            .send(AgentEvent::Warning(format!(
+                                "completion hook failed: {hook_error:#}"
+                            )))
+                            .await;
+                    }
                     let _ = events_tx
                         .send(AgentEvent::Failed(format!("{error:#}")))
                         .await;
@@ -2133,7 +2315,25 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
                     if !no_save {
                         if let Some(store) = &store {
                             if let Err(error) = store.save(&mut current) {
-                                summary.last_error = Some(error.to_string());
+                                let error_text = error.to_string();
+                                summary.last_error = Some(error_text.clone());
+                                let mut payload = lifecycle_hook_payload(
+                                    HookEvent::Completion,
+                                    &hook_workspace_for_worker,
+                                    &provider,
+                                    &model,
+                                );
+                                payload.prompt = Some(&prompt);
+                                payload.success = Some(false);
+                                payload.error = Some(&error_text);
+                                if let Err(hook_error) = worker_hooks.run_best_effort(payload).await
+                                {
+                                    let _ = events_tx
+                                        .send(AgentEvent::Warning(format!(
+                                            "completion hook failed: {hook_error:#}"
+                                        )))
+                                        .await;
+                                }
                                 let _ = events_tx
                                     .send(AgentEvent::Failed(format!("saving session: {error:#}")))
                                     .await;
@@ -2152,14 +2352,15 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
                     session = Some(current);
                     summary.provider = outcome.provider_id.clone();
                     summary.model = outcome.model.clone();
-                    let payload = completion_hook_payload(
-                        true,
-                        &prompt,
-                        Some(&outcome),
-                        None,
-                        &workspace_name_for_worker,
+                    let mut payload = lifecycle_hook_payload(
+                        HookEvent::Completion,
+                        &hook_workspace_for_worker,
+                        &outcome.provider_id,
+                        &outcome.model,
                     );
-                    if let Err(error) = run_hook_chain(&completion_hooks, &payload).await {
+                    payload.prompt = Some(&prompt);
+                    payload.success = Some(true);
+                    if let Err(error) = worker_hooks.run_best_effort(payload).await {
                         let _ = events_tx
                             .send(AgentEvent::Warning(format!(
                                 "completion hook failed: {error:#}"
@@ -2177,14 +2378,17 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
                 }
                 Err(error) => {
                     summary.last_error = Some(error.to_string());
-                    let payload = completion_hook_payload(
-                        false,
-                        &prompt,
-                        None,
-                        Some(&error.to_string()),
-                        &workspace_name_for_worker,
+                    let error_text = error.to_string();
+                    let mut payload = lifecycle_hook_payload(
+                        HookEvent::Completion,
+                        &hook_workspace_for_worker,
+                        &summary.provider,
+                        &summary.model,
                     );
-                    if let Err(error) = run_hook_chain(&completion_hooks, &payload).await {
+                    payload.prompt = Some(&prompt);
+                    payload.success = Some(false);
+                    payload.error = Some(&error_text);
+                    if let Err(error) = worker_hooks.run_best_effort(payload).await {
                         let _ = events_tx
                             .send(AgentEvent::Warning(format!(
                                 "completion hook failed: {error:#}"
@@ -2218,6 +2422,7 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
         }
     };
     let ui_error = ui_result.as_ref().err().map(|error| format!("{error:#}"));
+    let cleanup_hooks = hooks.clone();
     let cleanup_result = close_tui_runtime(
         prompts_tx,
         shutdown_tx,
@@ -2226,18 +2431,15 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
         fallback_summary,
         ui_error,
         move |summary| async move {
-            let payload = serde_json::json!({
-                "event": "session_end",
-                "workspace": workspace_name_for_cleanup,
-                "prompts_processed": summary.prompt_count,
-                "success": summary.last_error.is_none(),
-                "error": summary.last_error.unwrap_or_default(),
-                "provider": summary.provider,
-                "model": summary.model,
-            });
-            if let Err(error) = run_hook_chain(&session_end_hooks, &payload).await {
-                eprintln!("session_end hook failed: {error:#}");
-            }
+            let mut payload = lifecycle_hook_payload(
+                HookEvent::SessionEnd,
+                &workspace_for_cleanup,
+                &summary.provider,
+                &summary.model,
+            );
+            payload.success = Some(summary.last_error.is_none());
+            payload.error = summary.last_error.as_deref();
+            run_best_effort_hook(&cleanup_hooks, payload).await;
         },
     )
     .await;
@@ -2267,144 +2469,34 @@ fn detect_git_branch(workspace: &Path) -> Option<String> {
     }
 }
 
-fn completion_hook_payload<'a>(
-    success: bool,
-    prompt: &'a str,
-    outcome: Option<&'a AgentOutcome>,
-    error: Option<&'a str>,
-    workspace: &'a str,
-) -> Value {
-    let mut payload = serde_json::json!({
-        "event": "completion",
-        "success": success,
-        "prompt": prompt,
-        "workspace": workspace,
-    });
-    if let Some(error) = error {
-        payload["error"] = Value::String(error.to_string());
-    } else {
-        payload["error"] = Value::Null;
-    }
-    if let Some(outcome) = outcome {
-        payload["provider"] = Value::String(outcome.provider_id.clone());
-        payload["model"] = Value::String(outcome.model.clone());
-        payload["steps"] = Value::from(outcome.steps);
-        payload["cached"] = Value::Bool(outcome.cached);
-        payload["usage"] = serde_json::json!({
-            "input_tokens": outcome.usage.input_tokens,
-            "output_tokens": outcome.usage.output_tokens,
-        });
-    }
+fn lifecycle_hook_payload<'a>(
+    event: HookEvent,
+    workspace: &'a Path,
+    provider: &'a str,
+    model: &'a str,
+) -> HookPayload<'a> {
+    let mut payload = HookPayload::new(event, workspace);
+    payload.provider = Some(provider);
+    payload.model = Some(model);
     payload
 }
 
-async fn apply_pre_message_send_hooks(commands: &[String], prompt: &str) -> Result<String> {
-    apply_prompt_hooks(commands, "pre_message_send", prompt).await
+async fn apply_prompt_hook(
+    hooks: &HookRunner,
+    event: HookEvent,
+    workspace: &Path,
+    provider: &str,
+    model: &str,
+    prompt: &str,
+) -> Result<String> {
+    let mut payload = lifecycle_hook_payload(event, workspace, provider, model);
+    payload.prompt = Some(prompt);
+    hooks.run_prompt(payload).await
 }
 
-async fn apply_pre_prompt_hooks(commands: &[String], prompt: &str) -> Result<String> {
-    apply_prompt_hooks(commands, "pre_prompt", prompt).await
-}
-
-async fn apply_prompt_hooks(commands: &[String], event: &str, prompt: &str) -> Result<String> {
-    if commands.is_empty() {
-        return Ok(prompt.to_string());
-    }
-    let mut current = prompt.to_string();
-    for command in commands {
-        let payload = json!({
-            "event": event,
-            "prompt": current,
-        })
-        .to_string();
-        let output = run_shell_command(command, Some(&payload), DEFAULT_HOOK_TIMEOUT_MS).await?;
-        if let Some(next) = extract_prompt_from_hook_output(&output) {
-            current = next;
-        }
-    }
-    Ok(current)
-}
-
-fn extract_prompt_from_hook_output(output: &str) -> Option<String> {
-    let trimmed = output.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
-        if let Some(prompt) = value.get("prompt").and_then(Value::as_str) {
-            return Some(prompt.to_string());
-        }
-    }
-    Some(trimmed.to_string())
-}
-
-fn hook_chain_with_plugins(base: &[String], plugins: &[PluginConfig], event: &str) -> Vec<String> {
-    let mut commands = base.to_vec();
-    commands.extend(plugin_hook_commands(plugins, event));
-    commands
-}
-
-fn plugin_hook_commands(plugins: &[PluginConfig], event: &str) -> Vec<String> {
-    plugins
-        .iter()
-        .filter(|plugin| {
-            plugin.enabled
-                && matches!(plugin.kind, PluginKind::Hook)
-                && plugin
-                    .hook_event
-                    .as_deref()
-                    .is_some_and(|hook_event| hook_event == event)
-        })
-        .map(|plugin| {
-            let mut command = Vec::with_capacity(1 + plugin.args.len());
-            command.push(shell_single_quote(&plugin.command));
-            command.extend(plugin.args.iter().map(|arg| shell_single_quote(arg)));
-            command.join(" ")
-        })
-        .collect()
-}
-
-fn shell_single_quote(value: &str) -> String {
-    if value.is_empty() {
-        "''".to_string()
-    } else {
-        format!("'{}'", value.replace('\'', "'\"'\"'"))
-    }
-}
-
-async fn run_hook_chain(commands: &[String], payload: &Value) -> Result<()> {
-    if commands.is_empty() {
-        return Ok(());
-    }
-    let payload = payload.to_string();
-    for command in commands {
-        run_shell_command(command, Some(&payload), DEFAULT_HOOK_TIMEOUT_MS).await?;
-    }
-    Ok(())
-}
-
-async fn run_shell_command(command: &str, input: Option<&str>, timeout_ms: u64) -> Result<String> {
-    let mut spec = CommandSpec::legacy_shell(command).timeout(Duration::from_millis(timeout_ms));
-    for key in ["PATH", "HOME"] {
-        if let Some(value) = std::env::var_os(key) {
-            spec = spec.env(key, value);
-        }
-    }
-    #[cfg(windows)]
-    for key in ["PATHEXT", "SYSTEMROOT", "USERPROFILE"] {
-        if let Some(value) = std::env::var_os(key) {
-            spec = spec.env(key, value);
-        }
-    }
-    if let Some(input) = input {
-        spec = spec.stdin(input.as_bytes().to_vec());
-    }
-    let output = run_bounded(spec).await?;
-    let text = output.combined_lossy();
-    if output.status.success() {
-        Ok(text)
-    } else {
-        bail!("{}", text.trim());
+async fn run_best_effort_hook(hooks: &HookRunner, payload: HookPayload<'_>) {
+    if let Err(error) = hooks.run_best_effort(payload).await {
+        eprintln!("{} hook failed: {error:#}", payload.event.as_str());
     }
 }
 
@@ -2964,31 +3056,51 @@ mod tests {
         assert_eq!(ended.load(Ordering::SeqCst), 1);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn apply_pre_prompt_hooks_can_rewrite_from_plain_output() {
-        let commands = vec!["printf 'from plain hook'".into()];
-        let prompt = apply_pre_prompt_hooks(&commands, "original").await.unwrap();
-        assert_eq!(prompt, "from plain hook");
-    }
-
-    #[tokio::test]
-    async fn apply_pre_prompt_hooks_accepts_json_payload() {
-        let commands = vec!["printf '{\"prompt\":\"from json hook\"}'".into()];
-        let prompt = apply_pre_prompt_hooks(&commands, "original").await.unwrap();
-        assert_eq!(prompt, "from json hook");
-    }
-
-    #[tokio::test]
-    async fn extract_prompt_from_hook_output_handles_empty_as_none() {
-        assert_eq!(extract_prompt_from_hook_output(""), None);
-        assert_eq!(
-            extract_prompt_from_hook_output("{\"prompt\":\"x\"}"),
-            Some("x".to_string())
+    async fn cancelled_tui_runs_typed_session_end_hook_once() {
+        let workspace = tempfile::tempdir().unwrap();
+        let marker = workspace.path().join("session-end.marker");
+        let hooks = HookRunner::new(
+            &grey_core::HooksConfig {
+                session_end: vec![format!("printf x >> '{}'", marker.display())],
+                ..Default::default()
+            },
+            &[],
+            &grey_core::RuntimeConfig::default(),
         );
-        assert_eq!(
-            extract_prompt_from_hook_output("not-json"),
-            Some("not-json".to_string())
-        );
+        let (prompts, _prompt_rx) = mpsc::channel(1);
+        let (shutdown, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let worker = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            unreachable!()
+        });
+        let hook_workspace = workspace.path().to_path_buf();
+
+        let error = close_tui_runtime(
+            prompts,
+            shutdown,
+            worker,
+            Duration::from_millis(20),
+            TuiWorkerSummary::new("provider", "model"),
+            Some("cancelled".into()),
+            move |summary| async move {
+                let mut payload = lifecycle_hook_payload(
+                    HookEvent::SessionEnd,
+                    &hook_workspace,
+                    &summary.provider,
+                    &summary.model,
+                );
+                payload.success = Some(false);
+                payload.error = summary.last_error.as_deref();
+                hooks.run_best_effort(payload).await.unwrap();
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("shutdown timed out"));
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "x");
     }
 
     #[test]

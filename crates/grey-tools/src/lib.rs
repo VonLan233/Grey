@@ -11,7 +11,8 @@ use async_trait::async_trait;
 use globset::{Glob, GlobMatcher};
 use grey_core::{
     process::{run_bounded, CommandSpec},
-    McpToolConfig, PluginConfig, ToolCall, ToolDefinition, ToolExecutor, ToolResult, ToolRisk,
+    HookEvent, HookPayload, HookRunner, HookTool, McpToolConfig, PluginConfig, ToolCall,
+    ToolDefinition, ToolExecutor, ToolResult, ToolRisk,
 };
 use ignore::WalkBuilder;
 use regex::Regex;
@@ -23,7 +24,6 @@ use tempfile::NamedTempFile;
 pub const BUILTIN_TOOL_NAMES: [&str; 5] = ["read_file", "edit_file", "bash", "glob", "grep"];
 const LSP_TOOL_DEFAULT_MAX_ITEMS: usize = 50;
 const LSP_TOOL_MAX_ITEMS: usize = 500;
-const DEFAULT_HOOK_TIMEOUT: u64 = 10_000;
 const DEFAULT_TOOL_TIMEOUT: u64 = 5_000;
 
 #[derive(Debug, Clone)]
@@ -514,56 +514,43 @@ impl Approver for StdioApprover {
 #[derive(Clone)]
 pub struct HookedApprover {
     inner: Arc<dyn Approver>,
-    permission_decision_hooks: Vec<String>,
+    hooks: HookRunner,
+    workspace: PathBuf,
+    provider: String,
+    model: String,
 }
 
 impl HookedApprover {
-    pub fn new(inner: Arc<dyn Approver>, permission_decision_hooks: Vec<String>) -> Self {
+    pub fn new(
+        inner: Arc<dyn Approver>,
+        hooks: HookRunner,
+        workspace: &Path,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
         Self {
             inner,
-            permission_decision_hooks,
+            hooks,
+            workspace: workspace.to_path_buf(),
+            provider: provider.into(),
+            model: model.into(),
         }
     }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "lowercase")]
-#[serde(deny_unknown_fields)]
-struct PermissionHookOutput {
-    approved: Option<bool>,
-    allow: Option<bool>,
 }
 
 #[async_trait]
 impl Approver for HookedApprover {
     async fn approve(&self, call: &ToolCall, risk: ToolRisk) -> bool {
-        let mut approved = self.inner.approve(call, risk).await;
-        if self.permission_decision_hooks.is_empty() {
-            return approved;
-        }
-
-        let payload = json!({
-            "event": "permission_decision",
-            "tool": {
-                "id": call.id,
-                "name": call.name,
-                "arguments": call.arguments,
-            },
-            "risk": format!("{risk:?}")
-        })
-        .to_string();
-
-        for command in &self.permission_decision_hooks {
-            let output =
-                match run_shell_command(command, Some(&payload), DEFAULT_HOOK_TIMEOUT).await {
-                    Ok(output) => output,
-                    Err(_) => return false,
-                };
-            if let Some(next) = extract_permission_decision_from_hook_output(&output) {
-                approved = approved && next;
-            }
-        }
-        approved
+        let approved = self.inner.approve(call, risk).await;
+        let mut payload = HookPayload::new(HookEvent::PermissionDecision, &self.workspace);
+        payload.provider = Some(&self.provider);
+        payload.model = Some(&self.model);
+        payload.tool = Some(HookTool {
+            name: &call.name,
+            risk,
+        });
+        let hook_approved = self.hooks.run_gate(payload).await.unwrap_or(false);
+        approved && hook_approved
     }
 }
 
@@ -611,20 +598,29 @@ impl ToolExecutor for CombinedTools {
 
 pub struct HookedTools {
     inner: Arc<dyn ToolExecutor>,
-    pre_tool_hooks: Vec<String>,
-    post_tool_hooks: Vec<String>,
+    approver: Arc<dyn Approver>,
+    hooks: HookRunner,
+    workspace: PathBuf,
+    provider: String,
+    model: String,
 }
 
 impl HookedTools {
     pub fn new(
         inner: Arc<dyn ToolExecutor>,
-        pre_tool_hooks: Vec<String>,
-        post_tool_hooks: Vec<String>,
+        approver: Arc<dyn Approver>,
+        hooks: HookRunner,
+        workspace: &Path,
+        provider: impl Into<String>,
+        model: impl Into<String>,
     ) -> Self {
         Self {
             inner,
-            pre_tool_hooks,
-            post_tool_hooks,
+            approver,
+            hooks,
+            workspace: workspace.to_path_buf(),
+            provider: provider.into(),
+            model: model.into(),
         }
     }
 }
@@ -636,17 +632,51 @@ impl ToolExecutor for HookedTools {
     }
 
     async fn execute(&self, call: &ToolCall) -> ToolResult {
-        if let Err(error) = run_hook_chain(&self.pre_tool_hooks, "pre_tool_call", call).await {
-            return ToolResult::failure(
-                call,
-                format!("pre_tool_call hook denied tool {}: {error}", call.name),
-            );
+        let risk = self
+            .inner
+            .definitions()
+            .into_iter()
+            .find(|definition| definition.name == call.name)
+            .map(|definition| definition.risk)
+            .unwrap_or(ToolRisk::ReadOnly);
+        if risk != ToolRisk::ReadOnly && !self.approver.approve(call, risk).await {
+            return ToolResult::failure(call, format!("{} denied by approval policy", call.name));
         }
 
-        let mut result = self.inner.execute(call).await;
-        if let Err(error) = run_hook_chain(&self.post_tool_hooks, "post_tool_call", call).await {
-            result.success = false;
-            result.output = format!("{error}\n{}", result.output);
+        let mut pre_payload = HookPayload::new(HookEvent::PreToolCall, &self.workspace);
+        pre_payload.provider = Some(&self.provider);
+        pre_payload.model = Some(&self.model);
+        pre_payload.tool = Some(HookTool {
+            name: &call.name,
+            risk,
+        });
+        match self.hooks.run_gate(pre_payload).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return ToolResult::failure(
+                    call,
+                    format!("pre_tool_call hook denied tool {}", call.name),
+                )
+            }
+            Err(error) => {
+                return ToolResult::failure(
+                    call,
+                    format!("pre_tool_call hook denied tool {}: {error}", call.name),
+                )
+            }
+        }
+
+        let result = self.inner.execute(call).await;
+        let mut post_payload = HookPayload::new(HookEvent::PostToolCall, &self.workspace);
+        post_payload.provider = Some(&self.provider);
+        post_payload.model = Some(&self.model);
+        post_payload.tool = Some(HookTool {
+            name: &call.name,
+            risk,
+        });
+        post_payload.success = Some(result.success);
+        if let Err(error) = self.hooks.run_best_effort(post_payload).await {
+            eprintln!("post_tool_call hook failed: {error:#}");
         }
         result
     }
@@ -1281,34 +1311,6 @@ fn compact_text_tool_output(
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
-    #[test]
-    fn hook_shell_uses_non_login_legacy_boundary() {
-        let spec = hook_command_spec("printf hook", None, 10);
-        assert_eq!(spec.program, std::ffi::OsString::from("/bin/sh"));
-        assert_eq!(
-            spec.args,
-            ["-c", "printf hook"]
-                .into_iter()
-                .map(std::ffi::OsString::from)
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn hook_shell_uses_cmd_legacy_boundary() {
-        let spec = hook_command_spec("echo hook", None, 10);
-        assert_eq!(spec.program, std::ffi::OsString::from("cmd.exe"));
-        assert_eq!(
-            spec.args,
-            ["/D", "/S", "/C", "echo hook"]
-                .into_iter()
-                .map(std::ffi::OsString::from)
-                .collect::<Vec<_>>()
-        );
-    }
-
     #[test]
     fn compact_tool_output_marks_truncated_items() {
         let output = compact_tool_output(
@@ -1335,65 +1337,6 @@ mod tests {
         assert_eq!(normalized_max_items(Some(0)), 1);
         assert_eq!(normalized_max_items(Some(1000)), 500);
     }
-}
-
-async fn run_hook_chain(commands: &[String], event: &str, call: &ToolCall) -> Result<(), String> {
-    if commands.is_empty() {
-        return Ok(());
-    }
-    let payload = json!({
-        "event": event,
-        "tool": {
-            "id": call.id,
-            "name": call.name,
-            "arguments": call.arguments,
-        }
-    })
-    .to_string();
-    for command in commands {
-        if let Err(error) = run_shell_command(command, Some(&payload), DEFAULT_HOOK_TIMEOUT).await {
-            return Err(format!(
-                "{event} hook failed for tool {} with command `{command}`: {error}",
-                call.name
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn extract_permission_decision_from_hook_output(output: &str) -> Option<bool> {
-    let trimmed = output.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if matches!(trimmed, "true" | "TRUE" | "false" | "FALSE") {
-        return Some(trimmed.eq_ignore_ascii_case("true"));
-    }
-    let mut approved = match serde_json::from_str::<PermissionHookOutput>(trimmed) {
-        Ok(hook_output) => hook_output.approved.or(hook_output.allow),
-        Err(_) => None,
-    };
-    if approved.is_none() {
-        if trimmed == "approved=false" || trimmed == "allow=false" {
-            approved = Some(false);
-        } else if trimmed == "approved=true" || trimmed == "allow=true" {
-            approved = Some(true);
-        }
-    }
-    approved
-}
-
-async fn run_shell_command(command: &str, input: Option<&str>, timeout_ms: u64) -> Result<String> {
-    run_command_spec(hook_command_spec(command, input, timeout_ms)).await
-}
-
-fn hook_command_spec(command: &str, input: Option<&str>, timeout_ms: u64) -> CommandSpec {
-    let mut spec = command_with_runtime_env(CommandSpec::legacy_shell(command))
-        .timeout(Duration::from_millis(timeout_ms));
-    if let Some(input) = input {
-        spec = spec.stdin(input.as_bytes().to_vec());
-    }
-    spec
 }
 
 async fn execute_command(

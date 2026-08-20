@@ -1,7 +1,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use grey_core::{McpToolConfig, PluginConfig, PluginKind, ToolCall, ToolExecutor};
+use grey_core::{
+    HookRunner, HooksConfig, McpToolConfig, PluginConfig, PluginKind, RuntimeConfig, ToolCall,
+    ToolExecutor,
+};
 use grey_tools::{
     AlwaysApprove, BuiltinTools, CombinedTools, DenySideEffects, HookedApprover, HookedTools,
     LspTools, McpTools, PluginTools, BUILTIN_TOOL_NAMES,
@@ -13,6 +16,10 @@ fn call(name: &str, arguments: serde_json::Value) -> ToolCall {
         name: name.into(),
         arguments,
     }
+}
+
+fn hook_runner(hooks: HooksConfig) -> HookRunner {
+    HookRunner::new(&hooks, &[], &RuntimeConfig::default())
 }
 
 #[test]
@@ -116,7 +123,13 @@ async fn permission_decision_hook_can_block_when_inner_approves() {
     std::fs::write(&path, "old").unwrap();
     let approver = Arc::new(HookedApprover::new(
         Arc::new(AlwaysApprove),
-        vec!["printf '{\"approved\": false}'".into()],
+        hook_runner(HooksConfig {
+            permission_decision: vec!["printf '{\"approved\": false}'".into()],
+            ..Default::default()
+        }),
+        directory.path(),
+        "provider",
+        "model",
     ));
     let tools = BuiltinTools::new(directory.path(), approver).unwrap();
 
@@ -142,7 +155,13 @@ async fn permission_decision_hook_false_plain_output_defaults_to_denied() {
     std::fs::write(&path, "old").unwrap();
     let approver = Arc::new(HookedApprover::new(
         Arc::new(AlwaysApprove),
-        vec!["printf false".into()],
+        hook_runner(HooksConfig {
+            permission_decision: vec!["printf false".into()],
+            ..Default::default()
+        }),
+        directory.path(),
+        "provider",
+        "model",
     ));
     let tools = BuiltinTools::new(directory.path(), approver).unwrap();
 
@@ -159,6 +178,47 @@ async fn permission_decision_hook_false_plain_output_defaults_to_denied() {
     assert!(!result.success);
     assert!(result.output.contains("denied"));
     assert_eq!(std::fs::read_to_string(path).unwrap(), "old");
+}
+
+#[tokio::test]
+async fn permission_hook_cannot_upgrade_a_base_denial() {
+    let workspace = tempfile::tempdir().unwrap();
+    let marker = workspace.path().join("permission.marker");
+    let hooks = HooksConfig {
+        permission_decision: vec![format!(
+            "printf config >> '{}'; printf true",
+            marker.display()
+        )],
+        ..Default::default()
+    };
+    let plugins = vec![PluginConfig {
+        id: "permission-plugin".into(),
+        kind: PluginKind::Hook,
+        enabled: true,
+        command: "/bin/sh".into(),
+        args: vec![
+            "-c".into(),
+            format!("printf plugin >> '{}'; printf true", marker.display()),
+        ],
+        hook_event: Some("permission_decision".into()),
+        ..Default::default()
+    }];
+    let approver = HookedApprover::new(
+        Arc::new(DenySideEffects),
+        HookRunner::new(&hooks, &plugins, &RuntimeConfig::default()),
+        workspace.path(),
+        "provider",
+        "model",
+    );
+    assert!(
+        !grey_tools::Approver::approve(
+            &approver,
+            &call("bash", serde_json::json!({"command": "true"})),
+            grey_core::ToolRisk::Execute,
+        )
+        .await
+    );
+    assert_eq!(std::fs::read_to_string(marker).unwrap(), "configplugin");
 }
 
 #[tokio::test]
@@ -261,7 +321,17 @@ async fn combined_tools_resolves_builtins_and_mcp() {
 async fn pre_tool_hook_blocks_and_post_tool_hook_runs_on_success() {
     let workspace = tempfile::tempdir().unwrap();
     let builtin = BuiltinTools::new(workspace.path(), Arc::new(DenySideEffects)).unwrap();
-    let tools = HookedTools::new(Arc::new(builtin), vec!["false".into()], vec!["true".into()]);
+    let tools = HookedTools::new(
+        Arc::new(builtin),
+        Arc::new(AlwaysApprove),
+        hook_runner(HooksConfig {
+            pre_tool_call: vec!["printf false".into()],
+            ..Default::default()
+        }),
+        workspace.path(),
+        "provider",
+        "model",
+    );
     let result = tools
         .execute(&crate::call(
             "read_file",
@@ -273,7 +343,7 @@ async fn pre_tool_hook_blocks_and_post_tool_hook_runs_on_success() {
 }
 
 #[tokio::test]
-async fn post_tool_hook_error_marks_tool_failed_after_tool_success() {
+async fn post_tool_hook_error_preserves_tool_success() {
     let workspace = tempfile::tempdir().unwrap();
     let file_path = workspace.path().join("code.rs");
     std::fs::write(&file_path, "hello").unwrap();
@@ -281,8 +351,14 @@ async fn post_tool_hook_error_marks_tool_failed_after_tool_success() {
     let builtin = BuiltinTools::new(workspace.path(), Arc::new(AlwaysApprove)).unwrap();
     let tools = HookedTools::new(
         Arc::new(builtin),
-        vec![],
-        vec!["false".into(), "echo unreachable".into()],
+        Arc::new(AlwaysApprove),
+        hook_runner(HooksConfig {
+            post_tool_call: vec!["false".into(), "echo unreachable".into()],
+            ..Default::default()
+        }),
+        workspace.path(),
+        "provider",
+        "model",
     );
     let result = tools
         .execute(&crate::call(
@@ -290,10 +366,8 @@ async fn post_tool_hook_error_marks_tool_failed_after_tool_success() {
             serde_json::json!({"path": "code.rs"}),
         ))
         .await;
-    assert!(!result.success, "{}", result.output);
-    assert!(result
-        .output
-        .contains("post_tool_call hook failed for tool read_file"));
+    assert!(result.success, "{}", result.output);
+    assert_eq!(result.output, "hello");
 }
 
 #[tokio::test]
