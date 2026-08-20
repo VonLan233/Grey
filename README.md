@@ -1,78 +1,137 @@
 # Grey
 
 > 一个轻量、高性能、可扩展的 Coding Agent Harness
+> 默认极简，一切按需扩展。快是特性，省是特性，顺是特性。
 
-默认极简，一切按需扩展。快是特性，省是特性，顺是特性。
+<p align="center">
+  <img src="docs/assets/grey-logo.png" alt="Grey" width="128" />
+</p>
 
-## 当前状态
+<p align="center">
+  <a href="https://github.com/VonLan233/Grey/actions/workflows/ci.yml"><img src="https://github.com/VonLan233/Grey/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <img src="https://img.shields.io/badge/version-v0.1.0-blue" alt="Version" />
+  <img src="https://img.shields.io/badge/license-MIT-green" alt="License" />
+  <img src="https://img.shields.io/badge/rust-1.97.1-orange" alt="Rust" />
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey" alt="Platform" />
+</p>
 
-Grey 已完成 P0 技术验证，并具备 P1 的首个可用纵向闭环：同一套 Core
-同时服务单发 CLI 与 TUI，模型可以流式回答、调用工作区工具、接收工具结果并继续推理，
-会话可保存到 SQLite 后恢复。
+Grey 是一个用 Rust 写的 Coding Agent Harness：同一套 Core 同时服务单发 CLI 与交互式 TUI，
+模型可以流式回答、调用工作区工具、接收结果并继续推理，会话持久化到 SQLite。
+它围绕三个原则构建：
 
-当前版本是 **v0.3/P3 MVP**（非 v1.0）。P2 已完成多 Provider 路由、故障切换、
-上下文预算、请求缓存和 usage 持久化；MCP 与 Hook 也已接入（Prompt Hook、工具前后
-Hook、MCP Command Tool）；P3 已补齐多 Agent 编排与会话化记忆持久化。
-LSP 工具现已支持 `lsp_*` 结果的路径级语义视图注入会话（并按 tool/path 去重），
-P5 已进入交付：TUI 支持布局高度/主题配置与基础完成提醒；P6 已进入实现（Hook 生命周期、`loop/goal`、插件工具/Hook），WASM 插件、图片与发布打包仍在后续。
+- **快** — 启动毫秒级、渲染帧率有硬性门禁、工具调用低延迟。
+- **省** — 分区 Token 预算、滚动摘要、LRU 请求缓存、usage 全程记账。
+- **顺** — 多 Provider 自动路由与故障切换、MCP 生态、Hook 全链路、可编排的多 Agent。
 
-## 已实现
+## 目录
 
-- 有界 Agent 工具循环与统一事件流
+- [特性](#特性)
+- [快速开始](#快速开始)
+- [CLI 速览](#cli-速览)
+- [配置](#配置)
+- [工具与安全](#工具与安全)
+- [Hook 与插件](#hook-与插件)
+- [MCP](#mcp)
+- [会话](#会话)
+- [架构](#架构)
+- [开发与发布](#开发与发布)
+- [路线图](#路线图)
+- [许可证](#许可证)
+
+## 特性
+
+**核心对话**
+- 有界 Agent 工具循环与统一事件流，支持流式输出、工具调用聚合与错误传播
 - OpenAI Chat Completions 兼容协议、Anthropic Messages API、离线 Mock Provider
 - 可靠 SSE 跨分片解析、流式工具调用聚合和错误传播
-- `read_file` / `edit_file` / `bash` / `glob` / `grep`
-- 工作区路径隔离、精确单次替换、原子写入、写入/执行审批
-- 保守上下文裁剪及可审计裁剪事件
-- SQLite 会话保存、列出、查看、按 id 或工作区恢复
-- 可脚本化 `grey "prompt"` 与 JSON 输出
-- ratatui 对话界面、流式状态、滚动和终端清理
-- rust-analyzer 诊断与定义跳转 Spike
-- 动态 `[[providers]]` 注册表、planning/coding/fast/default 路由和 CLI 覆盖
-- Provider/model fallback：只在尚未产生可见输出时切换，并带失败冷却与恢复
-- system/history/tool/input 分区预算、工具输出 token 截断、滚动摘要和裁剪审计事件
-- LSP 语义视图注入：`lsp_*` 工具结果会按文件路径写入紧凑上下文摘要，去重计数暴露在 `tool_outputs_deduplicated`
-- SQLite 请求缓存（TTL/LRU/provider 隔离）与 `--no-cache` 控制
-- 每会话 token/cost usage 记录，跨 CLI 调用累积并由 `usage show/summary` 查询
-- MCP 命令工具与 Hook：`pre_prompt`、`pre_tool_call`、`post_tool_call`
-- MCP stdio 协议客户端：`[[mcp_servers]]` 持久化服务器、`initialize/tools/list/tools/call`、`grey mcp` CRUD 与 `id__tool` 工具注册
-- P6 扩展能力：`grey plugins`、`[[plugins]]`（tool/hook）、`grey loop`、`grey goal`、以及 Hook 全链路事件
-- 多 Agent 编排：`grey orchestrate` 并行运行子 agent，支持 `--session`/`--continue` 与结果持久化
-- TUI 外观与提醒：`[tui]` 布局高度、主题与长任务完成提醒可配置（可控制终端鸣铃、强鸣铃）
 
-完整路线图见[阶段性开发文档](docs/阶段性开发文档.md)，架构背景见[项目计划书](docs/项目计划书.md)。
+**省 Token 与成本**
+- system / history / tool / input 分区预算、工具输出截断、滚动摘要与可审计裁剪事件
+- SQLite 请求缓存（TTL / LRU / provider 隔离）与 `--no-cache` 控制
+- 每会话 token/cost usage 记录，跨调用累积，`usage show/summary` 查询
+
+**多 Provider 与路由**
+- 动态 `[[providers]]` 注册表、planning / coding / fast / default 路由、CLI 覆盖
+- Provider/model fallback：只在尚未产生可见输出时切换，带失败冷却与恢复
+- `GREY_PROVIDER_<ID>_<FIELD>` 环境变量覆盖；未知/重复/无效引用直接报错，不静默降级
+
+**工具与安全**
+- 内建 `read_file` / `edit_file` / `bash` / `glob` / `grep`
+- 工作区路径隔离（拒绝 `..` / 绝对路径 / 符号链接逃逸）、精确单次替换、原子写入、写入/执行审批
+- LSP 语义视图注入：`lsp_*` 结果按路径写入紧凑上下文摘要并按 tool/path 去重
+
+**扩展性**
+- MCP 生态：`[[mcp_servers]]` stdio 协议客户端（`id__tool` 注册）+ `[[mcp_tools]]` 兼容层
+- Hook 全链路：`pre_prompt`、`pre_message_send`、`pre_tool_call` / `post_tool_call`、`permission_decision`、`completion`、`session_start` / `session_end`
+- 插件系统：`grey plugins` 管理 tool / hook 插件（含 sealed WASM 插件运行时）
+- 多 Agent 编排：`grey orchestrate` 并行子 agent + `grey loop` / `grey goal`
+
+**界面**
+- ratatui 对话界面：流式状态、滚动、主题（`slate` / `grey_storm` 等）、布局配置
+- 长任务完成提醒（终端鸣铃 / 强鸣铃 / 系统通知），状态栏展示任务、模型、分支与 token 统计
 
 ## 快速开始
 
-需要 Rust 1.97.1（仓库的 `rust-toolchain.toml` 已固定版本）。LSP Spike 还需要单独安装
-`rust-analyzer`；普通对话不需要它。
+> 需要 Rust 1.97.1（仓库 `rust-toolchain.toml` 已固定版本）。仅 LSP Spike 需要额外安装 `rust-analyzer`。
 
-一条命令运行离线 Demo（不访问网络、不保存会话）：
+**一条命令运行离线 Demo**（不访问网络、不保存会话）：
 
 ```bash
 cargo run -p grey-cli -- --no-save "你好 Grey"
 ```
 
-启动交互 TUI：
+**启动交互式 TUI**：
 
 ```bash
 cargo run -p grey-cli
 ```
 
-脚本化 JSON 输出：
+**脚本化 JSON 输出**：
 
 ```bash
 cargo run -q -p grey-cli -- --no-save --format json "概述这个项目"
 ```
 
-安装本地二进制：
+**安装本地二进制**：
 
 ```bash
 cargo install --path crates/grey-cli
 grey --help
 ```
 
-## Provider 配置
+也可以直接从 [GitHub Releases](https://github.com/VonLan233/Grey/releases) 下载发布包：
+
+```bash
+tar -xzf grey-0.1.0-darwin-aarch64.tar.gz
+cp grey-0.1.0-darwin-aarch64/bin/grey /usr/local/bin/grey
+```
+
+## CLI 速览
+
+```text
+grey [OPTIONS] <COMMAND>
+
+Commands:
+  config       配置管理（init / show / path）
+  providers    Provider 与模型管理（list / show）
+  sessions     会话管理（list / show）
+  plugins      插件管理（list / show / find / add / remove / enable / disable）
+  hooks        Hook 插件管理
+  skills       本地 SKILL.md 管理
+  mcp          MCP 服务器管理（list / show / find / add / remove）
+  cache        请求缓存（stats / clear）
+  usage        用量与成本（show / summary）
+  auth         ChatGPT OAuth 登录（login / status / logout）
+  tui          TUI 偏好（theme / layout / keys）
+  orchestrate  多 Agent 编排
+  loop         固定轮次迭代
+  goal         目标驱动迭代
+  spike-a/b/c  P0 技术验证 Spike
+```
+
+常用全局参数：`--provider`、`--model`、`--workspace`、`--session`、`--continue`、`--no-save`、`--no-cache`、`--format json`、`--auto-approve`、`--read-only`。
+
+## 配置
 
 创建默认配置：
 
@@ -81,13 +140,13 @@ grey config init
 grey config show
 ```
 
-默认路径是 `~/.config/grey/grey.toml`，也可用 `GREY_CONFIG` 指定。配置优先级固定为：
+默认路径是 `~/.config/grey/grey.toml`，可用 `GREY_CONFIG` 指定。配置优先级固定为：
 
 ```text
 内置默认值 < TOML < GREY_* 环境变量 < CLI 参数
 ```
 
-动态 Provider 示例：
+### 动态 Provider 示例
 
 ```toml
 default_provider = "local"
@@ -161,7 +220,10 @@ theme = { preset = "slate", overrides = { border = "#1f2937", accent = "#60a5fa"
 completion = { enabled = true, long_running_steps = 4, long_running_seconds = 120, bell = true, strong_bell = true, notify = true, persistent = true }
 keys = { leader = "\\", help = "k", quit = "ctrl-c", clear = "ctrl-l", scroll_up = "pageup", scroll_down = "pagedown" }
 ```
-状态栏会展示当前任务、模型（provider/model）、分支、输入/输出 token、错误状态，并支持 `<leader>k` 打开快捷键帮助（默认 leader 为 `\\`）。
+
+状态栏会展示当前任务、模型（provider/model）、分支、输入/输出 token、错误状态，并支持 `<leader>k` 打开快捷键帮助（默认 leader 为 `\`）。
+
+### 旧版配置兼容
 
 旧版配置仍兼容，但会输出迁移提示：
 
@@ -185,40 +247,23 @@ max_tokens = 4096
 rust_analyzer = "rust-analyzer"
 ```
 
-常用覆盖：
+### 环境变量覆盖
 
 ```bash
 GREY_PROVIDER_OPENAI_API_KEY=sk-xxx GREY_PROVIDER_OPENAI_BASE_URL=https://api.openai.com/v1 grey --provider openai --model gpt-5.3-codex-spark "Hello"
-GREY_PROVIDER_OPENAI_API_KEY=sk-xxx GREY_PROVIDER_OPENAI_BASE_URL=https://api.openai.com/v1 grey --provider openai --model gpt-5.3-codex-spark --no-cache --no-save "请只回复 ok"
-grey --provider openai --model qwen2.5:7b "修复测试失败"
-grey --provider anthropic "解释这个 workspace"
 GREY_OPENAI_BASE_URL=http://localhost:11434/v1 grey --provider openai "你好"
 ARK_API_KEY=ark-xxx GREY_PROVIDER_VOLCANO_BASE_URL=https://ark.cn-beijing.volces.com/api/v3 grey --provider volcano --model deepseek-v4-flash-ga-260731 --no-cache --no-save "请只回复 ok"
-ARK_API_KEY=<VOLCANO_API_KEY> GREY_PROVIDER_VOLCANO_BASE_URL=https://ark.cn-beijing.volces.com/api/v3 grey --provider volcano --model deepseek-v4-flash-ga-260731 --no-cache --no-save "请只回复 ok"
 grey --task coding --no-cache "修复测试失败"
-grey providers list
-grey providers show mock
-grey cache stats
-grey usage show <SESSION_ID>
-grey usage summary
-./scripts/run-grey-smoke-p2.sh   # 运行 OpenAI/Volcano 实网 smoke（默认优先 OpenAI 模型 gpt-5.3-codex-spark，Volcano 为可选）
 ```
 
-每个 Provider 还可以使用 `GREY_PROVIDER_<ID>_<FIELD>` 覆盖，例如
-`GREY_PROVIDER_LOCAL_BASE_URL`、`GREY_PROVIDER_LOCAL_API_KEY`。在动态 `[[providers]]` 配置下，
-`GREY_PROVIDER_OPENAI_API_KEY`/`GREY_PROVIDER_OPENAI_BASE_URL` 可用于覆盖 openai 配置；`volcano` 分支支持 `ARK_API_KEY`（或 `VOLCANO_API_KEY`）兜底。
-`run-grey-smoke-p2.sh` 会优先执行 OpenAI `gpt-5.3-codex-spark` 分支，并在有 `VOLCANO/ARK` key 时补充执行火山方舟 `deepseek-v4-flash-ga-260731` 验证；
-若未显式设置 OpenAI key，会回退到 `YUNWU_API_KEY` 并按需跳过 OpenAI 分支。
-`ARK_API_KEY` 也可直接用于 `volcano` provider；
-旧的 `GREY_OPENAI_*` / `GREY_ANTHROPIC_*` 变量也继续有效（用于 legacy 兼容）。
-进行 OpenAI 实网验证时请使用 `sk-` 前缀的 OpenAI API key（非 ChatGPT 会话 token）。进行火山方舟验证时请使用 `ARK_API_KEY`/`VOLCANO_API_KEY`。
-未知 Provider、重复 Provider ID
-和无效 fallback 引用会直接报错，不会静默降级为 Mock。
+- 每个 Provider 可用 `GREY_PROVIDER_<ID>_<FIELD>` 覆盖（如 `GREY_PROVIDER_LOCAL_BASE_URL`）。
+- `volcano` 分支支持 `ARK_API_KEY`（或 `VOLCANO_API_KEY`）兜底；旧 `GREY_OPENAI_*` / `GREY_ANTHROPIC_*` 变量继续有效（legacy 兼容）。
+- 实网验证脚本 `scripts/run-grey-smoke-p2.sh` 优先执行 OpenAI `gpt-5.3-codex-spark` 分支，有 `VOLCANO/ARK` key 时补充执行火山方舟验证；OpenAI key 用 `sk-` 前缀（非 ChatGPT 会话 token）。
+- 未知 Provider、重复 Provider ID 和无效 fallback 引用会直接报错，不会静默降级为 Mock。
 
-## 工具安全
+## 工具与安全
 
-读取与搜索工具默认可用。单发 CLI 中，`edit_file` 与 `bash` 默认逐次询问；非交互环境
-和 TUI 默认拒绝副作用（避免与 raw-mode 输入竞争），TUI 需要显式传入 `--auto-approve` 才会执行写入。
+读取与搜索工具默认可用。单发 CLI 中 `edit_file` 与 `bash` 默认逐次询问；非交互环境和 TUI 默认拒绝副作用（避免与 raw-mode 输入竞争），TUI 需要显式传入 `--auto-approve` 才会执行写入。
 
 ```bash
 # 明确自动批准写入和命令执行
@@ -228,21 +273,22 @@ grey --auto-approve "修复 bug 并运行测试"
 grey --read-only "找出 bug，但不要修改"
 ```
 
-所有文件工具只能访问 `--workspace` 指定的规范化目录，`..`、绝对路径和符号链接逃逸会被拒绝。
-`edit_file` 只修改现有文件，且 `old_string` 必须恰好匹配一次。
+- 所有文件工具只能访问 `--workspace` 指定的规范化目录，`..`、绝对路径和符号链接逃逸会被拒绝。
+- `edit_file` 只修改现有文件，且 `old_string` 必须恰好匹配一次。
 
-Hook 约定：
+## Hook 与插件
+
+### Hook 约定
+
 - `session_start`：会话开始时执行一次。
-- `pre_message_send`：每次消息发送前执行，可改写 `prompt`，返回 JSON `{"prompt":"..."}`
-  或纯文本时按原样替换。
+- `pre_message_send`：每次消息发送前执行，可改写 `prompt`（返回 JSON `{"prompt":"..."}` 或纯文本按原样替换）。
 - `pre_prompt`：兼容历史行为，每次消息处理前再次触发。
-- `pre_tool_call` / `post_tool_call`：工具调用前后执行；`pre_tool_call` 失败会阻断对应工具执行。
-- `permission_decision`：权限决策钩子，在 `edit_file`/`bash` 等有副作用工具执行前给出最终批准（可返回
-  `{"approved":false}`）。
+- `pre_tool_call` / `post_tool_call`：工具调用前后执行；`pre_tool_call` 失败会阻断对应工具。
+- `permission_decision`：权限决策钩子，副作用工具执行前给出最终批准（可返回 `{"approved":false}`）。
 - `completion`：每次交互成功或失败后执行。
 - `session_end`：会话结束时执行一次（TUI 与 headless）。
 
-插件管理：
+### 插件管理
 
 ```bash
 grey plugins list
@@ -254,24 +300,18 @@ grey plugins remove rewrite-hook
 grey plugins add tool-check --kind tool --command printf --arg hello
 ```
 
-`add`/`remove` 会将变更落盘到 `GREY_CONFIG`（或默认 `~/.config/grey/grey.toml`）对应的
-`[[plugins]]` 配置。
+`add`/`remove` 会将变更落盘到 `GREY_CONFIG`（或默认 `~/.config/grey/grey.toml`）对应的 `[[plugins]]` 配置。
 
-### MCP 服务器
+## MCP
 
 Grey 支持两类 MCP 配置，二者可共存：
 
-- `[[mcp_tools]]`：**兼容层**（保留，不迁移）。每个条目是单条 shell 命令工具，不执行
-  MCP JSON-RPC 协议，直接注册为同名工具。
-- `[[mcp_servers]]`：**持久化 stdio MCP 协议客户端**（推荐）。启动后执行
-  `initialize` → `tools/list` → `tools/call`，发现的工具以 `id__tool` 命名注册；单连接
-  串行处理请求，超时（默认 5s，`timeout_ms` 覆盖）后对进程组先 `TERM` 再 `KILL` 回收。
+- **`[[mcp_tools]]`（兼容层，保留）**：每个条目是单条 shell 命令工具，不执行 MCP JSON-RPC 协议，直接注册为同名工具。
+- **`[[mcp_servers]]`（持久化 stdio MCP 协议客户端，推荐）**：启动后执行 `initialize` → `tools/list` → `tools/call`，发现的工具以 `id__tool` 命名注册；单连接串行处理请求，超时（默认 5s，`timeout_ms` 覆盖）后对进程组先 `TERM` 再 `KILL` 回收。
 
-迁移说明：若某个 `[[mcp_tools]]` 条目本身就是一个会讲 MCP stdio JSON-RPC 的服务进程，
-把它迁移到 `[[mcp_servers]]`（补一个稳定 `id`）即可走协议握手；纯 shell 命令工具继续留在
-`[[mcp_tools]]`。`[[mcp_servers]]` 只支持 `stdio` 传输，`command` 必须是直接命令而非 URL。
+**迁移说明**：若某个 `[[mcp_tools]]` 条目本身就是一个会讲 MCP stdio JSON-RPC 的服务进程，把它迁移到 `[[mcp_servers]]`（补一个稳定 `id`）即可走协议握手；纯 shell 命令工具继续留在 `[[mcp_tools]]`。`[[mcp_servers]]` 只支持 `stdio` 传输，`command` 必须是直接命令而非 URL。
 
-管理命令（落盘到 `GREY_CONFIG` 的 `[[mcp_servers]]`）：
+**管理命令**（落盘到 `GREY_CONFIG` 的 `[[mcp_servers]]`）：
 
 ```bash
 grey mcp list
@@ -281,13 +321,11 @@ grey mcp add filesystem --command npx --arg=-y --arg=@modelcontextprotocol/serve
 grey mcp remove filesystem
 ```
 
-`add` 以 `id` 为准执行 upsert（更新时保留已有 `args`/`timeout_ms`/`env`）；`env` 暂由
-配置文件手写，`show` 会脱敏 `args` 与常见密钥字段。
+`add` 以 `id` 为准执行 upsert（更新时保留已有 `args`/`timeout_ms`/`env`）；`env` 暂由配置文件手写，`show` 会脱敏 `args` 与常见密钥字段。
 
 ## 会话
 
-会话默认保存在 `~/.local/share/grey/sessions.db`，测试或便携环境可用
-`GREY_SESSION_DB` 覆盖。
+会话默认保存在 `~/.local/share/grey/sessions.db`，测试或便携环境可用 `GREY_SESSION_DB` 覆盖。
 
 ```bash
 grey "第一轮"
@@ -300,39 +338,61 @@ grey --no-save "临时问题"
 
 恢复会话时会校验工作区，避免在另一个目录意外执行旧上下文中的工具请求。
 
-## P0 技术 Spike
+## 架构
 
-```bash
-grey spike-a
-grey spike-b crates/grey-core/src/config.rs
-grey spike-c "流式测试"
-```
+Rust workspace，分层清晰，单向依赖：
 
-`spike-c` 使用 Mock Provider 时会额外发出一个示例工具调用，但不会执行它；真实 Agent
-入口是 `grey "prompt"`。
+| Crate | 职责 |
+| --- | --- |
+| `grey-core` | 语言无关契约：协议、Agent 循环、上下文预算、会话、配置、Hook 运行时 |
+| `grey-provider` | Provider 适配：OpenAI / Anthropic / Mock / SSE / OAuth / 路由与 fallback |
+| `grey-tools` | 内建工具 + LSP + MCP 客户端 + 插件工具，统一 `ToolExecutor` |
+| `grey-tui` | ratatui 交互界面、主题、完成提醒 |
+| `grey-lsp` | rust-analyzer 诊断与定义跳转集成 |
+| `grey-cli` | CLI 入口：所有子命令、工具链组装、会话与 TUI 编排 |
 
-## 开发与验证
+关键架构决策记录在 [ADR](docs/adr/)：
+
+- [ADR-001 运行时与边界](docs/adr/ADR-001-runtime-and-boundaries.md)
+- [ADR-002 P2 多 Provider 路由](docs/adr/ADR-002-p2-multi-provider-routing.md)
+- [ADR-003 P3 Agent 编排](docs/adr/ADR-003-p3-agent-orchestration.md)
+- [ADR-004 P4 LSP 语义上下文](docs/adr/ADR-004-p4-lsp-semantic-context.md)
+- [ADR-005 P5 TUI 定制](docs/adr/ADR-005-p5-tui-customization.md)
+- [ADR-006 P6 Hook 生命周期](docs/adr/ADR-006-p6-hook-lifecycle.md)
+
+完整路线图见[阶段性开发文档](docs/阶段性开发文档.md)，架构背景见[项目计划书](docs/项目计划书.md)。
+
+## 开发与发布
+
+### 开发
 
 ```bash
 cargo fmt --all -- --check
-# 如果环境里 cargo clippy 有时回退到旧 rustc，可显式使用 rustup 1.97.1 的 cargo-clippy：
-# ~/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/cargo-clippy --workspace --all-targets --all-features -- -D warnings
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo build --workspace --release --locked
 ```
 
-仓库分层与关键决策记录在
-[ADR-001](docs/adr/ADR-001-runtime-and-boundaries.md)
-[ADR-002](docs/adr/ADR-002-p2-multi-provider-routing.md)，
-本次实现计划见
-[P0+P1 Implementation Plan](docs/plans/p0-p1-harness.md)。
+> 若环境里的 cargo/clippy 偶发回退到旧 rustc，可显式使用 rustup 1.97.1：
+> `~/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/cargo-clippy --workspace --all-targets --all-features -- -D warnings`
 
-## 路线图（规划）
+### 发布门禁与脚本
 
-1. P2：多 Provider 路由、故障切换、Token 预算/摘要/缓存
-2. P3：多 Agent 编排
-3. P4：完整 LSP 语义工具、文档与图片
-4. P5：可定制布局、主题与完成提醒
-5. P6：WASM 插件、Hook、Loop/Goal 和性能门禁
-6. P7：跨平台打包与 v1.0 发布
+- `scripts/test-all.sh` — 完整离线 release gate：fmt、clippy、workspace 测试、doc 测试、release 构建、性能门禁、soak。
+- `scripts/run-grey-p6-perf-gates.sh` — 启动时延 / 内存 / 渲染 FPS / 大仓库扫描门禁（已接入 CI）。
+- `scripts/run-grey-p8-soak.sh` — RSS 峰值与斜率、子进程水位长时 soak（`--long` 一小时）。
+- `scripts/run-grey-p7-release.sh` — 构建并打包 GitHub Release 产物（tar.gz + SHA256SUMS + RELEASE_NOTES）。
+- `scripts/run-grey-smoke-p2.sh` — OpenAI / Volcano 实网 smoke。
+
+## 路线图
+
+1. **P2** ✅ 多 Provider 路由、故障切换、Token 预算 / 摘要 / 缓存
+2. **P3** ✅ 多 Agent 编排与会话化记忆
+3. **P4** LSP 语义工具、文档与图片
+4. **P5** ✅ 可定制布局、主题与完成提醒
+5. **P6** ✅ Hook 生命周期、Loop / Goal、插件与性能门禁
+6. **P7** 🚧 跨平台打包与 v1.0 发布（当前 v0.1.0）
+
+## 许可证
+
+[MIT](LICENSE) © Grey Team
