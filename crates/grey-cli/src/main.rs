@@ -4426,8 +4426,10 @@ mod tests {
     #[tokio::test]
     async fn sealed_wasm_theme_executes_without_command_fallback() {
         let root = tempfile::tempdir().unwrap();
-        let mut config = GreyConfig::default();
-        config.plugin_config_dir = root.path().to_path_buf();
+        let mut config = GreyConfig {
+            plugin_config_dir: root.path().to_path_buf(),
+            ..Default::default()
+        };
         config.tui.theme.plugin = Some("sealed-theme".into());
         let mut plugin = sealed_theme_plugin(root.path());
         plugin.command = "false".into();
