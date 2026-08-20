@@ -1935,7 +1935,7 @@ fn render_status_line(frame: &mut Frame<'_>, state: &AppState, theme: &RenderThe
 }
 
 fn render_help_overlay(frame: &mut Frame<'_>, state: &AppState, theme: &RenderTheme) {
-    let area = centered_rect(60, 16, frame.area());
+    let area = centered_rect(68, 70, frame.area());
     let labels = state.settings.keys.labels();
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1946,24 +1946,31 @@ fn render_help_overlay(frame: &mut Frame<'_>, state: &AppState, theme: &RenderTh
         Line::from("快捷键"),
         Line::from(""),
         Line::from(format!(
-            " {} {}  显示/关闭快捷键帮助",
+            " {} {}    显示/关闭快捷键帮助",
             labels.leader, labels.help
         )),
-        Line::from(" Enter     发送输入"),
-        Line::from(format!(" {}        退出", labels.quit)),
-        Line::from(format!(" {}        清空输出", labels.clear)),
+        Line::from(" Enter        发送输入"),
+        Line::from(" Shift/Alt+Enter  换行（多行输入）"),
+        Line::from(" 行尾 \\ + Enter   换行"),
+        Line::from(format!(" {}           退出", labels.quit)),
+        Line::from(format!(" {}           清空输出", labels.clear)),
         Line::from(format!(
-            " {} / {}  滚动输出",
+            " {} / {} / 滚轮  滚动消息",
             labels.scroll_up, labels.scroll_down
         )),
         Line::from(""),
-        Line::from("状态栏含义"),
-        Line::from(" task: 当前任务名".to_string()),
-        Line::from(" model: 当前模型 (provider/model)".to_string()),
-        Line::from(" branch: 当前仓库分支".to_string()),
-        Line::from(" i/o: 累积输入输出 token".to_string()),
-        Line::from(" [ERR]/[OK]: 最近事件状态"),
-        Line::from("[HOLD]: 完成提醒等待回执".to_string()),
+        Line::from("斜杠命令"),
+        Line::from(""),
+        Line::from(" /help          帮助"),
+        Line::from(" /clear         清空输出"),
+        Line::from(" /quit  /exit   退出"),
+        Line::from(" /model <name>  切换模型（下一条生效）"),
+        Line::from(" /usage         查看累积 token 用量"),
+        Line::from(""),
+        Line::from("界面"),
+        Line::from(" task: 输入框上方显示当前任务名".to_string()),
+        Line::from(" model/branch/i-o: 底部状态栏".to_string()),
+        Line::from(" [ERR]/[OK] 事件状态 · [HOLD] 完成提醒".to_string()),
     ]);
     frame.render_widget(
         Paragraph::new(body).block(block).wrap(Wrap { trim: false }),
