@@ -1,4 +1,4 @@
-use crate::config::PluginConfig;
+use crate::config::{PluginConfig, PluginRuntime};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::env;
@@ -113,6 +113,8 @@ pub fn upsert_plugin(doc: &mut DocumentMut, plugin: &PluginConfig) -> Result<()>
     set_optional_integer(entry, "timeout_ms", plugin.timeout_ms);
     set_optional_string(entry, "version", plugin.version.as_deref());
     set_optional_string(entry, "hook_event", plugin.hook_event.as_deref());
+    entry["runtime"] = value(plugin_runtime(plugin));
+    set_optional_string(entry, "manifest", plugin.manifest.as_deref());
     Ok(())
 }
 
@@ -178,6 +180,13 @@ fn plugin_kind(plugin: &PluginConfig) -> &'static str {
         crate::config::PluginKind::Provider => "provider",
         crate::config::PluginKind::Hook => "hook",
         crate::config::PluginKind::Theme => "theme",
+    }
+}
+
+fn plugin_runtime(plugin: &PluginConfig) -> &'static str {
+    match plugin.runtime {
+        PluginRuntime::Command => "command",
+        PluginRuntime::Wasm => "wasm",
     }
 }
 
@@ -296,6 +305,29 @@ mod tests {
         let mut value = serde_json::json!({"nested": {"authorization": "hidden"}});
         redact(&mut value);
         assert_eq!(value["nested"]["authorization"], "***");
+    }
+
+    #[test]
+    fn raw_config_upsert_preserves_unknown_wasm_plugin_fields() {
+        let source = "# keep\n[[plugins]]\nid = \"echo\"\nowner = \"user\"\n";
+        let edited = edit_text(source, |doc| {
+            upsert_plugin(
+                doc,
+                &PluginConfig {
+                    id: "echo".into(),
+                    kind: crate::config::PluginKind::Tool,
+                    enabled: true,
+                    runtime: PluginRuntime::Wasm,
+                    manifest: Some("plugins/echo/plugin.json".into()),
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+        assert!(edited.contains("# keep"));
+        assert!(edited.contains("owner = \"user\""));
+        assert!(edited.contains("runtime = \"wasm\""));
+        assert!(edited.contains("manifest = \"plugins/echo/plugin.json\""));
     }
 
     #[cfg(unix)]

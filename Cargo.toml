@@ -44,6 +44,8 @@ uuid = { version = "1", features = ["v4"] }
 tiktoken-rs = "0.6"
 sha2 = "0.10"
 hex = "0.4"
+wasmtime = { version = "47.0.3", default-features = false, features = ["cranelift", "runtime", "std"] }
+wasmtime-wasi = { version = "47.0.3", default-features = false, features = ["p1"] }
 
 [profile.release]
 lto = true

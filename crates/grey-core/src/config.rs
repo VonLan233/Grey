@@ -85,6 +85,14 @@ pub enum PluginKind {
     Theme,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PluginRuntime {
+    #[default]
+    Command,
+    Wasm,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PluginConfig {
     pub id: String,
@@ -106,6 +114,10 @@ pub struct PluginConfig {
     pub version: Option<String>,
     #[serde(default)]
     pub hook_event: Option<String>,
+    #[serde(default)]
+    pub runtime: PluginRuntime,
+    #[serde(default)]
+    pub manifest: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -206,6 +218,10 @@ const RUNTIME_QUEUE_MIN: usize = 1;
 const RUNTIME_QUEUE_MAX: usize = 65_536;
 const RUNTIME_BYTES_MIN: usize = 1024;
 const RUNTIME_BYTES_MAX: usize = 64 * 1024 * 1024;
+pub const RUNTIME_WASM_MEMORY_MIN: usize = 64 * 1024;
+pub const RUNTIME_WASM_MEMORY_MAX: usize = 256 * 1024 * 1024;
+pub const RUNTIME_WASM_FUEL_MIN: u64 = 1;
+pub const RUNTIME_WASM_FUEL_MAX: u64 = 100_000_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeConfig {
@@ -225,6 +241,10 @@ pub struct RuntimeConfig {
     pub command_stderr_max_bytes: usize,
     #[serde(default = "default_skill_max_bytes")]
     pub skill_max_bytes: usize,
+    #[serde(default = "default_wasm_memory_bytes")]
+    pub wasm_memory_bytes: usize,
+    #[serde(default = "default_wasm_fuel")]
+    pub wasm_fuel: u64,
 }
 
 fn default_event_queue_capacity() -> usize {
@@ -250,6 +270,12 @@ fn default_command_stderr_max_bytes() -> usize {
 }
 fn default_skill_max_bytes() -> usize {
     1024 * 1024
+}
+fn default_wasm_memory_bytes() -> usize {
+    64 * 1024 * 1024
+}
+fn default_wasm_fuel() -> u64 {
+    10_000_000
 }
 
 impl RuntimeConfig {
@@ -278,6 +304,12 @@ impl RuntimeConfig {
         self.skill_max_bytes = self
             .skill_max_bytes
             .clamp(RUNTIME_BYTES_MIN, RUNTIME_BYTES_MAX);
+        self.wasm_memory_bytes = self
+            .wasm_memory_bytes
+            .clamp(RUNTIME_WASM_MEMORY_MIN, RUNTIME_WASM_MEMORY_MAX);
+        self.wasm_fuel = self
+            .wasm_fuel
+            .clamp(RUNTIME_WASM_FUEL_MIN, RUNTIME_WASM_FUEL_MAX);
         self
     }
 }
@@ -293,6 +325,8 @@ impl Default for RuntimeConfig {
             command_stdout_max_bytes: default_command_stdout_max_bytes(),
             command_stderr_max_bytes: default_command_stderr_max_bytes(),
             skill_max_bytes: default_skill_max_bytes(),
+            wasm_memory_bytes: default_wasm_memory_bytes(),
+            wasm_fuel: default_wasm_fuel(),
         }
     }
 }
@@ -606,6 +640,9 @@ pub struct GreyConfig {
     pub tui: TuiConfig,
     /// Plugin registry for P6 extension points.
     pub plugins: Vec<PluginConfig>,
+    /// Canonical base directory for relative plugin manifests. Not persisted.
+    #[serde(skip, default = "default_plugin_config_dir")]
+    pub plugin_config_dir: PathBuf,
 
     // Legacy fields (kept for backward compat; migrated into `providers`).
     pub provider: String,
@@ -634,6 +671,7 @@ impl Default for GreyConfig {
             hooks: HooksConfig::default(),
             mcp_tools: Vec::new(),
             plugins: Vec::new(),
+            plugin_config_dir: default_plugin_config_dir(),
             tui: TuiConfig::default(),
             provider: "mock".into(),
             model: "grey-default".into(),
@@ -741,6 +779,7 @@ fn load_from_path(path: Option<&Path>) -> Result<GreyConfig> {
     }
     apply_env(&mut cfg)?;
     cfg.runtime = cfg.runtime.clamped();
+    cfg.plugin_config_dir = plugin_config_dir(path)?;
     let legacy_env = [
         "GREY_PROVIDER",
         "GREY_MODEL",
@@ -757,7 +796,74 @@ fn load_from_path(path: Option<&Path>) -> Result<GreyConfig> {
     if legacy_file || legacy_env {
         eprintln!("warning: legacy provider fields are deprecated; migrate to [[providers]]");
     }
+    validate_plugins(&cfg.plugins)?;
     Ok(cfg)
+}
+
+fn default_plugin_config_dir() -> PathBuf {
+    env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn plugin_config_dir(path: Option<&Path>) -> Result<PathBuf> {
+    let base = path
+        .and_then(Path::parent)
+        .unwrap_or_else(|| Path::new("."));
+    base.canonicalize()
+        .with_context(|| format!("canonicalizing plugin config directory {}", base.display()))
+}
+
+pub fn validate_plugins(plugins: &[PluginConfig]) -> Result<()> {
+    for plugin in plugins {
+        validate_plugin_config(plugin)?;
+    }
+    Ok(())
+}
+
+pub fn validate_plugin_config(plugin: &PluginConfig) -> Result<()> {
+    anyhow::ensure!(!plugin.id.trim().is_empty(), "plugin id must not be empty");
+    match plugin.runtime {
+        PluginRuntime::Command => {
+            anyhow::ensure!(
+                !plugin.command.trim().is_empty(),
+                "command plugin `{}` must specify command",
+                plugin.id
+            );
+            anyhow::ensure!(
+                plugin.manifest.is_none(),
+                "command plugin `{}` must not specify manifest",
+                plugin.id
+            );
+        }
+        PluginRuntime::Wasm => {
+            anyhow::ensure!(
+                matches!(
+                    plugin.kind,
+                    PluginKind::Provider | PluginKind::Theme | PluginKind::Tool
+                ),
+                "wasm plugin `{}` must be provider, theme, or tool",
+                plugin.id
+            );
+            anyhow::ensure!(
+                plugin
+                    .manifest
+                    .as_deref()
+                    .is_some_and(|path| !path.trim().is_empty()),
+                "wasm plugin `{}` must specify manifest",
+                plugin.id
+            );
+            anyhow::ensure!(
+                plugin.command.trim().is_empty() && plugin.args.is_empty(),
+                "wasm plugin `{}` must not specify command or args",
+                plugin.id
+            );
+            anyhow::ensure!(
+                plugin.hook_event.is_none(),
+                "wasm plugin `{}` must not specify hook_event",
+                plugin.id
+            );
+        }
+    }
+    Ok(())
 }
 
 fn merge_file(base: GreyConfig, over: GreyConfig, raw: &toml::Value) -> GreyConfig {
@@ -1191,6 +1297,8 @@ mod tests {
         assert_eq!(defaults.runtime.command_stdout_max_bytes, 64 * 1024);
         assert_eq!(defaults.runtime.command_stderr_max_bytes, 64 * 1024);
         assert_eq!(defaults.runtime.skill_max_bytes, 1024 * 1024);
+        assert_eq!(defaults.runtime.wasm_memory_bytes, 64 * 1024 * 1024);
+        assert_eq!(defaults.runtime.wasm_fuel, 10_000_000);
 
         let dir = test_dir().join("bounded-runtime");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1207,6 +1315,8 @@ response_max_bytes = 0
 command_stdout_max_bytes = {max}
 command_stderr_max_bytes = 0
 skill_max_bytes = {max}
+wasm_memory_bytes = {max}
+wasm_fuel = {max}
 "#,
                 max = i64::MAX
             ),
@@ -1222,6 +1332,8 @@ skill_max_bytes = {max}
         assert_eq!(cfg.runtime.command_stdout_max_bytes, 64 * 1024 * 1024);
         assert_eq!(cfg.runtime.command_stderr_max_bytes, 1024);
         assert_eq!(cfg.runtime.skill_max_bytes, 64 * 1024 * 1024);
+        assert_eq!(cfg.runtime.wasm_memory_bytes, 256 * 1024 * 1024);
+        assert_eq!(cfg.runtime.wasm_fuel, 100_000_000);
     }
 
     #[test]

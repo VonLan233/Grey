@@ -2797,6 +2797,8 @@ fn run_plugins(action: PluginAction) -> Result<()> {
                     } else {
                         None
                     },
+                    runtime: grey_core::PluginRuntime::Command,
+                    manifest: None,
                 };
                 grey_core::raw_config::upsert_plugin(doc, &plugin)
             })?;

@@ -16,6 +16,7 @@ pub mod summary;
 pub mod token;
 pub mod tool;
 pub mod usage;
+pub mod wasm_plugin;
 
 #[cfg(test)]
 pub(crate) mod test_support {
@@ -34,9 +35,9 @@ pub use agent::{Agent, AgentEvent, AgentOptions, AgentOutcome, ProviderCandidate
 pub use cache::{CacheStats, CachedResponse, RequestCache};
 pub use config::{
     AnthropicConfig, CacheConfig, ContextConfig, FallbackConfig, GreyConfig, HooksConfig,
-    LspConfig, McpToolConfig, ModelEntry, OpenAiConfig, PluginConfig, PluginKind, ProviderAuth,
-    ProviderEntry, RouteRule, RuntimeConfig, TaskKind, TuiColorOverrides, TuiCompletionConfig,
-    TuiConfig, TuiKeysConfig, TuiLayoutConfig, TuiThemeConfig, UsageConfig,
+    LspConfig, McpToolConfig, ModelEntry, OpenAiConfig, PluginConfig, PluginKind, PluginRuntime,
+    ProviderAuth, ProviderEntry, RouteRule, RuntimeConfig, TaskKind, TuiColorOverrides,
+    TuiCompletionConfig, TuiConfig, TuiKeysConfig, TuiLayoutConfig, TuiThemeConfig, UsageConfig,
 };
 pub use context::{ContextAudit, ContextManager};
 pub use hook::{HookEvent, HookPayload, HookRunner, HookTool};
@@ -49,3 +50,4 @@ pub use summary::SummaryEngine;
 pub use token::{CharApproxCounter, TiktokenCounter, TokenCounter};
 pub use tool::{ToolDefinition, ToolExecutor, ToolResult, ToolRisk};
 pub use usage::{CostRate, SessionUsage, TurnUsage, UsageTracker};
+pub use wasm_plugin::{WasmPlugin, WasmPluginError, WasmPluginErrorKind, WasmPluginOutput};
