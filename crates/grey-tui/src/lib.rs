@@ -18,7 +18,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crossterm::{
     cursor::{Hide, Show},
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -41,6 +44,7 @@ use unicode_width::UnicodeWidthStr;
 const DEMO_REPLY: &str = "Grey 是一个轻量、高性能、可扩展的代码 Agent Harness。\n\n这是 Spike A 的模拟流式输出：消息按小块持续流入 TUI 并增量渲染，状态栏实时显示帧耗时与渲染频率。输入内容后回车会触发一轮新的模拟回复，Esc、Ctrl-C 或空输入时按 q 退出。";
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(80);
 const SCROLL_PAGE_LINES: u16 = 5;
+const MOUSE_SCROLL_LINES: i16 = 3;
 const PERSISTENT_REMINDER_TICK: Duration = Duration::from_millis(1800);
 const TRUNCATED_MARKER: &str = "[cut]";
 pub const TUI_INPUT_LINES_MIN: u16 = 1;
@@ -1030,6 +1034,25 @@ impl AppState {
         self.follow_output
     }
 
+    fn scroll_mouse(&mut self, lines: i16) {
+        if lines < 0 {
+            let previous = self.scroll;
+            self.scroll = previous.saturating_sub(lines.unsigned_abs());
+            let changed = self.scroll != previous;
+            if changed {
+                self.follow_output = false;
+                self.dirty = true;
+            }
+        } else {
+            self.scroll = self
+                .scroll
+                .saturating_add(lines as u16)
+                .min(self.max_scroll);
+            self.follow_output = self.scroll == self.max_scroll;
+            self.dirty = true;
+        }
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
@@ -1478,6 +1501,8 @@ async fn run_loop<B: Backend>(
                             return Ok(());
                         }
                     }
+                    InputMessage::ScrollUp => state.scroll_mouse(-MOUSE_SCROLL_LINES),
+                    InputMessage::ScrollDown => state.scroll_mouse(MOUSE_SCROLL_LINES),
                     InputMessage::Resize => state.note_resize(),
                     InputMessage::Error(error) => anyhow::bail!("reading terminal input: {error}"),
                 }
@@ -1879,13 +1904,18 @@ impl Drop for TerminalRestoreGuard {
 fn enter_terminal() -> Result<TerminalRestoreGuard> {
     enable_raw_mode().context("enabling terminal raw mode")?;
     let guard = TerminalRestoreGuard::new();
-    execute!(io::stdout(), EnterAlternateScreen, Hide)
+    execute!(io::stdout(), EnterAlternateScreen, Hide, EnableMouseCapture)
         .context("entering terminal alternate screen")?;
     Ok(guard)
 }
 
 fn restore_terminal() -> io::Result<()> {
-    let screen_result = execute!(io::stdout(), Show, LeaveAlternateScreen);
+    let screen_result = execute!(
+        io::stdout(),
+        Show,
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    );
     let raw_result = disable_raw_mode();
     screen_result.and(raw_result)
 }
@@ -1893,6 +1923,8 @@ fn restore_terminal() -> io::Result<()> {
 #[derive(Debug)]
 enum InputMessage {
     Key(KeyEvent),
+    ScrollUp,
+    ScrollDown,
     Resize,
     Error(String),
 }
@@ -1945,6 +1977,18 @@ fn read_input(stop: Arc<AtomicBool>, sender: mpsc::Sender<InputMessage>) {
                 Ok(Event::Key(key)) => {
                     if !send_input(&stop, &sender, InputMessage::Key(key)) {
                         return;
+                    }
+                }
+                Ok(Event::Mouse(mouse)) => {
+                    let message = match mouse.kind {
+                        MouseEventKind::ScrollUp => Some(InputMessage::ScrollUp),
+                        MouseEventKind::ScrollDown => Some(InputMessage::ScrollDown),
+                        _ => None,
+                    };
+                    if let Some(message) = message {
+                        if !send_input(&stop, &sender, message) {
+                            return;
+                        }
                     }
                 }
                 Ok(Event::Resize(_, _)) => {
@@ -2316,6 +2360,27 @@ mod tests {
             row.contains("line-0"),
             "scroll offset was not rendered: {row:?}"
         );
+    }
+
+    #[test]
+    fn mouse_scroll_releases_and_restores_follow() {
+        let mut state = AppState::default();
+        state.reduce_agent_event(AgentEvent::Delta(
+            (0..9)
+                .map(|line| format!("line-{line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+        state.update_viewport(28, 4);
+        assert_eq!(state.scroll(), 5);
+
+        state.scroll_mouse(-MOUSE_SCROLL_LINES);
+        assert_eq!(state.scroll(), 2);
+        assert!(!state.follows_output());
+
+        state.scroll_mouse(MOUSE_SCROLL_LINES);
+        assert_eq!(state.scroll(), 5);
+        assert!(state.follows_output());
     }
 
     #[test]
