@@ -3180,6 +3180,8 @@ fn read_raw_plugins(path: &Path) -> Result<Vec<PluginConfig>> {
 }
 
 fn show_raw_plugin(path: &Path, id: &str) -> Result<()> {
+    // Keep the raw display path behind the same fail-closed configuration gate as all mutations.
+    read_raw_plugins(path)?;
     let source = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let mut config: toml::Value =
         toml::from_str(&source).with_context(|| format!("parsing {}", path.display()))?;

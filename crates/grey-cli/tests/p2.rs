@@ -279,6 +279,34 @@ version = "provider-version"
     assert!(String::from_utf8_lossy(&output.stderr).contains("duplicate plugin id: collision"));
 }
 
+#[test]
+fn plugins_show_rejects_cross_kind_plugin_id_collision() {
+    let env = temp_home();
+    let path = env.home.path().join("collision.toml");
+    std::fs::write(
+        &path,
+        r#"[[plugins]]
+id = "collision"
+kind = "tool"
+command = "printf"
+
+[[plugins]]
+id = "collision"
+kind = "theme"
+command = "printf"
+"#,
+    )
+    .unwrap();
+    let output = env
+        .command()
+        .env("GREY_CONFIG", path)
+        .args(["plugins", "show", "collision"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("duplicate plugin id: collision"));
+}
+
 #[cfg(unix)]
 #[test]
 fn provider_plugin_runs_from_resolved_workspace() {
