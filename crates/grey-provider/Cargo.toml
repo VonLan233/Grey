@@ -22,3 +22,6 @@ tokio.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+wat = "1"
+tempfile.workspace = true
+hex.workspace = true

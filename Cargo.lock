@@ -1019,11 +1019,14 @@ dependencies = [
  "grey-provider",
  "grey-tools",
  "grey-tui",
+ "hex",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "toml",
+ "wat",
 ]
 
 [[package]]
@@ -1071,13 +1074,16 @@ dependencies = [
  "base64 0.22.1",
  "futures-util",
  "grey-core",
+ "hex",
  "keyring",
  "rand 0.8.7",
  "reqwest",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokio",
+ "wat",
 ]
 
 [[package]]
@@ -1089,12 +1095,15 @@ dependencies = [
  "globset",
  "grey-core",
  "grey-lsp",
+ "hex",
  "ignore",
  "regex",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
+ "wat",
 ]
 
 [[package]]

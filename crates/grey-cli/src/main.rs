@@ -3150,6 +3150,36 @@ fn duplicate_tool_names(tools: &[Arc<dyn ToolExecutor>]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
+
+    fn sealed_theme_plugin(root: &Path) -> PluginConfig {
+        let dir = root.join("plugins/theme");
+        std::fs::create_dir_all(&dir).unwrap();
+        let output = br#"{"schema_version":1,"preset":"slate","overrides":{"accent":"cyan"}}"#;
+        let mut bytes = Vec::from([8, 0, 0, 0]);
+        bytes.extend_from_slice(&(output.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(output);
+        let data = bytes
+            .iter()
+            .map(|byte| format!("\\{:02x}", byte))
+            .collect::<String>();
+        let module = wat::parse_str(format!(r#"(module (import "wasi_snapshot_preview1" "fd_write" (func $w (param i32 i32 i32 i32) (result i32))) (memory 1) (export "memory" (memory 0)) (data (i32.const 0) "{data}") (func (export "_start") i32.const 1 i32.const 0 i32.const 1 i32.const 64 call $w drop))"#)).unwrap();
+        std::fs::write(dir.join("module.wasm"), &module).unwrap();
+        let manifest = format!(
+            r#"{{"schema_version":1,"id":"sealed-theme","kind":"theme","protocol":"grey.wasm-plugin.v1","wasi":"preview1-stdio","module":"module.wasm","module_sha256":"{}"}}"#,
+            hex::encode(Sha256::digest(&module))
+        );
+        std::fs::write(dir.join("plugin.json"), &manifest).unwrap();
+        PluginConfig {
+            id: "sealed-theme".into(),
+            kind: PluginKind::Theme,
+            enabled: true,
+            runtime: PluginRuntime::Wasm,
+            manifest: Some("plugins/theme/plugin.json".into()),
+            manifest_sha256: Some(hex::encode(Sha256::digest(manifest.as_bytes()))),
+            ..Default::default()
+        }
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
@@ -3539,6 +3569,34 @@ mod tests {
             .unwrap();
         assert_eq!(resolved.theme.preset, "slate");
         assert_eq!(resolved.theme.overrides.accent.as_deref(), Some("cyan"));
+    }
+
+    #[tokio::test]
+    async fn sealed_wasm_theme_executes_without_command_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = GreyConfig::default();
+        config.plugin_config_dir = root.path().to_path_buf();
+        config.tui.theme.plugin = Some("sealed-theme".into());
+        let mut plugin = sealed_theme_plugin(root.path());
+        plugin.command = "false".into();
+        config.plugins = vec![plugin];
+        assert_eq!(
+            resolve_theme_plugin_config(&config, root.path())
+                .await
+                .unwrap()
+                .theme
+                .preset,
+            config.tui.theme.preset
+        );
+        config.plugins[0].command.clear();
+        assert_eq!(
+            resolve_theme_plugin_config(&config, root.path())
+                .await
+                .unwrap()
+                .theme
+                .preset,
+            "slate"
+        );
     }
 
     #[tokio::test]

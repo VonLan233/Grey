@@ -735,6 +735,12 @@ impl PluginTools {
         configured: Vec<PluginConfig>,
         approver: Arc<dyn Approver>,
     ) -> Self {
+        let configured = configured
+            .into_iter()
+            .filter(|plugin| {
+                plugin.runtime == PluginRuntime::Command && !plugin.command.trim().is_empty()
+            })
+            .collect();
         Self::new_with_runtime(
             workspace,
             configured,
@@ -742,7 +748,7 @@ impl PluginTools {
             &RuntimeConfig::default(),
             workspace,
         )
-        .expect("command plugin configuration must be valid")
+        .expect("filtered command plugin configuration must be valid")
     }
 
     pub fn new_with_runtime(

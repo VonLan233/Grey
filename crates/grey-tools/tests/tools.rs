@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -400,6 +401,64 @@ async fn plugin_tool_executes_command_in_workspace() {
 }
 
 #[tokio::test]
+async fn sealed_wasm_tool_executes_without_command_fallback() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("plugins/tool");
+    std::fs::create_dir_all(&dir).unwrap();
+    let output = br#"{"success":true,"output":"wasm-tool"}"#;
+    let mut bytes = Vec::from([8, 0, 0, 0]);
+    bytes.extend_from_slice(&(output.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(output);
+    let data = bytes
+        .iter()
+        .map(|byte| format!("\\{:02x}", byte))
+        .collect::<String>();
+    let module = wat::parse_str(format!(r#"(module (import "wasi_snapshot_preview1" "fd_write" (func $w (param i32 i32 i32 i32) (result i32))) (memory 1) (export "memory" (memory 0)) (data (i32.const 0) "{data}") (func (export "_start") i32.const 1 i32.const 0 i32.const 1 i32.const 64 call $w drop))"#)).unwrap();
+    std::fs::write(dir.join("module.wasm"), &module).unwrap();
+    let manifest = format!(
+        r#"{{"schema_version":1,"id":"sealed-tool","kind":"tool","protocol":"grey.wasm-plugin.v1","wasi":"preview1-stdio","module":"module.wasm","module_sha256":"{}"}}"#,
+        hex::encode(Sha256::digest(&module))
+    );
+    std::fs::write(dir.join("plugin.json"), &manifest).unwrap();
+    let mut plugin = PluginConfig {
+        id: "sealed-tool".into(),
+        kind: PluginKind::Tool,
+        enabled: true,
+        runtime: grey_core::PluginRuntime::Wasm,
+        manifest: Some("plugins/tool/plugin.json".into()),
+        manifest_sha256: Some(hex::encode(Sha256::digest(manifest.as_bytes()))),
+        ..Default::default()
+    };
+    plugin.command = "false".into();
+    assert!(PluginTools::new_with_runtime(
+        root.path(),
+        vec![plugin.clone()],
+        Arc::new(AlwaysApprove),
+        &RuntimeConfig::default(),
+        root.path()
+    )
+    .is_err());
+    plugin.command.clear();
+    let tools = PluginTools::new_with_runtime(
+        root.path(),
+        vec![plugin],
+        Arc::new(AlwaysApprove),
+        &RuntimeConfig::default(),
+        root.path(),
+    )
+    .unwrap();
+    assert!(tools
+        .definitions()
+        .iter()
+        .any(|definition| definition.name == "sealed-tool"));
+    let result = tools
+        .execute(&call("sealed-tool", serde_json::json!({})))
+        .await;
+    assert!(result.success, "{}", result.output);
+    assert_eq!(result.output, "wasm-tool");
+}
+
+#[tokio::test]
 async fn plugin_tool_unknown_name_fails() {
     let workspace = tempfile::tempdir().unwrap();
     let tools = PluginTools::new(
@@ -418,6 +477,25 @@ async fn plugin_tool_unknown_name_fails() {
     let result = tools.execute(&call("missing", serde_json::json!({}))).await;
     assert!(!result.success);
     assert!(result.output.contains("unknown plugin tool"));
+}
+
+#[test]
+fn command_only_plugin_tools_never_panics_on_wasm_configuration() {
+    let workspace = tempfile::tempdir().unwrap();
+    let tools = PluginTools::new(
+        workspace.path(),
+        vec![PluginConfig {
+            id: "sealed".into(),
+            kind: PluginKind::Tool,
+            enabled: true,
+            runtime: grey_core::PluginRuntime::Wasm,
+            manifest: Some("missing.json".into()),
+            manifest_sha256: Some("0".repeat(64)),
+            ..Default::default()
+        }],
+        Arc::new(AlwaysApprove),
+    );
+    assert!(tools.is_empty());
 }
 
 #[tokio::test]

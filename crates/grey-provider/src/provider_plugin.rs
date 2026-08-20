@@ -276,7 +276,8 @@ impl Provider for PluginProvider {
 #[cfg(test)]
 mod tests {
     use futures_util::StreamExt;
-    use grey_core::{ChatMessage, Provider};
+    use grey_core::{ChatMessage, PluginConfig, PluginKind, PluginRuntime, Provider};
+    use sha2::{Digest, Sha256};
 
     use super::*;
 
@@ -302,6 +303,66 @@ mod tests {
             .next()
             .await
             .unwrap()
+    }
+
+    fn sealed_wasm_provider() -> (tempfile::TempDir, PluginConfig) {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("plugins/provider");
+        std::fs::create_dir_all(&dir).unwrap();
+        let output = br#"{"schema_version":1,"text":"wasm"}"#;
+        let mut bytes = Vec::from([8, 0, 0, 0]);
+        bytes.extend_from_slice(&(output.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(output);
+        let data = bytes
+            .iter()
+            .map(|byte| format!("\\{:02x}", byte))
+            .collect::<String>();
+        let wat = format!(
+            r#"(module (import "wasi_snapshot_preview1" "fd_write" (func $w (param i32 i32 i32 i32) (result i32))) (memory 1) (export "memory" (memory 0)) (data (i32.const 0) "{data}") (func (export "_start") i32.const 1 i32.const 0 i32.const 1 i32.const 64 call $w drop))"#
+        );
+        let module = wat::parse_str(wat).unwrap();
+        std::fs::write(dir.join("module.wasm"), &module).unwrap();
+        let manifest = format!(
+            r#"{{"schema_version":1,"id":"sealed-provider","kind":"provider","protocol":"grey.wasm-plugin.v1","wasi":"preview1-stdio","module":"module.wasm","module_sha256":"{}"}}"#,
+            hex::encode(Sha256::digest(&module))
+        );
+        std::fs::write(dir.join("plugin.json"), &manifest).unwrap();
+        (
+            root,
+            PluginConfig {
+                id: "sealed-provider".into(),
+                kind: PluginKind::Provider,
+                enabled: true,
+                runtime: PluginRuntime::Wasm,
+                manifest: Some("plugins/provider/plugin.json".into()),
+                manifest_sha256: Some(hex::encode(Sha256::digest(manifest.as_bytes()))),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn sealed_wasm_provider_executes_without_command_fallback() {
+        let (root, mut plugin) = sealed_wasm_provider();
+        plugin.command = "false".into();
+        assert!(PluginProvider::from_plugin(
+            &plugin,
+            &RuntimeConfig::default(),
+            root.path(),
+            root.path()
+        )
+        .is_err());
+        plugin.command.clear();
+        let provider = PluginProvider::from_plugin(
+            &plugin,
+            &RuntimeConfig::default(),
+            root.path(),
+            root.path(),
+        )
+        .unwrap();
+        assert!(
+            matches!(first_event(&provider).await, ProviderEvent::Delta(ref text) if text == "wasm")
+        );
     }
 
     #[tokio::test]
