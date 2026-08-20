@@ -115,6 +115,7 @@ pub fn upsert_plugin(doc: &mut DocumentMut, plugin: &PluginConfig) -> Result<()>
     set_optional_string(entry, "hook_event", plugin.hook_event.as_deref());
     entry["runtime"] = value(plugin_runtime(plugin));
     set_optional_string(entry, "manifest", plugin.manifest.as_deref());
+    set_optional_string(entry, "manifest_sha256", plugin.manifest_sha256.as_deref());
     Ok(())
 }
 
@@ -319,6 +320,7 @@ mod tests {
                     enabled: true,
                     runtime: PluginRuntime::Wasm,
                     manifest: Some("plugins/echo/plugin.json".into()),
+                    manifest_sha256: Some("0".repeat(64)),
                     ..Default::default()
                 },
             )
@@ -328,6 +330,7 @@ mod tests {
         assert!(edited.contains("owner = \"user\""));
         assert!(edited.contains("runtime = \"wasm\""));
         assert!(edited.contains("manifest = \"plugins/echo/plugin.json\""));
+        assert!(edited.contains("manifest_sha256"));
     }
 
     #[cfg(unix)]

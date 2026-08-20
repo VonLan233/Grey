@@ -7,6 +7,9 @@ use std::{
     time::Duration,
 };
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use wasmtime::{Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder};
@@ -26,6 +29,9 @@ const DEFAULT_WASM_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_WASM_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_MODULE_BYTES: u64 = 4 * 1024 * 1024;
+
+#[cfg(test)]
+static TEST_GUEST_ENTERED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WasmPluginErrorKind {
@@ -151,7 +157,13 @@ impl WasmPlugin {
             &config_dir,
             plugin.manifest.as_deref().expect("validated wasm manifest"),
         )?;
-        let manifest = parse_manifest(&manifest_path)?;
+        let manifest = parse_manifest(
+            &manifest_path,
+            plugin
+                .manifest_sha256
+                .as_deref()
+                .expect("validated wasm manifest hash"),
+        )?;
         if manifest.schema_version != WASM_PLUGIN_SCHEMA_VERSION
             || manifest.id != plugin.id
             || manifest.kind != plugin.kind
@@ -310,8 +322,9 @@ fn resolve_relative_file(base: &Path, relative: &str) -> Result<PathBuf, WasmPlu
     Ok(path)
 }
 
-fn parse_manifest(path: &Path) -> Result<WasmPluginManifest, WasmPluginError> {
+fn parse_manifest(path: &Path, expected_hash: &str) -> Result<WasmPluginManifest, WasmPluginError> {
     let bytes = read_bounded_file(path, MAX_MANIFEST_BYTES, "wasm plugin manifest")?;
+    verify_sha256(&bytes, expected_hash, "wasm plugin manifest")?;
     serde_json::from_slice(&bytes).map_err(|_| {
         WasmPluginError::new(
             WasmPluginErrorKind::Manifest,
@@ -321,16 +334,20 @@ fn parse_manifest(path: &Path) -> Result<WasmPluginManifest, WasmPluginError> {
 }
 
 fn verify_module_hash(bytes: &[u8], expected: &str) -> Result<(), WasmPluginError> {
+    verify_sha256(bytes, expected, "wasm plugin module")
+}
+
+fn verify_sha256(bytes: &[u8], expected: &str, label: &str) -> Result<(), WasmPluginError> {
     let expected = hex::decode(expected).map_err(|_| {
         WasmPluginError::new(
             WasmPluginErrorKind::Manifest,
-            "invalid wasm plugin module hash",
+            format!("invalid {label} hash"),
         )
     })?;
     if expected.len() != 32 || expected.as_slice() != Sha256::digest(bytes).as_slice() {
         return Err(WasmPluginError::new(
             WasmPluginErrorKind::Manifest,
-            "wasm plugin module hash does not match manifest",
+            format!("{label} hash does not match its sealed configuration"),
         ));
     }
     Ok(())
@@ -412,6 +429,8 @@ async fn invoke_async(
     let stderr = MemoryOutputPipe::new(stderr_limit.saturating_add(1));
     let mut builder = WasiCtxBuilder::new();
     builder
+        // Preview1 host calls must stay asynchronous so dropping this invocation can cancel them.
+        .allow_blocking_current_thread(false)
         .stdin(MemoryInputPipe::new(input))
         .stdout(stdout.clone())
         .stderr(stderr.clone());
@@ -452,21 +471,21 @@ async fn invoke_async(
                 "wasm plugin has no _start entrypoint",
             )
         })?;
+    #[cfg(test)]
+    TEST_GUEST_ENTERED.store(true, Ordering::Release);
     start.call_async(&mut store, ()).await.map_err(|_| {
         WasmPluginError::new(WasmPluginErrorKind::Runtime, "wasm plugin execution failed")
     })?;
-    let stdout = stdout.contents().to_vec();
-    let stderr = stderr.contents().to_vec();
-    if stdout.len() > stdout_limit || stderr.len() > stderr_limit {
-        return Err(WasmPluginError::new(
-            WasmPluginErrorKind::Runtime,
-            "wasm plugin output exceeds configured limit",
-        ));
-    }
-    // A full pipe is conservatively marked truncated because Preview1 fd_write may short-write.
+    let mut stdout = stdout.contents().to_vec();
+    let mut stderr = stderr.contents().to_vec();
+    // The one-byte sentinel makes exact-limit output distinct from an attempted overflow.
+    let stdout_truncated = stdout.len() > stdout_limit;
+    let stderr_truncated = stderr.len() > stderr_limit;
+    stdout.truncate(stdout_limit);
+    stderr.truncate(stderr_limit);
     Ok(WasmPluginOutput {
-        stdout_truncated: stdout.len() == stdout_limit,
-        stderr_truncated: stderr.len() == stderr_limit,
+        stdout_truncated,
+        stderr_truncated,
         stdout,
         stderr,
     })
@@ -485,14 +504,23 @@ mod tests {
             enabled: true,
             runtime: PluginRuntime::Wasm,
             manifest: Some(manifest.into()),
+            manifest_sha256: Some("0".repeat(64)),
             ..Default::default()
         }
+    }
+
+    fn sealed_plugin(root: &TempDir) -> PluginConfig {
+        let mut plugin = plugin("plugins/echo/plugin.json");
+        plugin.manifest_sha256 = Some(hex::encode(Sha256::digest(
+            fs::read(root.path().join("plugins/echo/plugin.json")).unwrap(),
+        )));
+        plugin
     }
 
     #[test]
     fn wasm_configuration_is_strict_and_defaults_to_command() {
         let config: crate::GreyConfig = toml::from_str(
-            "[[plugins]]\nid = \"echo\"\nkind = \"tool\"\nruntime = \"wasm\"\nmanifest = \"plugins/echo/plugin.json\"\n",
+            "[[plugins]]\nid = \"echo\"\nkind = \"tool\"\nruntime = \"wasm\"\nmanifest = \"plugins/echo/plugin.json\"\nmanifest_sha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"\n",
         )
         .unwrap();
         assert_eq!(config.plugins[0].runtime, PluginRuntime::Wasm);
@@ -500,6 +528,7 @@ mod tests {
             config.plugins[0].manifest.as_deref(),
             Some("plugins/echo/plugin.json")
         );
+        assert!(validate_plugin_config(&config.plugins[0]).is_ok());
 
         let mut plugin = plugin("plugin.json");
         assert!(validate_plugin_config(&plugin).is_ok());
@@ -510,6 +539,14 @@ mod tests {
         assert!(validate_plugin_config(&plugin).is_err());
         plugin.kind = PluginKind::Tool;
         plugin.manifest = None;
+        assert!(validate_plugin_config(&plugin).is_err());
+        plugin.manifest = Some("plugin.json".into());
+        plugin.manifest_sha256 = None;
+        assert!(validate_plugin_config(&plugin).is_err());
+        plugin.runtime = PluginRuntime::Command;
+        plugin.manifest = None;
+        plugin.command = "runner".into();
+        plugin.manifest_sha256 = Some("0".repeat(64));
         assert!(validate_plugin_config(&plugin).is_err());
     }
 
@@ -544,13 +581,38 @@ mod tests {
             i32.const 1 i32.const 0 i32.const 1 i32.const 12 call $write drop))
     "#;
 
+    const ECHO_WIDE: &str = r#"
+        (module
+          (import "wasi_snapshot_preview1" "fd_read" (func $read (param i32 i32 i32 i32) (result i32)))
+          (import "wasi_snapshot_preview1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
+          (memory 1) (export "memory" (memory 0))
+          (data (i32.const 0) "\10\00\00\00\00\08\00\00")
+          (func (export "_start") (local $n i32)
+            i32.const 0 i32.const 0 i32.const 1 i32.const 8 call $read drop
+            i32.const 8 i32.load local.set $n
+            i32.const 4 local.get $n i32.store
+            i32.const 1 i32.const 0 i32.const 1 i32.const 12 call $write drop))
+    "#;
+
+    const CLOCK_SLEEP: &str = r#"
+        (module
+          (import "wasi_snapshot_preview1" "poll_oneoff" (func $poll (param i32 i32 i32 i32) (result i32)))
+          (memory 1) (export "memory" (memory 0))
+          (func (export "_start")
+            ;; subscription_clock: monotonic, relative 60-second timeout.
+            i32.const 8 i32.const 0 i32.store8
+            i32.const 16 i32.const 1 i32.store
+            i32.const 24 i64.const 60000000000 i64.store
+            i32.const 32 i64.const 0 i64.store
+            i32.const 40 i32.const 0 i32.store16
+            i32.const 0 i32.const 64 i32.const 1 i32.const 128 call $poll drop))
+    "#;
+
     #[tokio::test]
     async fn stdio_only_wasm_plugin_echoes_json_without_host_capabilities() {
-        let root = write_fixture(ECHO);
+        let root = write_fixture(ECHO_WIDE);
         let runtime = RuntimeConfig::default();
-        let wasm =
-            WasmPlugin::from_config(&plugin("plugins/echo/plugin.json"), root.path(), &runtime)
-                .unwrap();
+        let wasm = WasmPlugin::from_config(&sealed_plugin(&root), root.path(), &runtime).unwrap();
         let output = wasm.invoke(br#"{"request":"ok"}"#.to_vec()).await.unwrap();
         assert_eq!(output.stdout, br#"{"request":"ok"}"#);
         assert!(output.stderr.is_empty());
@@ -560,25 +622,27 @@ mod tests {
     fn manifest_rejects_unknown_fields_and_path_escape() {
         let root = write_fixture(ECHO);
         let manifest = root.path().join("plugins/echo/plugin.json");
-        fs::write(
-            &manifest,
-            r#"{"schema_version":1,"id":"echo","kind":"tool","protocol":"grey.wasm-plugin.v1","wasi":"preview1-stdio","module":"../module.wasm","extra":true}"#,
-        )
-        .unwrap();
-        let error = WasmPlugin::from_config(
-            &plugin("plugins/echo/plugin.json"),
-            root.path(),
-            &RuntimeConfig::default(),
-        )
-        .unwrap_err();
+        let hash = hex::encode(Sha256::digest(
+            fs::read(root.path().join("plugins/echo/module.wasm")).unwrap(),
+        ));
+        let unknown = format!(
+            r#"{{"schema_version":1,"id":"echo","kind":"tool","protocol":"grey.wasm-plugin.v1","wasi":"preview1-stdio","module":"module.wasm","module_sha256":"{hash}","extra":true}}"#
+        );
+        fs::write(&manifest, &unknown).unwrap();
+        let mut sealed = plugin("plugins/echo/plugin.json");
+        sealed.manifest_sha256 = Some(hex::encode(Sha256::digest(unknown.as_bytes())));
+        let error =
+            WasmPlugin::from_config(&sealed, root.path(), &RuntimeConfig::default()).unwrap_err();
         assert_eq!(error.kind(), WasmPluginErrorKind::Manifest);
 
-        let error = WasmPlugin::from_config(
-            &plugin("../plugin.json"),
-            root.path(),
-            &RuntimeConfig::default(),
-        )
-        .unwrap_err();
+        let escaped_content = format!(
+            r#"{{"schema_version":1,"id":"echo","kind":"tool","protocol":"grey.wasm-plugin.v1","wasi":"preview1-stdio","module":"../module.wasm","module_sha256":"{hash}"}}"#
+        );
+        fs::write(&manifest, &escaped_content).unwrap();
+        let mut escaped = plugin("plugins/echo/plugin.json");
+        escaped.manifest_sha256 = Some(hex::encode(Sha256::digest(escaped_content.as_bytes())));
+        let error =
+            WasmPlugin::from_config(&escaped, root.path(), &RuntimeConfig::default()).unwrap_err();
         assert_eq!(error.kind(), WasmPluginErrorKind::Manifest);
     }
 
@@ -586,22 +650,24 @@ mod tests {
     fn manifest_rejects_each_identity_contract_mismatch() {
         let root = write_fixture(ECHO);
         let manifest = root.path().join("plugins/echo/plugin.json");
+        let hash = hex::encode(Sha256::digest(
+            fs::read(root.path().join("plugins/echo/module.wasm")).unwrap(),
+        ));
         for value in [
-            serde_json::json!({"schema_version":2,"id":"echo","kind":"tool","protocol":WASM_PLUGIN_PROTOCOL,"wasi":"preview1-stdio","module":"module.wasm"}),
-            serde_json::json!({"schema_version":1,"id":"other","kind":"tool","protocol":WASM_PLUGIN_PROTOCOL,"wasi":"preview1-stdio","module":"module.wasm"}),
-            serde_json::json!({"schema_version":1,"id":"echo","kind":"theme","protocol":WASM_PLUGIN_PROTOCOL,"wasi":"preview1-stdio","module":"module.wasm"}),
-            serde_json::json!({"schema_version":1,"id":"echo","kind":"tool","protocol":"other","wasi":"preview1-stdio","module":"module.wasm"}),
-            serde_json::json!({"schema_version":1,"id":"echo","kind":"tool","protocol":WASM_PLUGIN_PROTOCOL,"wasi":"preview2","module":"module.wasm"}),
+            serde_json::json!({"schema_version":2,"id":"echo","kind":"tool","protocol":WASM_PLUGIN_PROTOCOL,"wasi":"preview1-stdio","module":"module.wasm","module_sha256":hash}),
+            serde_json::json!({"schema_version":1,"id":"other","kind":"tool","protocol":WASM_PLUGIN_PROTOCOL,"wasi":"preview1-stdio","module":"module.wasm","module_sha256":hash}),
+            serde_json::json!({"schema_version":1,"id":"echo","kind":"theme","protocol":WASM_PLUGIN_PROTOCOL,"wasi":"preview1-stdio","module":"module.wasm","module_sha256":hash}),
+            serde_json::json!({"schema_version":1,"id":"echo","kind":"tool","protocol":"other","wasi":"preview1-stdio","module":"module.wasm","module_sha256":hash}),
+            serde_json::json!({"schema_version":1,"id":"echo","kind":"tool","protocol":WASM_PLUGIN_PROTOCOL,"wasi":"preview2","module":"module.wasm","module_sha256":hash}),
         ] {
-            fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+            let bytes = serde_json::to_vec(&value).unwrap();
+            fs::write(&manifest, &bytes).unwrap();
+            let mut sealed = plugin("plugins/echo/plugin.json");
+            sealed.manifest_sha256 = Some(hex::encode(Sha256::digest(bytes)));
             assert_eq!(
-                WasmPlugin::from_config(
-                    &plugin("plugins/echo/plugin.json"),
-                    root.path(),
-                    &RuntimeConfig::default(),
-                )
-                .unwrap_err()
-                .kind(),
+                WasmPlugin::from_config(&sealed, root.path(), &RuntimeConfig::default(),)
+                    .unwrap_err()
+                    .kind(),
                 WasmPluginErrorKind::Manifest
             );
         }
@@ -620,12 +686,10 @@ mod tests {
         )
         .unwrap();
         symlink(&outside, root.path().join("plugins/echo/linked.json")).unwrap();
-        let error = WasmPlugin::from_config(
-            &plugin("plugins/echo/linked.json"),
-            root.path(),
-            &RuntimeConfig::default(),
-        )
-        .unwrap_err();
+        let mut sealed = sealed_plugin(&root);
+        sealed.manifest = Some("plugins/echo/linked.json".into());
+        let error =
+            WasmPlugin::from_config(&sealed, root.path(), &RuntimeConfig::default()).unwrap_err();
         assert_eq!(error.kind(), WasmPluginErrorKind::Manifest);
     }
 
@@ -635,7 +699,7 @@ mod tests {
             r#"(module (memory 1) (func (export "_start") i32.const 1025 memory.grow drop))"#,
         );
         let wasm = WasmPlugin::from_config(
-            &plugin("plugins/echo/plugin.json"),
+            &sealed_plugin(&grow),
             grow.path(),
             &RuntimeConfig::default(),
         )
@@ -646,7 +710,7 @@ mod tests {
         );
 
         let looped = write_fixture(r#"(module (func (export "_start") (loop br 0)))"#);
-        let mut loop_plugin = plugin("plugins/echo/plugin.json");
+        let mut loop_plugin = sealed_plugin(&looped);
         loop_plugin.timeout_ms = Some(1);
         let wasm = WasmPlugin::from_config(&loop_plugin, looped.path(), &RuntimeConfig::default())
             .unwrap();
@@ -663,7 +727,7 @@ mod tests {
         fs::write(&manifest, vec![b'x'; (MAX_MANIFEST_BYTES + 1) as usize]).unwrap();
         assert_eq!(
             WasmPlugin::from_config(
-                &plugin("plugins/echo/plugin.json"),
+                &sealed_plugin(&root),
                 root.path(),
                 &RuntimeConfig::default(),
             )
@@ -689,7 +753,7 @@ mod tests {
         fs::write(&module, wat::parse_str("(module)").unwrap()).unwrap();
         assert_eq!(
             WasmPlugin::from_config(
-                &plugin("plugins/echo/plugin.json"),
+                &sealed_plugin(&root),
                 root.path(),
                 &RuntimeConfig::default(),
             )
@@ -699,16 +763,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn manifest_content_swap_is_rejected_before_manifest_parsing() {
+        let root = write_fixture(ECHO);
+        let sealed = sealed_plugin(&root);
+        fs::write(
+            root.path().join("plugins/echo/plugin.json"),
+            r#"{"schema_version":1,"id":"other","kind":"tool","protocol":"grey.wasm-plugin.v1","wasi":"preview1-stdio","module":"module.wasm","module_sha256":"0000000000000000000000000000000000000000000000000000000000000000"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            WasmPlugin::from_config(&sealed, root.path(), &RuntimeConfig::default())
+                .unwrap_err()
+                .kind(),
+            WasmPluginErrorKind::Manifest
+        );
+    }
+
     #[tokio::test]
-    async fn dropping_an_infinite_invocation_cancels_without_waiting_for_plugin_timeout() {
-        let looped = write_fixture(r#"(module (func (export "_start") (loop br 0)))"#);
-        let mut loop_plugin = plugin("plugins/echo/plugin.json");
-        loop_plugin.timeout_ms = Some(60_000);
-        let wasm = WasmPlugin::from_config(&loop_plugin, looped.path(), &RuntimeConfig::default())
-            .unwrap();
+    async fn timeout_cancels_an_in_progress_preview1_hostcall() {
+        let sleeper = write_fixture(CLOCK_SLEEP);
+        let mut plugin = sealed_plugin(&sleeper);
+        plugin.timeout_ms = Some(20);
+        let wasm =
+            WasmPlugin::from_config(&plugin, sleeper.path(), &RuntimeConfig::default()).unwrap();
+        TEST_GUEST_ENTERED.store(false, Ordering::Release);
+        let started = tokio::time::Instant::now();
         let task = tokio::spawn(async move { wasm.invoke(Vec::new()).await });
-        task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !TEST_GUEST_ENTERED.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("guest should enter the poll_oneoff fixture");
+        assert_eq!(
+            task.await.unwrap().unwrap_err().kind(),
+            WasmPluginErrorKind::Runtime
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[tokio::test]
@@ -722,9 +815,7 @@ mod tests {
             wasm_fuel: u64::MAX,
             ..RuntimeConfig::default()
         };
-        let wasm =
-            WasmPlugin::from_config(&plugin("plugins/echo/plugin.json"), root.path(), &runtime)
-                .unwrap();
+        let wasm = WasmPlugin::from_config(&sealed_plugin(&root), root.path(), &runtime).unwrap();
         assert_eq!(wasm.memory_bytes, crate::config::RUNTIME_WASM_MEMORY_MAX);
         assert_eq!(wasm.fuel, crate::config::RUNTIME_WASM_FUEL_MAX);
         assert_eq!(wasm.stdout_limit, 64 * 1024 * 1024);
@@ -738,22 +829,24 @@ mod tests {
 
     #[tokio::test]
     async fn stdio_and_entrypoint_failures_are_bounded() {
-        let root = write_fixture(ECHO);
+        let root = write_fixture(ECHO_WIDE);
         let runtime = RuntimeConfig {
             response_max_bytes: 2_048,
             command_stdout_max_bytes: 1_024,
             ..RuntimeConfig::default()
         };
-        let wasm =
-            WasmPlugin::from_config(&plugin("plugins/echo/plugin.json"), root.path(), &runtime)
-                .unwrap();
+        let wasm = WasmPlugin::from_config(&sealed_plugin(&root), root.path(), &runtime).unwrap();
+        // ECHO's Preview1 fd_write receives a 1,025-byte iovec, one byte over the cap.
         let output = wasm.invoke(vec![b'x'; 1_025]).await.unwrap();
         assert_eq!(output.stdout.len(), 1_024);
         assert!(output.stdout_truncated);
+        let exact = wasm.invoke(vec![b'x'; 1_024]).await.unwrap();
+        assert_eq!(exact.stdout.len(), 1_024);
+        assert!(!exact.stdout_truncated);
 
         let no_start = write_fixture("(module)");
         let wasm = WasmPlugin::from_config(
-            &plugin("plugins/echo/plugin.json"),
+            &sealed_plugin(&no_start),
             no_start.path(),
             &RuntimeConfig::default(),
         )
@@ -782,7 +875,7 @@ mod tests {
                   i32.const 1 i32.const 32 i32.const 1 i32.const 40 call $write drop))"#,
         );
         let wasm = WasmPlugin::from_config(
-            &plugin("plugins/echo/plugin.json"),
+            &sealed_plugin(&root),
             root.path(),
             &RuntimeConfig::default(),
         )

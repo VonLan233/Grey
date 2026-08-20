@@ -118,6 +118,8 @@ pub struct PluginConfig {
     pub runtime: PluginRuntime,
     #[serde(default)]
     pub manifest: Option<String>,
+    #[serde(default)]
+    pub manifest_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -833,8 +835,8 @@ pub fn validate_plugin_config(plugin: &PluginConfig) -> Result<()> {
                 plugin.id
             );
             anyhow::ensure!(
-                plugin.manifest.is_none(),
-                "command plugin `{}` must not specify manifest",
+                plugin.manifest.is_none() && plugin.manifest_sha256.is_none(),
+                "command plugin `{}` must not specify a wasm manifest",
                 plugin.id
             );
         }
@@ -853,6 +855,15 @@ pub fn validate_plugin_config(plugin: &PluginConfig) -> Result<()> {
                     .as_deref()
                     .is_some_and(|path| !path.trim().is_empty()),
                 "wasm plugin `{}` must specify manifest",
+                plugin.id
+            );
+            anyhow::ensure!(
+                plugin
+                    .manifest_sha256
+                    .as_deref()
+                    .is_some_and(|hash| hash.len() == 64
+                        && hash.bytes().all(|byte| byte.is_ascii_hexdigit())),
+                "wasm plugin `{}` must specify a SHA-256 manifest hash",
                 plugin.id
             );
             anyhow::ensure!(

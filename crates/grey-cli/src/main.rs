@@ -2799,6 +2799,7 @@ fn run_plugins(action: PluginAction) -> Result<()> {
                     },
                     runtime: grey_core::PluginRuntime::Command,
                     manifest: None,
+                    manifest_sha256: None,
                 };
                 grey_core::raw_config::upsert_plugin(doc, &plugin)
             })?;
