@@ -3170,19 +3170,22 @@ fn read_raw_plugins(path: &Path) -> Result<Vec<PluginConfig>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let plugins = toml::from_str::<RawPluginList>(
-        &fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?,
-    )
-    .map(|config| config.plugins)
-    .with_context(|| format!("parsing {}", path.display()))?;
+    let source = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    parse_raw_plugins(&source)
+}
+
+fn parse_raw_plugins(source: &str) -> Result<Vec<PluginConfig>> {
+    let plugins = toml::from_str::<RawPluginList>(source)
+        .map(|config| config.plugins)
+        .context("parsing raw plugin configuration")?;
     config::validate_plugins(&plugins)?;
     Ok(plugins)
 }
 
 fn show_raw_plugin(path: &Path, id: &str) -> Result<()> {
-    // Keep the raw display path behind the same fail-closed configuration gate as all mutations.
-    read_raw_plugins(path)?;
     let source = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    // Validate and render the same snapshot so a concurrent atomic config replacement cannot race this path.
+    parse_raw_plugins(&source)?;
     let mut config: toml::Value =
         toml::from_str(&source).with_context(|| format!("parsing {}", path.display()))?;
     let plugin = config
