@@ -326,14 +326,17 @@ enum PluginAction {
     /// Add or update a plugin entry.
     Add {
         id: String,
-        #[arg(long, value_enum, default_value_t = PluginKindArg::Tool)]
-        kind: PluginKindArg,
+        #[arg(long, value_enum)]
+        kind: Option<PluginKindArg>,
         /// Executable command for tool/hook plugins.
         #[arg(long)]
         command: Option<String>,
         /// Repeated arguments appended to the command.
         #[arg(long = "arg")]
-        args: Vec<String>,
+        args: Option<Vec<String>>,
+        /// Remove all existing command arguments.
+        #[arg(long)]
+        clear_args: bool,
         /// Human friendly plugin name.
         #[arg(long)]
         name: Option<String>,
@@ -349,9 +352,12 @@ enum PluginAction {
         /// Command timeout override in milliseconds.
         #[arg(long)]
         timeout_ms: Option<u64>,
+        /// Remove an existing command timeout.
+        #[arg(long)]
+        clear_timeout: bool,
         /// Plugin execution runtime.
-        #[arg(long, value_enum, default_value_t = PluginRuntimeArg::Command)]
-        runtime: PluginRuntimeArg,
+        #[arg(long, value_enum)]
+        runtime: Option<PluginRuntimeArg>,
         /// Sealed WASM plugin manifest path.
         #[arg(long)]
         manifest: Option<String>,
@@ -359,8 +365,8 @@ enum PluginAction {
         #[arg(long)]
         manifest_sha256: Option<String>,
         /// Enable plugin immediately.
-        #[arg(long, default_value_t = true)]
-        enabled: bool,
+        #[arg(long)]
+        enabled: Option<bool>,
     },
     /// Remove a plugin by id.
     Remove { id: String },
@@ -2867,48 +2873,81 @@ fn run_plugins(action: PluginAction) -> Result<()> {
             kind,
             command,
             args,
+            clear_args,
             name,
             description,
             hook_event,
             version,
             timeout_ms,
+            clear_timeout,
             runtime,
             manifest,
             manifest_sha256,
             enabled,
         } => {
-            let kind = kind.to_core();
-            let runtime = runtime.to_core();
+            if clear_args && args.is_some() {
+                bail!("--clear-args cannot be combined with --arg");
+            }
+            if clear_timeout && timeout_ms.is_some() {
+                bail!("--clear-timeout cannot be combined with --timeout-ms");
+            }
             let mut updated = false;
             let output_id = id.clone();
             grey_core::raw_config::edit_file(&config_path, |doc| {
-                let existing_command = grey_core::raw_config::plugin_command(doc, &id)?;
-                updated = existing_command.is_some();
+                let existing = grey_core::raw_config::plugin_config_for_id(doc, &id)?;
+                updated = existing.is_some();
+                let is_existing = existing.is_some();
+                let existing = existing.unwrap_or_default();
+                let kind = kind.map(PluginKindArg::to_core).unwrap_or(existing.kind);
+                let runtime = runtime
+                    .map(PluginRuntimeArg::to_core)
+                    .unwrap_or(existing.runtime);
                 let plugin = PluginConfig {
                     id: id.clone(),
-                    name: name.clone(),
+                    name: name.clone().or(existing.name),
                     kind,
-                    enabled,
-                    description: description.clone(),
+                    enabled: enabled.unwrap_or(if is_existing { existing.enabled } else { true }),
+                    description: description.clone().or(existing.description),
                     command: match runtime {
-                        PluginRuntime::Command => {
-                            command.clone().or(existing_command).with_context(|| {
+                        PluginRuntime::Command => command
+                            .clone()
+                            .filter(|command| !command.trim().is_empty())
+                            .or_else(|| {
+                                (!existing.command.trim().is_empty())
+                                    .then(|| existing.command.clone())
+                            })
+                            .with_context(|| {
                                 format!("--command is required when adding plugin {id}")
-                            })?
-                        }
+                            })?,
                         PluginRuntime::Wasm => command.clone().unwrap_or_default(),
                     },
-                    args: args.clone(),
-                    timeout_ms,
-                    version: version.clone(),
+                    args: if clear_args {
+                        Vec::new()
+                    } else {
+                        args.clone().unwrap_or(existing.args)
+                    },
+                    timeout_ms: if clear_timeout {
+                        None
+                    } else {
+                        timeout_ms.or(existing.timeout_ms)
+                    },
+                    version: version.clone().or(existing.version),
                     hook_event: if kind == PluginKind::Hook {
-                        hook_event.clone()
+                        hook_event.clone().or(existing.hook_event)
                     } else {
                         None
                     },
                     runtime,
-                    manifest: manifest.clone(),
-                    manifest_sha256: manifest_sha256.clone(),
+                    manifest: if runtime == PluginRuntime::Wasm {
+                        manifest.clone().or(existing.manifest)
+                    } else {
+                        None
+                    },
+                    manifest_sha256: if runtime == PluginRuntime::Wasm {
+                        manifest_sha256.clone().or(existing.manifest_sha256)
+                    } else {
+                        None
+                    },
                 };
                 if kind == PluginKind::Hook && plugin.hook_event.is_none() {
                     bail!("--hook-event is required for hook plugins");
@@ -3131,11 +3170,13 @@ fn read_raw_plugins(path: &Path) -> Result<Vec<PluginConfig>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    toml::from_str::<RawPluginList>(
+    let plugins = toml::from_str::<RawPluginList>(
         &fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?,
     )
     .map(|config| config.plugins)
-    .with_context(|| format!("parsing {}", path.display()))
+    .with_context(|| format!("parsing {}", path.display()))?;
+    config::validate_plugins(&plugins)?;
+    Ok(plugins)
 }
 
 fn show_raw_plugin(path: &Path, id: &str) -> Result<()> {

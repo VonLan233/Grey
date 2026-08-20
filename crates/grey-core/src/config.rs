@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -825,8 +825,27 @@ fn plugin_config_dir(path: Option<&Path>) -> Result<PathBuf> {
 }
 
 pub fn validate_plugins(plugins: &[PluginConfig]) -> Result<()> {
+    validate_unique_plugin_ids(plugins)?;
     for plugin in plugins {
         validate_plugin_config(plugin)?;
+    }
+    Ok(())
+}
+
+/// Plugin IDs are exact and case-sensitive; surrounding whitespace is rejected.
+pub fn validate_unique_plugin_ids(plugins: &[PluginConfig]) -> Result<()> {
+    let mut ids = HashSet::with_capacity(plugins.len());
+    for plugin in plugins {
+        anyhow::ensure!(
+            plugin.id == plugin.id.trim(),
+            "plugin id must not have leading or trailing whitespace: {:?}",
+            plugin.id
+        );
+        anyhow::ensure!(
+            ids.insert(plugin.id.as_str()),
+            "duplicate plugin id: {}",
+            plugin.id
+        );
     }
     Ok(())
 }
@@ -1721,6 +1740,28 @@ completion = ["printf 'complete'"]
         assert_eq!(cfg.hooks.session_end, vec!["printf 'end'"]);
         assert_eq!(cfg.hooks.permission_decision, vec!["printf 'decision'"]);
         assert_eq!(cfg.hooks.completion, vec!["printf 'complete'"]);
+    }
+
+    #[test]
+    fn load_rejects_duplicate_plugin_ids_across_kinds() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("grey.toml");
+        std::fs::write(
+            &path,
+            r#"[[plugins]]
+id = "shared"
+kind = "tool"
+command = "printf"
+
+[[plugins]]
+id = "shared"
+kind = "provider"
+command = "printf"
+"#,
+        )
+        .unwrap();
+        let error = load_from_path(Some(&path)).unwrap_err();
+        assert!(error.to_string().contains("duplicate plugin id: shared"));
     }
 
     #[test]

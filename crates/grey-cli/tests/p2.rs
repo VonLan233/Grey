@@ -247,7 +247,7 @@ enabled = true
 }
 
 #[test]
-fn providers_show_uses_the_provider_eligibility_set_on_id_collision() {
+fn providers_show_rejects_cross_kind_plugin_id_collision() {
     let env = temp_home();
     let config_dir = env.home.path().join(".config/grey");
     std::fs::create_dir_all(&config_dir).unwrap();
@@ -275,14 +275,8 @@ version = "provider-version"
         .args(["providers", "show", "collision"])
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("protocol: plugin"));
-    assert!(stdout.contains("version: provider-version"));
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("duplicate plugin id: collision"));
 }
 
 #[cfg(unix)]
@@ -1109,6 +1103,85 @@ fn extension_management_help_and_legacy_hook_notice_are_explicit() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("legacy [hooks] entries"));
+}
+
+#[test]
+fn plugins_add_patch_preserves_unspecified_raw_fields_and_replaces_args_explicitly() {
+    let env = temp_home();
+    let path = env.home.path().join("patch.toml");
+    std::fs::write(
+        &path,
+        "# keep\n[[plugins]]\nid = \"preserve\"\ncommand = \"printf\"\nargs = [\"${PLUGIN_TOKEN}\"]\ndescription = \"old\"\nversion = \"1.0\"\nenabled = false\nextra = \"keep\"\n",
+    )
+    .unwrap();
+    let update = env
+        .command()
+        .env("GREY_CONFIG", &path)
+        .args(["plugins", "add", "preserve", "--description", "new"])
+        .output()
+        .unwrap();
+    assert!(
+        update.status.success(),
+        "{}",
+        String::from_utf8_lossy(&update.stderr)
+    );
+    let edited = std::fs::read_to_string(&path).unwrap();
+    for expected in [
+        "${PLUGIN_TOKEN}",
+        "version = \"1.0\"",
+        "enabled = false",
+        "extra = \"keep\"",
+        "description = \"new\"",
+    ] {
+        assert!(edited.contains(expected), "missing {expected} in {edited}");
+    }
+
+    let replace = env
+        .command()
+        .env("GREY_CONFIG", &path)
+        .args(["plugins", "add", "preserve", "--arg", "replaced"])
+        .output()
+        .unwrap();
+    assert!(
+        replace.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replace.stderr)
+    );
+    let edited = std::fs::read_to_string(&path).unwrap();
+    assert!(edited.contains("args = [\"replaced\"]"));
+    assert!(!edited.contains("${PLUGIN_TOKEN}"));
+}
+
+#[test]
+fn duplicate_hook_ids_fail_before_any_hook_can_execute() {
+    let env = temp_home();
+    let marker = env.home.path().join("duplicate-hook-ran");
+    let config = env.home.path().join("duplicates.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "default_provider = \"mock\"\ndefault_model = \"mock\"\n\n[[plugins]]\nid = \"duplicate\"\nkind = \"hook\"\ncommand = \"sh\"\nargs = [\"-c\", \"printf ran > '{}'\"]\nhook_event = \"session_start\"\nenabled = true\n\n[[plugins]]\nid = \"duplicate\"\nkind = \"hook\"\ncommand = \"printf\"\nhook_event = \"session_start\"\nenabled = true\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    let manage = env
+        .command()
+        .env("GREY_CONFIG", &config)
+        .args(["hooks", "list"])
+        .output()
+        .unwrap();
+    assert!(!manage.status.success());
+    assert!(String::from_utf8_lossy(&manage.stderr).contains("duplicate plugin id"));
+    let run = env
+        .command()
+        .env("GREY_CONFIG", &config)
+        .args(["--no-save", "hello"])
+        .output()
+        .unwrap();
+    assert!(!run.status.success());
+    assert!(String::from_utf8_lossy(&run.stderr).contains("duplicate plugin id"));
+    assert!(!marker.exists());
 }
 
 #[test]

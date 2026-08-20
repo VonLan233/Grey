@@ -1,5 +1,6 @@
-use crate::config::{PluginConfig, PluginRuntime};
+use crate::config::{self, PluginConfig, PluginRuntime};
 use anyhow::{bail, Context, Result};
+use serde::Deserialize;
 use serde_json::Value;
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -68,6 +69,9 @@ pub fn edit_text(
 }
 
 pub fn set_enabled(doc: &mut DocumentMut, table: &str, id: &str, enabled: bool) -> Result<()> {
+    if table == "plugins" {
+        validate_existing_plugins(doc)?;
+    }
     let entry = array_of_tables_mut(doc, table)?
         .iter_mut()
         .find(|entry| entry.get("id").and_then(Item::as_str) == Some(id))
@@ -88,6 +92,7 @@ pub fn set_enabled(doc: &mut DocumentMut, table: &str, id: &str, enabled: bool) 
 }
 
 pub fn upsert_plugin(doc: &mut DocumentMut, plugin: &PluginConfig) -> Result<()> {
+    validate_existing_plugins(doc)?;
     let plugins = array_of_tables_mut(doc, "plugins")?;
     let entry = plugins
         .iter_mut()
@@ -149,7 +154,23 @@ pub fn plugin_kind_for_id(doc: &DocumentMut, id: &str) -> Result<Option<String>>
         .map(str::to_owned))
 }
 
+pub fn plugin_config_for_id(doc: &DocumentMut, id: &str) -> Result<Option<PluginConfig>> {
+    let Some(plugins) = doc
+        .as_table()
+        .get("plugins")
+        .and_then(Item::as_array_of_tables)
+    else {
+        return Ok(None);
+    };
+    plugins
+        .iter()
+        .find(|entry| entry.get("id").and_then(Item::as_str) == Some(id))
+        .map(|entry| toml::from_str(&entry.to_string()).context("parsing raw plugin entry"))
+        .transpose()
+}
+
 pub fn remove_plugin(doc: &mut DocumentMut, id: &str) -> Result<()> {
+    validate_existing_plugins(doc)?;
     let plugins = array_of_tables_mut(doc, "plugins")?;
     let index = plugins
         .iter()
@@ -157,6 +178,19 @@ pub fn remove_plugin(doc: &mut DocumentMut, id: &str) -> Result<()> {
         .with_context(|| format!("plugins entry not found: {id}"))?;
     plugins.remove(index);
     Ok(())
+}
+
+#[derive(Deserialize, Default)]
+struct RawPluginList {
+    #[serde(default)]
+    plugins: Vec<PluginConfig>,
+}
+
+fn validate_existing_plugins(doc: &DocumentMut) -> Result<()> {
+    let plugins = toml::from_str::<RawPluginList>(&doc.to_string())
+        .context("parsing raw plugin configuration")?
+        .plugins;
+    config::validate_unique_plugin_ids(&plugins)
 }
 
 pub fn redact(value: &mut Value) {
