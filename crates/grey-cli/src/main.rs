@@ -1848,6 +1848,7 @@ async fn run_with_text_events(
                     eprintln!("[switch] {from} → {to}: {reason}")
                 }
                 AgentEvent::CacheHit { model } => eprintln!("[cache] hit for {model}"),
+                AgentEvent::Warning(warning) => eprintln!("[agent warning] {warning}"),
             }
         }
     });
@@ -1958,27 +1959,45 @@ async fn close_tui_runtime<F, Fut>(
     mut worker: JoinHandle<TuiWorkerSummary>,
     timeout: Duration,
     mut fallback: TuiWorkerSummary,
+    ui_error: Option<String>,
     session_end: F,
-) where
+) -> Result<()>
+where
     F: FnOnce(TuiWorkerSummary) -> Fut,
     Fut: Future<Output = ()>,
 {
     drop(prompts);
     let _ = shutdown.send(true);
-    let summary = match tokio::time::timeout(timeout, &mut worker).await {
-        Ok(Ok(summary)) => summary,
+    let (mut summary, cleanup_error) = match tokio::time::timeout(timeout, &mut worker).await {
+        Ok(Ok(summary)) => (summary, None),
         Ok(Err(error)) => {
-            fallback.last_error = Some(format!("TUI worker failed: {error}"));
-            fallback
+            let message = format!("TUI worker failed: {error}");
+            fallback.last_error = Some(message.clone());
+            (fallback, Some(anyhow::anyhow!(message)))
         }
         Err(_) => {
             worker.abort();
             let _ = worker.await;
-            fallback.last_error = Some("TUI worker shutdown timed out".into());
-            fallback
+            let message = "TUI worker shutdown timed out".to_string();
+            fallback.last_error = Some(message.clone());
+            (fallback, Some(anyhow::anyhow!(message)))
         }
     };
+    if let Some(ui_error) = ui_error {
+        summary.last_error = Some(ui_error);
+    }
     session_end(summary).await;
+    cleanup_error.map_or(Ok(()), Err)
+}
+
+fn finish_tui_result(ui_result: Result<()>, cleanup_result: Result<()>) -> Result<()> {
+    match (ui_result, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(ui_error), Err(cleanup_error)) => Err(anyhow::anyhow!(
+            "{ui_error:#}; additionally, TUI cleanup failed: {cleanup_error:#}"
+        )),
+    }
 }
 
 async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()> {
@@ -2125,7 +2144,7 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
                                 persist_usage(store, &current.id, usage_tracker.as_deref())
                             {
                                 let _ = events_tx
-                                    .send(AgentEvent::Failed(format!("saving usage: {error:#}")))
+                                    .send(AgentEvent::Warning(format!("saving usage: {error:#}")))
                                     .await;
                             }
                         }
@@ -2142,7 +2161,7 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
                     );
                     if let Err(error) = run_hook_chain(&completion_hooks, &payload).await {
                         let _ = events_tx
-                            .send(AgentEvent::Failed(format!(
+                            .send(AgentEvent::Warning(format!(
                                 "completion hook failed: {error:#}"
                             )))
                             .await;
@@ -2167,7 +2186,7 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
                     );
                     if let Err(error) = run_hook_chain(&completion_hooks, &payload).await {
                         let _ = events_tx
-                            .send(AgentEvent::Failed(format!(
+                            .send(AgentEvent::Warning(format!(
                                 "completion hook failed: {error:#}"
                             )))
                             .await;
@@ -2198,12 +2217,14 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
             },
         }
     };
-    close_tui_runtime(
+    let ui_error = ui_result.as_ref().err().map(|error| format!("{error:#}"));
+    let cleanup_result = close_tui_runtime(
         prompts_tx,
         shutdown_tx,
         worker,
         TUI_SHUTDOWN_TIMEOUT,
         fallback_summary,
+        ui_error,
         move |summary| async move {
             let payload = serde_json::json!({
                 "event": "session_end",
@@ -2220,7 +2241,7 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
         },
     )
     .await;
-    ui_result
+    finish_tui_result(ui_result, cleanup_result)
 }
 
 fn detect_git_branch(workspace: &Path) -> Option<String> {
@@ -2800,6 +2821,85 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn tui_cleanup_merges_idle_cancel_and_ui_error_into_session_end_once() {
+        use std::sync::Mutex;
+
+        for expected in ["interrupted", "terminal input failed"] {
+            let (prompts, _prompt_rx) = mpsc::channel(1);
+            let (shutdown, _shutdown_rx) = tokio::sync::watch::channel(false);
+            let worker = tokio::spawn(async { TuiWorkerSummary::new("provider", "model") });
+            let ended = Arc::new(Mutex::new(Vec::new()));
+            let ended_for_hook = Arc::clone(&ended);
+
+            close_tui_runtime(
+                prompts,
+                shutdown,
+                worker,
+                Duration::from_secs(1),
+                TuiWorkerSummary::new("fallback", "fallback"),
+                Some(expected.to_string()),
+                move |summary| async move {
+                    ended_for_hook.lock().unwrap().push(summary.last_error);
+                },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                ended.lock().unwrap().as_slice(),
+                [Some(expected.to_string())]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tui_cleanup_propagates_worker_panic_after_session_end() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (prompts, _prompt_rx) = mpsc::channel(1);
+        let (shutdown, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let worker = tokio::spawn(async { panic!("worker exploded") });
+        let ended = Arc::new(AtomicUsize::new(0));
+        let ended_for_hook = Arc::clone(&ended);
+
+        let error = close_tui_runtime(
+            prompts,
+            shutdown,
+            worker,
+            Duration::from_secs(1),
+            TuiWorkerSummary::new("provider", "model"),
+            None,
+            move |_| async move {
+                ended_for_hook.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("TUI worker failed"));
+        assert_eq!(ended.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn tui_result_keeps_ui_error_primary_and_attaches_cleanup_error() {
+        let error = finish_tui_result(
+            Err(anyhow::anyhow!("UI failed")),
+            Err(anyhow::anyhow!("cleanup failed")),
+        )
+        .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.starts_with("UI failed"));
+        assert!(text.contains("cleanup failed"));
+
+        assert!(
+            finish_tui_result(Ok(()), Err(anyhow::anyhow!("cleanup only")))
+                .unwrap_err()
+                .to_string()
+                .contains("cleanup only")
+        );
+    }
+
+    #[tokio::test]
     async fn tui_cleanup_closes_prompts_then_signals_and_runs_session_end_once() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2820,11 +2920,13 @@ mod tests {
             worker,
             Duration::from_secs(1),
             TuiWorkerSummary::new("fallback", "fallback"),
+            None,
             move |_| async move {
                 ended_for_hook.fetch_add(1, Ordering::SeqCst);
             },
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(ended.load(Ordering::SeqCst), 1);
     }
@@ -2843,19 +2945,22 @@ mod tests {
         let ended_for_hook = Arc::clone(&ended);
         let started = tokio::time::Instant::now();
 
-        close_tui_runtime(
+        let error = close_tui_runtime(
             prompts,
             shutdown,
             worker,
             Duration::from_millis(20),
             TuiWorkerSummary::new("provider", "model"),
+            None,
             move |_| async move {
                 ended_for_hook.fetch_add(1, Ordering::SeqCst);
             },
         )
-        .await;
+        .await
+        .unwrap_err();
 
         assert!(started.elapsed() >= Duration::from_millis(20));
+        assert!(error.to_string().contains("shutdown timed out"));
         assert_eq!(ended.load(Ordering::SeqCst), 1);
     }
 

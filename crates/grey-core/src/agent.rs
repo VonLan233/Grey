@@ -55,6 +55,7 @@ pub enum AgentEvent {
     CacheHit {
         model: String,
     },
+    Warning(String),
     Completed {
         usage: Usage,
         steps: usize,

@@ -1001,6 +1001,11 @@ impl AppState {
                 self.status_error = false;
                 self.status = "cache hit".into();
             }
+            AgentEvent::Warning(warning) => {
+                self.append_output(&format!("\n[warning] {warning}\n"));
+                self.status_error = true;
+                self.status = format!("warning: {warning}");
+            }
         }
         self.dirty = true;
     }
@@ -2023,6 +2028,46 @@ mod tests {
         assert!(!dispatch_action(action, &sender, &mut state).unwrap());
 
         assert_eq!(state.input(), " retry ");
+    }
+
+    #[tokio::test]
+    async fn ancillary_warning_never_releases_a_newer_turn_busy_guard() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut state = AppState::default();
+        dispatch_action(
+            UiAction::Submit {
+                prompt: "turn-a".into(),
+                rejected_input: "turn-a".into(),
+            },
+            &sender,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(receiver.recv().await.as_deref(), Some("turn-a"));
+
+        state.reduce_agent_event(AgentEvent::Warning("usage save failed".into()));
+        for character in "turn-b".chars() {
+            state.reduce_key(key(KeyCode::Char(character)));
+        }
+        assert_eq!(state.reduce_key(key(KeyCode::Enter)), UiAction::None);
+        assert_eq!(state.input(), "turn-b");
+
+        state.reduce_agent_event(AgentEvent::Completed {
+            usage: grey_core::Usage::default(),
+            steps: 1,
+            provider: "provider".into(),
+            model: "model".into(),
+        });
+        let turn_b = state.reduce_key(key(KeyCode::Enter));
+        dispatch_action(turn_b, &sender, &mut state).unwrap();
+        assert_eq!(receiver.recv().await.as_deref(), Some("turn-b"));
+
+        state.reduce_agent_event(AgentEvent::Warning("completion hook failed".into()));
+        for character in "turn-c".chars() {
+            state.reduce_key(key(KeyCode::Char(character)));
+        }
+        assert_eq!(state.reduce_key(key(KeyCode::Enter)), UiAction::None);
+        assert_eq!(state.input(), "turn-c");
     }
 
     static REMINDER_NOTIFICATIONS: AtomicUsize = AtomicUsize::new(0);
