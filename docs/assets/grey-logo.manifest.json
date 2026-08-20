@@ -1,0 +1,20 @@
+{
+  "name": "Grey logo",
+  "generated": "2026-08-21",
+  "source": "OpenAI image generation",
+  "reference": "https://zh.moegirl.org.cn/%E7%81%B0%E9%A3%8E",
+  "exports": [
+    {
+      "file": "grey-logo.png",
+      "size": "512x512",
+      "mode": "RGB",
+      "variant": "detailed README character emblem; charcoal, silver, electric teal, amber"
+    },
+    {
+      "file": "grey-logo-monochrome.png",
+      "size": "512x512",
+      "mode": "RGBA",
+      "variant": "single-color black character line art with transparent background"
+    }
+  ]
+}
