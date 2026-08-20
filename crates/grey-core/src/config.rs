@@ -1128,9 +1128,42 @@ pub fn is_secret_field(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
+    use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
 
-    static ARK_ENV_LOCK: Mutex<()> = Mutex::new(());
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn env_test_lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    struct EnvRestore(Vec<(&'static str, Option<OsString>)>);
+
+    impl EnvRestore {
+        fn capture(names: &[&'static str]) -> Self {
+            Self(
+                names
+                    .iter()
+                    .map(|name| (*name, env::var_os(name)))
+                    .collect(),
+            )
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            unsafe {
+                for (name, value) in &self.0 {
+                    match value {
+                        Some(value) => env::set_var(name, value),
+                        None => env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
 
     fn test_dir() -> &'static Path {
         static DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -1152,6 +1185,7 @@ mod tests {
 
     #[test]
     fn bounded_runtime_defaults_and_file_values_are_clamped() {
+        let _lock = env_test_lock();
         let defaults = GreyConfig::default();
         assert_eq!(defaults.runtime.event_queue_capacity, 256);
         assert_eq!(defaults.runtime.input_queue_capacity, 256);
@@ -1214,6 +1248,8 @@ skill_max_bytes = {max}
 
     #[test]
     fn env_override_file() {
+        let _lock = env_test_lock();
+        let _restore = EnvRestore::capture(&["GREY_OPENAI_BASE_URL"]);
         let dir = test_dir().join("env-override");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -1227,7 +1263,6 @@ skill_max_bytes = {max}
         base = merge(base, file);
         unsafe { env::set_var("GREY_OPENAI_BASE_URL", "http://env/v1") };
         apply_env(&mut base).unwrap();
-        unsafe { env::remove_var("GREY_OPENAI_BASE_URL") };
         assert_eq!(base.openai.base_url, "http://env/v1");
     }
 
@@ -1264,42 +1299,33 @@ skill_max_bytes = {max}
 
     #[test]
     fn expand_refs() {
+        let _lock = env_test_lock();
+        let _restore = EnvRestore::capture(&["GREY_TEST_REF"]);
         unsafe { env::set_var("GREY_TEST_REF", "hello") };
         assert_eq!(expand_env_refs("${GREY_TEST_REF}").unwrap(), "hello");
         assert_eq!(expand_env_refs("plain").unwrap(), "plain");
-        unsafe { env::remove_var("GREY_TEST_REF") };
     }
 
     #[test]
     fn invalid_anthropic_token_limit_and_missing_secret_reference_are_errors() {
+        let _lock = env_test_lock();
+        let _restore = EnvRestore::capture(&[
+            "GREY_ANTHROPIC_MAX_TOKENS",
+            "GREY_ANTHROPIC_API_KEY",
+            "GREY_MISSING_ANTHROPIC_KEY",
+        ]);
         let mut cfg = GreyConfig::default();
-        let previous_tokens = env::var_os("GREY_ANTHROPIC_MAX_TOKENS");
         unsafe { env::set_var("GREY_ANTHROPIC_MAX_TOKENS", "zero-ish") };
         let error = apply_env(&mut cfg).unwrap_err();
-        unsafe {
-            match previous_tokens {
-                Some(value) => env::set_var("GREY_ANTHROPIC_MAX_TOKENS", value),
-                None => env::remove_var("GREY_ANTHROPIC_MAX_TOKENS"),
-            }
-        }
         assert!(error.to_string().contains("positive integer"));
 
-        let previous_key = env::var_os("GREY_ANTHROPIC_API_KEY");
-        let previous_missing = env::var_os("GREY_MISSING_ANTHROPIC_KEY");
         unsafe {
+            env::remove_var("GREY_ANTHROPIC_MAX_TOKENS");
             env::remove_var("GREY_ANTHROPIC_API_KEY");
             env::remove_var("GREY_MISSING_ANTHROPIC_KEY");
         }
         cfg.anthropic.api_key = "${GREY_MISSING_ANTHROPIC_KEY}".into();
         let error = apply_env(&mut cfg).unwrap_err();
-        unsafe {
-            if let Some(value) = previous_key {
-                env::set_var("GREY_ANTHROPIC_API_KEY", value);
-            }
-            if let Some(value) = previous_missing {
-                env::set_var("GREY_MISSING_ANTHROPIC_KEY", value);
-            }
-        }
         assert!(error.to_string().contains("GREY_MISSING_ANTHROPIC_KEY"));
     }
 
@@ -1434,6 +1460,8 @@ scroll_down = "pagedown"
 
     #[test]
     fn parses_plugins_and_expands_refs() {
+        let _lock = env_test_lock();
+        let _restore = EnvRestore::capture(&["GREY_TEST_PLUGIN_CMD", "GREY_TEST_PLUGIN_ARG"]);
         let toml_str = r#"
 [[plugins]]
 id = "word_count"
@@ -1452,24 +1480,12 @@ name = "Pre prompt plugin"
 command = "echo hook"
 hook_event = "pre_prompt"
 "#;
-        let previous_cmd = env::var_os("GREY_TEST_PLUGIN_CMD");
-        let previous_arg = env::var_os("GREY_TEST_PLUGIN_ARG");
         unsafe {
             env::set_var("GREY_TEST_PLUGIN_CMD", "printf");
             env::set_var("GREY_TEST_PLUGIN_ARG", "x");
         }
         let mut cfg: GreyConfig = toml::from_str(toml_str).unwrap();
         apply_env(&mut cfg).unwrap();
-        unsafe {
-            match previous_cmd {
-                Some(value) => env::set_var("GREY_TEST_PLUGIN_CMD", value),
-                None => env::remove_var("GREY_TEST_PLUGIN_CMD"),
-            }
-            match previous_arg {
-                Some(value) => env::set_var("GREY_TEST_PLUGIN_ARG", value),
-                None => env::remove_var("GREY_TEST_PLUGIN_ARG"),
-            }
-        }
         assert_eq!(cfg.plugins.len(), 2);
         assert_eq!(cfg.plugins[0].id, "word_count");
         assert_eq!(cfg.plugins[0].command, "printf");
@@ -1484,6 +1500,8 @@ hook_event = "pre_prompt"
 
     #[test]
     fn parses_hook_and_provider_plugin_kinds() {
+        let _lock = env_test_lock();
+        let _restore = EnvRestore::capture(&["PLUGIN_VERSION"]);
         let toml_str = r#"
 [[plugins]]
 id = "hook-test"
@@ -1568,6 +1586,12 @@ completion = ["printf 'complete'"]
 
     #[test]
     fn mcp_tool_env_refs_are_expanded() {
+        let _lock = env_test_lock();
+        let _restore = EnvRestore::capture(&[
+            "GREY_ANTHROPIC_MAX_TOKENS",
+            "GREY_TEST_MCP_CMD",
+            "GREY_TEST_MCP_ARG",
+        ]);
         let mut cfg = GreyConfig::default();
         cfg.mcp_tools.push(McpToolConfig {
             name: "tool".into(),
@@ -1575,29 +1599,12 @@ completion = ["printf 'complete'"]
             args: vec!["${GREY_TEST_MCP_ARG}".into()],
             ..Default::default()
         });
-        let previous_antic = env::var_os("GREY_ANTHROPIC_MAX_TOKENS");
-        let previous_test_cmd = env::var_os("GREY_TEST_MCP_CMD");
-        let previous_test_arg = env::var_os("GREY_TEST_MCP_ARG");
         unsafe {
             env::remove_var("GREY_ANTHROPIC_MAX_TOKENS");
             env::set_var("GREY_TEST_MCP_CMD", "sh");
             env::set_var("GREY_TEST_MCP_ARG", "-lc");
         }
         let result = apply_env(&mut cfg);
-        unsafe {
-            match previous_antic {
-                Some(value) => env::set_var("GREY_ANTHROPIC_MAX_TOKENS", value),
-                None => env::remove_var("GREY_ANTHROPIC_MAX_TOKENS"),
-            }
-            match previous_test_cmd {
-                Some(value) => env::set_var("GREY_TEST_MCP_CMD", value),
-                None => env::remove_var("GREY_TEST_MCP_CMD"),
-            }
-            match previous_test_arg {
-                Some(value) => env::set_var("GREY_TEST_MCP_ARG", value),
-                None => env::remove_var("GREY_TEST_MCP_ARG"),
-            }
-        }
         assert!(result.is_ok(), "{}", result.unwrap_err());
         assert_eq!(cfg.mcp_tools[0].command, "sh");
         assert_eq!(cfg.mcp_tools[0].args, vec!["-lc".to_string()]);
@@ -1605,22 +1612,16 @@ completion = ["printf 'complete'"]
 
     #[test]
     fn applies_ark_api_key_to_volcano_provider_when_unset() {
-        let _guard = ARK_ENV_LOCK.lock().unwrap();
+        let _lock = env_test_lock();
+        let _restore = EnvRestore::capture(&["ARK_API_KEY"]);
         let mut cfg = GreyConfig::default();
         cfg.providers.push(ProviderEntry {
             id: "volcano".into(),
             protocol: "openai".into(),
             ..Default::default()
         });
-        let previous_ark = env::var_os("ARK_API_KEY");
         unsafe { env::set_var("ARK_API_KEY", "ark-demo-key") };
         let result = apply_env(&mut cfg);
-        unsafe {
-            match previous_ark {
-                Some(value) => env::set_var("ARK_API_KEY", value),
-                None => env::remove_var("ARK_API_KEY"),
-            }
-        }
         assert!(result.is_ok(), "{}", result.unwrap_err());
         let volcano = cfg
             .providers
@@ -1632,30 +1633,19 @@ completion = ["printf 'complete'"]
 
     #[test]
     fn applies_volcano_api_key_to_volcano_provider_when_unset() {
-        let _guard = ARK_ENV_LOCK.lock().unwrap();
+        let _lock = env_test_lock();
+        let _restore = EnvRestore::capture(&["ARK_API_KEY", "VOLCANO_API_KEY"]);
         let mut cfg = GreyConfig::default();
         cfg.providers.push(ProviderEntry {
             id: "volcano".into(),
             protocol: "openai".into(),
             ..Default::default()
         });
-        let previous_ark = env::var_os("ARK_API_KEY");
-        let previous_volcano = env::var_os("VOLCANO_API_KEY");
         unsafe {
             env::remove_var("ARK_API_KEY");
             env::set_var("VOLCANO_API_KEY", "volcano-demo-key");
         }
         let result = apply_env(&mut cfg);
-        unsafe {
-            match previous_ark {
-                Some(value) => env::set_var("ARK_API_KEY", value),
-                None => env::remove_var("ARK_API_KEY"),
-            }
-            match previous_volcano {
-                Some(value) => env::set_var("VOLCANO_API_KEY", value),
-                None => env::remove_var("VOLCANO_API_KEY"),
-            }
-        }
         assert!(result.is_ok(), "{}", result.unwrap_err());
         let volcano = cfg
             .providers
@@ -1667,15 +1657,14 @@ completion = ["printf 'complete'"]
 
     #[test]
     fn applies_ark_api_key_to_coding_plan_provider_when_unset() {
-        let _guard = ARK_ENV_LOCK.lock().unwrap();
+        let _lock = env_test_lock();
+        let _restore = EnvRestore::capture(&["ARK_API_KEY", "VOLCANO_API_KEY"]);
         let mut cfg = GreyConfig::default();
         cfg.providers.push(ProviderEntry {
             id: "volcano-coding-plan".into(),
             protocol: "openai".into(),
             ..Default::default()
         });
-        let previous_ark = env::var_os("ARK_API_KEY");
-        let previous_volcano = env::var_os("VOLCANO_API_KEY");
         unsafe {
             env::set_var("ARK_API_KEY", "ark-coding-plan-key");
             env::remove_var("VOLCANO_API_KEY");
@@ -1683,16 +1672,6 @@ completion = ["printf 'complete'"]
 
         let result = apply_env(&mut cfg);
 
-        unsafe {
-            match previous_ark {
-                Some(value) => env::set_var("ARK_API_KEY", value),
-                None => env::remove_var("ARK_API_KEY"),
-            }
-            match previous_volcano {
-                Some(value) => env::set_var("VOLCANO_API_KEY", value),
-                None => env::remove_var("VOLCANO_API_KEY"),
-            }
-        }
         result.unwrap();
         let provider = cfg
             .providers
@@ -1704,11 +1683,10 @@ completion = ["printf 'complete'"]
 
     #[test]
     fn applies_ark_model_to_coding_plan_default() {
-        let _guard = ARK_ENV_LOCK.lock().unwrap();
+        let _lock = env_test_lock();
+        let _restore = EnvRestore::capture(&["ARK_MODEL", "GREY_MODEL"]);
         let mut cfg = GreyConfig::default();
         cfg.default_provider = "volcano-coding-plan".into();
-        let previous_model = env::var_os("ARK_MODEL");
-        let previous_grey_model = env::var_os("GREY_MODEL");
         unsafe {
             env::set_var("ARK_MODEL", "doubao-seed-2.0-code");
             env::remove_var("GREY_MODEL");
@@ -1716,16 +1694,6 @@ completion = ["printf 'complete'"]
 
         let result = apply_env(&mut cfg);
 
-        unsafe {
-            match previous_model {
-                Some(value) => env::set_var("ARK_MODEL", value),
-                None => env::remove_var("ARK_MODEL"),
-            }
-            match previous_grey_model {
-                Some(value) => env::set_var("GREY_MODEL", value),
-                None => env::remove_var("GREY_MODEL"),
-            }
-        }
         result.unwrap();
         assert_eq!(cfg.default_model, "doubao-seed-2.0-code");
         assert_eq!(cfg.model, "doubao-seed-2.0-code");
@@ -1733,11 +1701,10 @@ completion = ["printf 'complete'"]
 
     #[test]
     fn grey_model_overrides_ark_model_for_coding_plan() {
-        let _guard = ARK_ENV_LOCK.lock().unwrap();
+        let _lock = env_test_lock();
+        let _restore = EnvRestore::capture(&["ARK_MODEL", "GREY_MODEL"]);
         let mut cfg = GreyConfig::default();
         cfg.default_provider = "volcano-coding-plan".into();
-        let previous_ark_model = env::var_os("ARK_MODEL");
-        let previous_grey_model = env::var_os("GREY_MODEL");
         unsafe {
             env::set_var("ARK_MODEL", "ark-model");
             env::set_var("GREY_MODEL", "grey-model");
@@ -1745,16 +1712,6 @@ completion = ["printf 'complete'"]
 
         let result = apply_env(&mut cfg);
 
-        unsafe {
-            match previous_ark_model {
-                Some(value) => env::set_var("ARK_MODEL", value),
-                None => env::remove_var("ARK_MODEL"),
-            }
-            match previous_grey_model {
-                Some(value) => env::set_var("GREY_MODEL", value),
-                None => env::remove_var("GREY_MODEL"),
-            }
-        }
         result.unwrap();
         assert_eq!(cfg.default_model, "grey-model");
         assert_eq!(cfg.model, "grey-model");
@@ -1762,12 +1719,11 @@ completion = ["printf 'complete'"]
 
     #[test]
     fn empty_ark_model_does_not_clear_coding_plan_default() {
-        let _guard = ARK_ENV_LOCK.lock().unwrap();
+        let _lock = env_test_lock();
+        let _restore = EnvRestore::capture(&["ARK_MODEL", "GREY_MODEL"]);
         let mut cfg = GreyConfig::default();
         cfg.default_provider = "volcano-coding-plan".into();
         cfg.default_model = "ark-code-latest".into();
-        let previous_ark_model = env::var_os("ARK_MODEL");
-        let previous_grey_model = env::var_os("GREY_MODEL");
         unsafe {
             env::set_var("ARK_MODEL", "");
             env::remove_var("GREY_MODEL");
@@ -1775,16 +1731,6 @@ completion = ["printf 'complete'"]
 
         let result = apply_env(&mut cfg);
 
-        unsafe {
-            match previous_ark_model {
-                Some(value) => env::set_var("ARK_MODEL", value),
-                None => env::remove_var("ARK_MODEL"),
-            }
-            match previous_grey_model {
-                Some(value) => env::set_var("GREY_MODEL", value),
-                None => env::remove_var("GREY_MODEL"),
-            }
-        }
         result.unwrap();
         assert_eq!(cfg.default_model, "ark-code-latest");
     }
