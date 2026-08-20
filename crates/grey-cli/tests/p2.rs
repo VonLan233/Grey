@@ -2272,7 +2272,11 @@ fn mcp_add_list_show_find_update_remove_workflow() {
     assert!(list_output.contains("sh"));
     assert!(list_output.contains("timeout_ms=1000"));
 
-    let find = env.command().args(["mcp", "find", "demo"]).output().unwrap();
+    let find = env
+        .command()
+        .args(["mcp", "find", "demo"])
+        .output()
+        .unwrap();
     assert!(
         find.status.success(),
         "{}",
@@ -2333,6 +2337,5 @@ fn mcp_add_list_show_find_update_remove_workflow() {
         "{}",
         String::from_utf8_lossy(&list_after.stderr)
     );
-    assert!(String::from_utf8_lossy(&list_after.stdout)
-        .contains("(no mcp servers configured)"));
+    assert!(String::from_utf8_lossy(&list_after.stdout).contains("(no mcp servers configured)"));
 }

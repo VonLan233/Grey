@@ -3323,8 +3323,7 @@ fn run_mcp(action: McpAction) -> Result<()> {
                     .clone()
                     .filter(|command| !command.trim().is_empty())
                     .or_else(|| {
-                        (!existing.command.trim().is_empty())
-                            .then(|| existing.command.clone())
+                        (!existing.command.trim().is_empty()).then(|| existing.command.clone())
                     })
                     .with_context(|| {
                         format!("--command is required when adding mcp server {id}")

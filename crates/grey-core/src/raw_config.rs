@@ -688,7 +688,10 @@ mod tests {
         })
         .unwrap();
         assert!(kept.contains("command = \"server-v2\""));
-        assert!(kept.contains("TOKEN"), "update must not drop existing env: {kept}");
+        assert!(
+            kept.contains("TOKEN"),
+            "update must not drop existing env: {kept}"
+        );
 
         let duplicate = "[[mcp_servers]]\nid = \"dup\"\n[[mcp_servers]]\nid = \"dup\"\n";
         assert!(edit_text(duplicate, |doc| remove_mcp_server(doc, "dup")).is_err());
