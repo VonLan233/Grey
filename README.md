@@ -80,8 +80,13 @@ Grey 是一个用 Rust 写的 Coding Agent Harness：同一套 Core 同时服务
 - 多 Agent 编排：`grey orchestrate` 并行子 agent + `grey loop` / `grey goal`
 
 **界面**
-- ratatui 对话界面：流式状态、滚动、主题（`slate` / `grey_storm` 等）、布局配置
-- 长任务完成提醒（终端鸣铃 / 强鸣铃 / 系统通知），状态栏展示任务、模型、分支与 token 统计
+- ratatui 对话界面：流式状态、主题（`slate` / `grey_storm` 等）、布局配置、Markdown 渲染
+- 开屏页（Grey + Gray 头像、按键/斜杠命令提示，任意键进入）
+- 多行输入：`Shift+Enter` / `Alt+Enter` 换行（行尾 `\` + Enter 兜底）、Up/Down 行内移动
+- 斜杠命令：`/help` `/clear` `/quit` `/exit` `/model <name>` `/usage`
+- 消息区滚动：滚轮 / `PageUp` / `PageDown`，自动跟随新输出
+- 独立任务行（输入框上方）；底部状态栏展示模型、分支、i/o token 与事件状态
+- 长任务完成提醒（终端鸣铃 / 强鸣铃 / 系统通知）
 
 ## 快速开始
 
@@ -320,7 +325,7 @@ grey plugins add tool-check --kind tool --command printf --arg hello
 Grey 支持两类 MCP 配置，二者可共存：
 
 - **`[[mcp_tools]]`（兼容层，保留）**：每个条目是单条 shell 命令工具，不执行 MCP JSON-RPC 协议，直接注册为同名工具。
-- **`[[mcp_servers]]`（持久化 stdio MCP 协议客户端，推荐）**：启动后执行 `initialize` → `tools/list` → `tools/call`，发现的工具以 `id__tool` 命名注册；单连接串行处理请求，超时（默认 5s，`timeout_ms` 覆盖）后对进程组先 `TERM` 再 `KILL` 回收。
+- **`[[mcp_servers]]`（持久化 stdio MCP 协议客户端，推荐）**：Agent 启动时自动连接，执行 `initialize` → `tools/list` → `tools/call`，发现的工具以 `id__tool` 命名注册并可用；单连接串行处理请求，超时（默认 5s，`timeout_ms` 覆盖）后对进程组先 `TERM` 再 `KILL` 回收。
 
 **迁移说明**：若某个 `[[mcp_tools]]` 条目本身就是一个会讲 MCP stdio JSON-RPC 的服务进程，把它迁移到 `[[mcp_servers]]`（补一个稳定 `id`）即可走协议握手；纯 shell 命令工具继续留在 `[[mcp_tools]]`。`[[mcp_servers]]` 只支持 `stdio` 传输，`command` 必须是直接命令而非 URL。
 
