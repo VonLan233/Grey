@@ -17,10 +17,20 @@ const SECRET_FIELDS: &[&str] = &["api_key", "token", "secret", "authorization", 
 // P2: dynamic provider registry
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAuth {
+    #[default]
+    ApiKey,
+    ChatgptOauth,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProviderEntry {
     pub id: String,
     pub protocol: String,
+    #[serde(default)]
+    pub auth: ProviderAuth,
     #[serde(default)]
     pub base_url: String,
     #[serde(default)]

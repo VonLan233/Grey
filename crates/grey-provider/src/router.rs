@@ -56,6 +56,16 @@ impl ProviderRouter {
             if providers.contains_key(&entry.id) {
                 bail!("duplicate provider id `{}`", entry.id);
             }
+            if entry.auth == grey_core::ProviderAuth::ChatgptOauth
+                && (entry.protocol != "openai_responses"
+                    || !entry.api_key.is_empty()
+                    || !entry.base_url.is_empty())
+            {
+                bail!(
+                    "provider `{}` may use chatgpt_oauth only with openai_responses and empty api_key/base_url",
+                    entry.id
+                );
+            }
             let provider: Box<dyn Provider> = match entry.protocol.as_str() {
                 "mock" => Box::new(mock::MockProvider::new(entry.id.clone())),
                 "openai" => Box::new(openai::OpenAiCompatibleProvider::new_with_usage(
@@ -68,15 +78,23 @@ impl ProviderRouter {
                     entry.include_usage,
                 )?
                 .with_response_max_bytes(cfg.runtime.response_max_bytes)),
-                "openai_responses" => Box::new(responses::ResponsesProvider::new(
-                    entry.base_url.clone(),
-                    if entry.api_key.is_empty() {
-                        None
+                "openai_responses" => Box::new(
+                    if entry.auth == grey_core::ProviderAuth::ChatgptOauth {
+                        responses::ResponsesProvider::new_chatgpt(
+                            crate::chatgpt_oauth::ChatgptOauth::new()?,
+                        )?
                     } else {
-                        Some(entry.api_key.clone())
-                    },
-                )?
-                .with_response_max_bytes(cfg.runtime.response_max_bytes)),
+                        responses::ResponsesProvider::new(
+                            entry.base_url.clone(),
+                            if entry.api_key.is_empty() {
+                                None
+                            } else {
+                                Some(entry.api_key.clone())
+                            },
+                        )?
+                    }
+                    .with_response_max_bytes(cfg.runtime.response_max_bytes),
+                ),
                 "anthropic" => Box::new(anthropic::AnthropicProvider::new(
                     entry.base_url.clone(),
                     if entry.api_key.is_empty() {
@@ -396,6 +414,35 @@ mod tests {
                 .id(),
             "openai"
         );
+    }
+
+    #[test]
+    fn chatgpt_oauth_is_confined_to_unoverridden_responses_provider() {
+        for (protocol, api_key, base_url) in [
+            ("openai", "", ""),
+            ("openai_responses", "key", ""),
+            ("openai_responses", "", "https://example.test"),
+        ] {
+            let mut cfg = config_with_mock();
+            cfg.providers = vec![grey_core::ProviderEntry {
+                id: "oauth".into(),
+                protocol: protocol.into(),
+                auth: grey_core::ProviderAuth::ChatgptOauth,
+                api_key: api_key.into(),
+                base_url: base_url.into(),
+                ..Default::default()
+            }];
+            assert!(ProviderRouter::from_config(&cfg).is_err());
+        }
+
+        let mut cfg = config_with_mock();
+        cfg.providers = vec![grey_core::ProviderEntry {
+            id: "oauth".into(),
+            protocol: "openai_responses".into(),
+            auth: grey_core::ProviderAuth::ChatgptOauth,
+            ..Default::default()
+        }];
+        assert!(ProviderRouter::from_config(&cfg).is_ok());
     }
 
     #[test]

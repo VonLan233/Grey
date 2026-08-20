@@ -1,6 +1,7 @@
 //! Provider adapters.
 
 pub mod anthropic;
+pub mod chatgpt_oauth;
 pub mod fallback;
 pub mod gemini;
 pub mod mock;

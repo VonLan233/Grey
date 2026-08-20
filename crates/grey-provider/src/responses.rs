@@ -12,11 +12,17 @@ use grey_core::{
 };
 use serde_json::{json, Value};
 
+use crate::chatgpt_oauth::{AccessGrant, ChatgptOauth, CHATGPT_RESPONSES_URL, ORIGINATOR};
 use crate::sse::SseDecoder;
+
+enum ResponsesAuth {
+    ApiKey(Option<String>),
+    Chatgpt(ChatgptOauth),
+}
 
 pub struct ResponsesProvider {
     base_url: String,
-    api_key: Option<String>,
+    auth: ResponsesAuth,
     response_max_bytes: usize,
     client: reqwest::Client,
 }
@@ -29,7 +35,20 @@ impl ResponsesProvider {
             .context("building OpenAI Responses HTTP client")?;
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            api_key,
+            auth: ResponsesAuth::ApiKey(api_key),
+            response_max_bytes: RuntimeConfig::default().response_max_bytes,
+            client,
+        })
+    }
+
+    pub fn new_chatgpt(oauth: ChatgptOauth) -> Result<Self> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(300))
+            .build()
+            .context("building ChatGPT Responses HTTP client")?;
+        Ok(Self {
+            base_url: String::new(),
+            auth: ResponsesAuth::Chatgpt(oauth),
             response_max_bytes: RuntimeConfig::default().response_max_bytes,
             client,
         })
@@ -53,7 +72,7 @@ impl ResponsesProvider {
             .post(url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .json(&body);
-        if let Some(key) = &self.api_key {
+        if let ResponsesAuth::ApiKey(Some(key)) = &self.auth {
             builder = builder.bearer_auth(key);
         }
         builder.build().map_err(|error| {
@@ -64,6 +83,30 @@ impl ResponsesProvider {
             )
             .into()
         })
+    }
+
+    fn build_oauth_request(
+        &self,
+        request: &ChatRequest,
+        grant: &AccessGrant,
+    ) -> Result<reqwest::Request> {
+        let body = request_body(request).map_err(anyhow::Error::new)?;
+        self.client
+            .post(CHATGPT_RESPONSES_URL)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .bearer_auth(&grant.access_token)
+            .header("chatgpt-account-id", &grant.account_id)
+            .header("originator", ORIGINATOR)
+            .json(&body)
+            .build()
+            .map_err(|error| {
+                ProviderFailure::with_source(
+                    ProviderFailureKind::Protocol,
+                    "building ChatGPT Responses request failed",
+                    error,
+                )
+                .into()
+            })
     }
 }
 
@@ -77,9 +120,37 @@ impl Provider for ResponsesProvider {
         &'a self,
         request: &'a ChatRequest,
     ) -> Result<futures_util::stream::BoxStream<'a, ProviderEvent>> {
-        let http_request = self.build_request(request)?;
-        let response =
-            crate::send_http(&self.client, http_request, "OpenAI Responses provider").await?;
+        let response = match &self.auth {
+            ResponsesAuth::ApiKey(_) => {
+                let http_request = self.build_request(request)?;
+                crate::send_http(&self.client, http_request, "OpenAI Responses provider").await?
+            }
+            ResponsesAuth::Chatgpt(oauth) => {
+                let (status, response) = oauth
+                    .with_401_retry(|grant| async move {
+                        let http_request = self.build_oauth_request(request, &grant)?;
+                        let response =
+                            self.client.execute(http_request).await.map_err(|error| {
+                                ProviderFailure::with_source(
+                                    ProviderFailureKind::Transport,
+                                    "ChatGPT Responses request failed before receiving a response",
+                                    error,
+                                )
+                            })?;
+                        Ok((response.status(), response))
+                    })
+                    .await?;
+                if status.is_success() {
+                    response
+                } else {
+                    return Err(
+                        crate::bounded_http_error(response, "ChatGPT Responses provider")
+                            .await
+                            .into(),
+                    );
+                }
+            }
+        };
         let mut chunks = response.bytes_stream();
         let output = async_stream::stream! {
             let mut decoder = SseDecoder::default();
@@ -712,6 +783,25 @@ mod tests {
             })
         );
         assert!(body["tools"][0].get("function").is_none());
+    }
+
+    #[test]
+    fn chatgpt_oauth_request_uses_fixed_endpoint_and_required_headers() {
+        let provider = ResponsesProvider::new_chatgpt(ChatgptOauth::new().unwrap()).unwrap();
+        let request = ChatRequest::new("gpt-test", vec![ChatMessage::new(Role::User, "hello")]);
+        let grant = AccessGrant {
+            access_token: "oauth-access".into(),
+            account_id: "acct-123".into(),
+        };
+        let http = provider.build_oauth_request(&request, &grant).unwrap();
+
+        assert_eq!(http.url().as_str(), CHATGPT_RESPONSES_URL);
+        assert_eq!(
+            http.headers()[reqwest::header::AUTHORIZATION],
+            "Bearer oauth-access"
+        );
+        assert_eq!(http.headers()["chatgpt-account-id"], "acct-123");
+        assert_eq!(http.headers()["originator"], ORIGINATOR);
     }
 
     #[test]

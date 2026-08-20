@@ -18,6 +18,7 @@ authors = ["Grey Team"]
 [workspace.dependencies]
 anyhow = "1.0"
 async-stream = "0.3"
+base64 = "0.22"
 bytes = "1"
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }
@@ -25,8 +26,10 @@ crossterm = "0.28"
 futures-util = "0.3"
 globset = "0.4"
 ignore = "0.4"
+keyring = { version = "3", features = ["apple-native", "linux-native", "windows-native"] }
 lsp-types = "0.97"
 ratatui = "0.29"
+rand = "0.8"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
