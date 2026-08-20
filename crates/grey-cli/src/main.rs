@@ -17,7 +17,8 @@ use grey_core::{
     process::{run_bounded, CommandSpec, DEFAULT_STDIN_LIMIT},
     Agent, AgentEvent, AgentOptions, AgentOutcome, CharApproxCounter, ChatMessage, ChatRequest,
     ContextManager, GreyConfig, HookEvent, HookPayload, HookRunner, PluginConfig, PluginKind,
-    PluginRuntime, Provider, Role, Session, SessionStore, SummaryEngine, ToolExecutor, WasmPlugin,
+    PluginRuntime, Provider, Role, Session, SessionStore, SkillConfig, SummaryEngine, ToolExecutor,
+    WasmPlugin,
 };
 use grey_provider::chatgpt_oauth::ChatgptOauth;
 use grey_provider::router::{enabled_provider_plugins, ProviderRouter};
@@ -38,6 +39,41 @@ Keep changes scoped to the user's request, report tool failures honestly, and ne
 without verification evidence."#;
 const DEFAULT_THEME_PLUGIN_TIMEOUT_MS: u64 = 10_000;
 const TUI_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn system_prompt_with_skills(cli: &Cli, config: &GreyConfig) -> Result<String> {
+    if cli.skills.is_empty() {
+        return Ok(SYSTEM_PROMPT.to_owned());
+    }
+    let mut prompt = SYSTEM_PROMPT.to_owned();
+    for id in &cli.skills {
+        grey_core::skill::validate_id(id)?;
+        let skill = config
+            .skills
+            .iter()
+            .find(|skill| skill.id == *id)
+            .with_context(|| format!("skill not found: {id}"))?;
+        anyhow::ensure!(skill.enabled, "skill is disabled: {id}");
+        let content = grey_core::skill::load_skill(
+            &config.skill_config_dir,
+            id,
+            config.runtime.skill_max_bytes,
+        )?;
+        prompt.push_str("\n\n<grey-skill id=\"");
+        prompt.push_str(id);
+        prompt.push_str("\">\n");
+        prompt.push_str(&content);
+        prompt.push_str("\n</grey-skill>");
+    }
+    Ok(prompt)
+}
+
+fn ensure_skills_start_new_session(cli: &Cli, existing: Option<&Session>) -> Result<()> {
+    anyhow::ensure!(
+        cli.skills.is_empty() || existing.is_none(),
+        "--skill cannot be combined with a resumed session"
+    );
+    Ok(())
+}
 
 #[derive(Parser, Clone)]
 #[command(
@@ -101,6 +137,10 @@ struct Cli {
     /// Disable provider fallback on failure.
     #[arg(long, global = true)]
     no_fallback: bool,
+
+    /// Load an enabled local skill into this agent's system context. Repeat to preserve order.
+    #[arg(long = "skill", global = true)]
+    skills: Vec<String>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -212,6 +252,11 @@ enum Command {
     Hooks {
         #[command(subcommand)]
         action: HookAction,
+    },
+    /// Local SKILL.md management.
+    Skills {
+        #[command(subcommand)]
+        action: SkillAction,
     },
     /// Request cache management.
     Cache {
@@ -512,6 +557,17 @@ enum HookAction {
 }
 
 #[derive(Subcommand, Clone)]
+enum SkillAction {
+    List,
+    Show { id: String },
+    Find { query: String },
+    Add { path: PathBuf },
+    Remove { id: String },
+    Enable { id: String },
+    Disable { id: String },
+}
+
+#[derive(Subcommand, Clone)]
 enum CacheAction {
     /// Remove all cached responses.
     Clear,
@@ -676,6 +732,14 @@ async fn main() -> Result<()> {
 }
 
 async fn run_command(cli: &Cli, command: Command) -> Result<()> {
+    if !cli.skills.is_empty()
+        && matches!(
+            &command,
+            Command::Orchestrate { .. } | Command::Loop { .. } | Command::Goal { .. }
+        )
+    {
+        bail!("--skill is not supported with orchestrate, loop, or goal");
+    }
     match command {
         Command::SpikeA => grey_tui::run_stream_demo().await,
         Command::SpikeB { file, lsp } => {
@@ -705,6 +769,7 @@ async fn run_command(cli: &Cli, command: Command) -> Result<()> {
         Command::Providers { action } => run_providers(action),
         Command::Plugins { action } => run_plugins(action),
         Command::Hooks { action } => run_hooks(action),
+        Command::Skills { action } => run_skills(action),
         Command::Cache { action } => run_cache(action),
         Command::Usage { action } => run_usage(action),
         Command::Auth { action } => run_auth(action).await,
@@ -1998,6 +2063,7 @@ async fn run_headless(
 ) -> Result<()> {
     let hooks = HookRunner::new(&config.hooks, &config.plugins, &config.runtime);
     let (agent, store, existing) = build_agent_and_session(cli, config, workspace, false, &hooks)?;
+    ensure_skills_start_new_session(cli, existing.as_ref())?;
     let usage_tracker = agent.usage_tracker();
     let active_provider = agent.provider_id().to_string();
     let active_model = agent.model().to_string();
@@ -2012,6 +2078,7 @@ async fn run_headless(
     )
     .await;
 
+    let system_prompt = system_prompt_with_skills(cli, config)?;
     let mut prompt = prompt.to_string();
     let run_result = async {
         prompt = apply_prompt_hook(
@@ -2037,11 +2104,12 @@ async fn run_headless(
                 &agent,
                 existing.as_ref(),
                 &prompt,
+                &system_prompt,
                 config.runtime.event_queue_capacity,
             )
             .await
         } else {
-            run_with_cancellation(&agent, existing.as_ref(), &prompt, None).await
+            run_with_cancellation(&agent, existing.as_ref(), &prompt, &system_prompt, None).await
         }
     }
     .await;
@@ -2337,6 +2405,7 @@ async fn run_with_text_events(
     agent: &Agent,
     existing: Option<&Session>,
     prompt: &str,
+    system_prompt: &str,
     event_queue_capacity: usize,
 ) -> Result<AgentOutcome> {
     let (events_tx, mut events_rx) = mpsc::channel(event_queue_capacity);
@@ -2373,7 +2442,8 @@ async fn run_with_text_events(
             }
         }
     });
-    let result = run_with_cancellation(agent, existing, prompt, Some(&events_tx)).await;
+    let result =
+        run_with_cancellation(agent, existing, prompt, system_prompt, Some(&events_tx)).await;
     drop(events_tx);
     let _ = printer.await;
     result
@@ -2383,6 +2453,7 @@ async fn run_with_cancellation(
     agent: &Agent,
     existing: Option<&Session>,
     prompt: &str,
+    system_prompt: &str,
     events: Option<&mpsc::Sender<AgentEvent>>,
 ) -> Result<AgentOutcome> {
     let run = async {
@@ -2391,7 +2462,7 @@ async fn run_with_cancellation(
                 .continue_messages(session.messages.clone(), prompt, events)
                 .await
         } else {
-            agent.run_new(SYSTEM_PROMPT, prompt, events).await
+            agent.run_new(system_prompt, prompt, events).await
         }
     };
     tokio::select! {
@@ -2525,6 +2596,8 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
     let tui_config = resolve_theme_plugin_config(config, workspace).await?;
     let hooks = HookRunner::new(&config.hooks, &config.plugins, &config.runtime);
     let (agent, store, existing) = build_agent_and_session(cli, config, workspace, true, &hooks)?;
+    ensure_skills_start_new_session(cli, existing.as_ref())?;
+    let system_prompt = system_prompt_with_skills(cli, config)?;
     let usage_tracker = agent.usage_tracker();
 
     run_best_effort_hook(
@@ -2654,7 +2727,7 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
                         }
                         None => {
                             agent
-                                .run_new(SYSTEM_PROMPT, &prompt, Some(&events_tx))
+                                .run_new(&system_prompt, &prompt, Some(&events_tx))
                                 .await
                         }
                     }
@@ -3169,6 +3242,102 @@ fn run_plugins(action: PluginAction) -> Result<()> {
     }
 }
 
+fn run_skills(action: SkillAction) -> Result<()> {
+    let config_path = grey_core::raw_config::mutation_target()?;
+    let config_dir = skill_config_dir(&config_path)?;
+    let max_bytes = config::load()?.runtime.skill_max_bytes;
+    match action {
+        SkillAction::List => print_skills(&read_raw_skills(&config_path)?, &config_dir),
+        SkillAction::Show { id } => {
+            let skill = read_raw_skills(&config_path)?
+                .into_iter()
+                .find(|skill| skill.id == id)
+                .with_context(|| format!("skill not found: {id}"))?;
+            println!(
+                "id: {}\nenabled: {}\npath: {}\n---",
+                skill.id,
+                skill.enabled,
+                grey_core::skill::skill_path(&config_dir, &id)?.display()
+            );
+            println!(
+                "{}",
+                grey_core::skill::load_skill(&config_dir, &id, max_bytes)?
+            );
+        }
+        SkillAction::Find { query } => {
+            let query = query.to_lowercase();
+            let skills = read_raw_skills(&config_path)?
+                .into_iter()
+                .filter(|skill| skill.id.to_lowercase().contains(&query))
+                .collect::<Vec<_>>();
+            print_skills(&skills, &config_dir);
+        }
+        SkillAction::Add { path } => {
+            let metadata = grey_core::skill::add_skill(&config_dir, &path, max_bytes)?;
+            // ponytail: config remains authoritative; if its atomic update fails this leaves only
+            // an unreferenced new file, never replaces/removes an existing managed skill. Add a
+            // cross-file journal only if managed-skill updates become a real requirement.
+            grey_core::raw_config::edit_file(&config_path, |doc| {
+                grey_core::raw_config::upsert_skill(
+                    doc,
+                    &SkillConfig {
+                        id: metadata.id.clone(),
+                        enabled: true,
+                    },
+                )
+            })?;
+            println!("added skill {}", metadata.id);
+        }
+        SkillAction::Remove { id } => {
+            grey_core::raw_config::edit_file(&config_path, |doc| {
+                grey_core::raw_config::remove_skill(doc, &id)
+            })?;
+            grey_core::skill::remove_skill(&config_dir, &id)?;
+            println!("removed skill {id}");
+        }
+        SkillAction::Enable { id } => set_skill_enabled(&config_path, &id, true)?,
+        SkillAction::Disable { id } => set_skill_enabled(&config_path, &id, false)?,
+    }
+    Ok(())
+}
+
+fn skill_config_dir(config_path: &Path) -> Result<PathBuf> {
+    let directory = config_path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(directory).with_context(|| format!("creating {}", directory.display()))?;
+    directory
+        .canonicalize()
+        .with_context(|| format!("canonicalizing {}", directory.display()))
+}
+
+fn set_skill_enabled(path: &Path, id: &str, enabled: bool) -> Result<()> {
+    grey_core::skill::validate_id(id)?;
+    grey_core::raw_config::edit_file(path, |doc| {
+        grey_core::raw_config::set_enabled(doc, "skills", id, enabled)
+    })?;
+    println!(
+        "{} skill {id}",
+        if enabled { "enabled" } else { "disabled" }
+    );
+    Ok(())
+}
+
+fn print_skills(skills: &[SkillConfig], config_dir: &Path) {
+    if skills.is_empty() {
+        println!("(no skills configured)");
+        return;
+    }
+    for skill in skills {
+        let path = grey_core::skill::skill_path(config_dir, &skill.id)
+            .expect("configured skill ids were validated");
+        println!(
+            "{}\t{}\t{}",
+            skill.id,
+            if skill.enabled { "enabled" } else { "disabled" },
+            path.display()
+        );
+    }
+}
+
 fn run_hooks(action: HookAction) -> Result<()> {
     let config_path = grey_core::raw_config::mutation_target()?;
     match action {
@@ -3344,6 +3513,24 @@ fn format_plugin_kind(kind: PluginKind) -> &'static str {
 struct RawPluginList {
     #[serde(default)]
     plugins: Vec<PluginConfig>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawSkillList {
+    #[serde(default)]
+    skills: Vec<SkillConfig>,
+}
+
+fn read_raw_skills(path: &Path) -> Result<Vec<SkillConfig>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let source = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let skills = toml::from_str::<RawSkillList>(&source)
+        .map(|config| config.skills)
+        .context("parsing raw skill configuration")?;
+    config::validate_skills(&skills)?;
+    Ok(skills)
 }
 
 fn read_raw_plugins(path: &Path) -> Result<Vec<PluginConfig>> {

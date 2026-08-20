@@ -123,6 +123,17 @@ pub struct PluginConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SkillConfig {
+    pub id: String,
+    #[serde(default = "default_skill_enabled")]
+    pub enabled: bool,
+}
+
+fn default_skill_enabled() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct McpToolConfig {
     pub name: String,
     pub command: String,
@@ -652,9 +663,14 @@ pub struct GreyConfig {
     pub tui: TuiConfig,
     /// Plugin registry for P6 extension points.
     pub plugins: Vec<PluginConfig>,
+    /// Local skill registry. Skill files live under `skills/<id>/SKILL.md` beside this config.
+    pub skills: Vec<SkillConfig>,
     /// Canonical base directory for relative plugin manifests. Not persisted.
     #[serde(skip, default = "default_plugin_config_dir")]
     pub plugin_config_dir: PathBuf,
+    /// Canonical base directory for local skills. Not persisted.
+    #[serde(skip, default = "default_plugin_config_dir")]
+    pub skill_config_dir: PathBuf,
 
     // Legacy fields (kept for backward compat; migrated into `providers`).
     pub provider: String,
@@ -683,7 +699,9 @@ impl Default for GreyConfig {
             hooks: HooksConfig::default(),
             mcp_tools: Vec::new(),
             plugins: Vec::new(),
+            skills: Vec::new(),
             plugin_config_dir: default_plugin_config_dir(),
+            skill_config_dir: default_plugin_config_dir(),
             tui: TuiConfig::default(),
             provider: "mock".into(),
             model: "grey-default".into(),
@@ -792,6 +810,7 @@ fn load_from_path(path: Option<&Path>) -> Result<GreyConfig> {
     apply_env(&mut cfg)?;
     cfg.runtime = cfg.runtime.clamped();
     cfg.plugin_config_dir = plugin_config_dir(path)?;
+    cfg.skill_config_dir = plugin_config_dir(path)?;
     let legacy_env = [
         "GREY_PROVIDER",
         "GREY_MODEL",
@@ -809,6 +828,7 @@ fn load_from_path(path: Option<&Path>) -> Result<GreyConfig> {
         eprintln!("warning: legacy provider fields are deprecated; migrate to [[providers]]");
     }
     validate_plugins(&cfg.plugins)?;
+    validate_skills(&cfg.skills)?;
     Ok(cfg)
 }
 
@@ -828,6 +848,19 @@ pub fn validate_plugins(plugins: &[PluginConfig]) -> Result<()> {
     validate_unique_plugin_ids(plugins)?;
     for plugin in plugins {
         validate_plugin_config(plugin)?;
+    }
+    Ok(())
+}
+
+pub fn validate_skills(skills: &[SkillConfig]) -> Result<()> {
+    let mut ids = HashSet::with_capacity(skills.len());
+    for skill in skills {
+        crate::skill::validate_id(&skill.id)?;
+        anyhow::ensure!(
+            ids.insert(skill.id.as_str()),
+            "duplicate skill id: {}",
+            skill.id
+        );
     }
     Ok(())
 }
@@ -948,6 +981,9 @@ fn merge_file(base: GreyConfig, over: GreyConfig, raw: &toml::Value) -> GreyConf
     if !table.contains_key("plugins") {
         merged.plugins = defaults.plugins;
     }
+    if !table.contains_key("skills") {
+        merged.skills = defaults.skills;
+    }
     if !table.contains_key("tui") {
         merged.tui = defaults.tui;
     }
@@ -994,6 +1030,9 @@ fn merge(mut base: GreyConfig, over: GreyConfig) -> GreyConfig {
     }
     if !over.plugins.is_empty() {
         base.plugins = over.plugins;
+    }
+    if !over.skills.is_empty() {
+        base.skills = over.skills;
     }
     if !over.tui.theme.preset.is_empty()
         || !over.tui.layout.input_lines.eq(&0)

@@ -12,6 +12,7 @@ pub mod process;
 pub mod provider;
 pub mod raw_config;
 pub mod session;
+pub mod skill;
 pub mod summary;
 pub mod token;
 pub mod tool;
@@ -36,8 +37,9 @@ pub use cache::{CacheStats, CachedResponse, RequestCache};
 pub use config::{
     AnthropicConfig, CacheConfig, ContextConfig, FallbackConfig, GreyConfig, HooksConfig,
     LspConfig, McpToolConfig, ModelEntry, OpenAiConfig, PluginConfig, PluginKind, PluginRuntime,
-    ProviderAuth, ProviderEntry, RouteRule, RuntimeConfig, TaskKind, TuiColorOverrides,
-    TuiCompletionConfig, TuiConfig, TuiKeysConfig, TuiLayoutConfig, TuiThemeConfig, UsageConfig,
+    ProviderAuth, ProviderEntry, RouteRule, RuntimeConfig, SkillConfig, TaskKind,
+    TuiColorOverrides, TuiCompletionConfig, TuiConfig, TuiKeysConfig, TuiLayoutConfig,
+    TuiThemeConfig, UsageConfig,
 };
 pub use context::{ContextAudit, ContextManager};
 pub use hook::{HookEvent, HookPayload, HookRunner, HookTool};

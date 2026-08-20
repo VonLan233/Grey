@@ -2111,3 +2111,109 @@ hook_event = "{event}"
         }
     }
 }
+
+#[test]
+fn skills_manage_config_relative_files_and_enablement() {
+    let env = temp_home();
+    let source = env.home.path().join("reviewer");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(
+        source.join("SKILL.md"),
+        "# Reviewer\n\nCheck boundary conditions.",
+    )
+    .unwrap();
+
+    let added = env
+        .command()
+        .args(["skills", "add", source.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    assert!(env
+        .home
+        .path()
+        .join(".config/grey/skills/reviewer/SKILL.md")
+        .is_file());
+
+    let list = env.command().args(["skills", "list"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&list.stdout).contains("reviewer\tenabled"));
+    let show = env
+        .command()
+        .args(["skills", "show", "reviewer"])
+        .output()
+        .unwrap();
+    assert!(
+        show.status.success(),
+        "{}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    assert!(String::from_utf8_lossy(&show.stdout).contains("Check boundary conditions."));
+
+    let initial = env.command().arg("first prompt").output().unwrap();
+    assert!(
+        initial.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    let resumed = env
+        .command()
+        .args(["--continue", "--skill", "reviewer", "second prompt"])
+        .output()
+        .unwrap();
+    assert!(!resumed.status.success());
+    assert!(String::from_utf8_lossy(&resumed.stderr)
+        .contains("--skill cannot be combined with a resumed session"));
+
+    let loop_with_skill = env
+        .command()
+        .args([
+            "--skill",
+            "reviewer",
+            "loop",
+            "repeat once",
+            "--iterations",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(!loop_with_skill.status.success());
+    assert!(String::from_utf8_lossy(&loop_with_skill.stderr)
+        .contains("--skill is not supported with orchestrate, loop, or goal"));
+
+    let disabled = env
+        .command()
+        .args(["skills", "disable", "reviewer"])
+        .output()
+        .unwrap();
+    assert!(
+        disabled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&disabled.stderr)
+    );
+    let rejected = env
+        .command()
+        .args(["--skill", "reviewer", "prompt"])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("skill is disabled: reviewer"));
+    let removed = env
+        .command()
+        .args(["skills", "remove", "reviewer"])
+        .output()
+        .unwrap();
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert!(!env
+        .home
+        .path()
+        .join(".config/grey/skills/reviewer/SKILL.md")
+        .exists());
+}

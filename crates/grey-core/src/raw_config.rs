@@ -1,4 +1,4 @@
-use crate::config::{self, PluginConfig, PluginRuntime};
+use crate::config::{self, PluginConfig, PluginRuntime, SkillConfig};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
@@ -71,6 +71,8 @@ pub fn edit_text(
 pub fn set_enabled(doc: &mut DocumentMut, table: &str, id: &str, enabled: bool) -> Result<()> {
     if table == "plugins" {
         validate_existing_plugins(doc)?;
+    } else if table == "skills" {
+        skills(doc)?;
     }
     let entry = array_of_tables_mut(doc, table)?
         .iter_mut()
@@ -180,6 +182,40 @@ pub fn remove_plugin(doc: &mut DocumentMut, id: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn skills(doc: &DocumentMut) -> Result<Vec<SkillConfig>> {
+    let skills = toml::from_str::<RawSkillList>(&doc.to_string())?.skills;
+    config::validate_skills(&skills)?;
+    Ok(skills)
+}
+
+pub fn upsert_skill(doc: &mut DocumentMut, skill: &SkillConfig) -> Result<()> {
+    config::validate_skills(std::slice::from_ref(skill))?;
+    skills(doc)?;
+    let skills = array_of_tables_mut(doc, "skills")?;
+    let existing = skills
+        .iter()
+        .position(|entry| entry.get("id").and_then(Item::as_str) == Some(skill.id.as_str()));
+    if let Some(index) = existing {
+        skills.get_mut(index).expect("skill index exists")["enabled"] = value(skill.enabled);
+    } else {
+        let mut entry = Table::new();
+        entry["id"] = value(skill.id.as_str());
+        entry["enabled"] = value(skill.enabled);
+        skills.push(entry);
+    }
+    Ok(())
+}
+
+pub fn remove_skill(doc: &mut DocumentMut, id: &str) -> Result<()> {
+    let skills = array_of_tables_mut(doc, "skills")?;
+    let index = skills
+        .iter()
+        .position(|entry| entry.get("id").and_then(Item::as_str) == Some(id))
+        .with_context(|| format!("skills entry not found: {id}"))?;
+    skills.remove(index);
+    Ok(())
+}
+
 /// Updates only the named TUI theme fields, preserving all unrelated raw TOML.
 pub fn set_tui_theme(
     doc: &mut DocumentMut,
@@ -214,6 +250,12 @@ pub fn set_tui_key(doc: &mut DocumentMut, name: &str, key: &str) -> Result<()> {
 struct RawPluginList {
     #[serde(default)]
     plugins: Vec<PluginConfig>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawSkillList {
+    #[serde(default)]
+    skills: Vec<SkillConfig>,
 }
 
 fn validate_existing_plugins(doc: &DocumentMut) -> Result<()> {
