@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/grey-logo-transparent.png" alt="Grey" height="170" />
+  <img src="docs/assets/grey-logo-transparent.png" alt="Grey" height="255" />
 </p>
 
 <h1 align="center">Grey</h1>
