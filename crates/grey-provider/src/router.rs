@@ -11,7 +11,7 @@ use grey_core::{
 };
 
 use crate::fallback::FallbackChain;
-use crate::{anthropic, mock, openai};
+use crate::{anthropic, mock, openai, responses};
 
 pub struct ProviderRouter {
     providers: HashMap<String, Arc<dyn Provider>>,
@@ -68,6 +68,15 @@ impl ProviderRouter {
                     entry.include_usage,
                 )?
                 .with_response_max_bytes(cfg.runtime.response_max_bytes)),
+                "openai_responses" => Box::new(responses::ResponsesProvider::new(
+                    entry.base_url.clone(),
+                    if entry.api_key.is_empty() {
+                        None
+                    } else {
+                        Some(entry.api_key.clone())
+                    },
+                )?
+                .with_response_max_bytes(cfg.runtime.response_max_bytes)),
                 "anthropic" => Box::new(anthropic::AnthropicProvider::new(
                     entry.base_url.clone(),
                     if entry.api_key.is_empty() {
@@ -93,7 +102,7 @@ impl ProviderRouter {
                 )?
                 .with_response_max_bytes(cfg.runtime.response_max_bytes)),
                 proto => bail!(
-                    "unknown protocol `{proto}` for provider `{}`; expected: mock, openai, anthropic",
+                    "unknown protocol `{proto}` for provider `{}`; expected: mock, openai, openai_responses, anthropic, gemini",
                     entry.id
                 ),
             };
@@ -350,6 +359,43 @@ mod tests {
         }];
         let err = ProviderRouter::from_config(&cfg).unwrap_err();
         assert!(err.to_string().contains("unknown protocol"));
+    }
+
+    #[test]
+    fn selects_responses_only_for_the_exact_protocol_not_the_model_name() {
+        let mut cfg = config_with_mock();
+        cfg.providers = vec![
+            grey_core::ProviderEntry {
+                id: "responses".into(),
+                protocol: "openai_responses".into(),
+                base_url: "https://example.test/v1".into(),
+                ..Default::default()
+            },
+            grey_core::ProviderEntry {
+                id: "chat".into(),
+                protocol: "openai".into(),
+                base_url: "https://example.test/v1".into(),
+                ..Default::default()
+            },
+        ];
+        let router = ProviderRouter::from_config(&cfg).unwrap();
+
+        assert_eq!(
+            router
+                .resolve_explicit("responses", "ordinary-model")
+                .unwrap()
+                .provider
+                .id(),
+            "openai_responses"
+        );
+        assert_eq!(
+            router
+                .resolve_explicit("chat", "gpt-responses-looking-model")
+                .unwrap()
+                .provider
+                .id(),
+            "openai"
+        );
     }
 
     #[test]
