@@ -42,6 +42,8 @@ const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(80);
 const SCROLL_PAGE_LINES: u16 = 5;
 const PERSISTENT_REMINDER_TICK: Duration = Duration::from_millis(1800);
 const TRUNCATED_MARKER: &str = "[cut]";
+pub const TUI_INPUT_LINES_MIN: u16 = 1;
+pub const TUI_INPUT_LINES_MAX: u16 = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum CompletionBell {
@@ -184,7 +186,10 @@ impl From<&TuiConfig> for TuiSettings {
         Self {
             theme: TuiTheme::from_config(&config.theme),
             layout: TuiLayoutConfig {
-                input_lines: config.layout.input_lines.max(1),
+                input_lines: config
+                    .layout
+                    .input_lines
+                    .clamp(TUI_INPUT_LINES_MIN, TUI_INPUT_LINES_MAX),
             },
             completion: config.completion.clone(),
             keys: TuiKeyBindings::from_config(&config.keys),
@@ -304,6 +309,16 @@ fn parse_keybinding(input: &str) -> Option<KeyBinding> {
         });
     }
     None
+}
+
+/// Returns whether a key string is accepted by the TUI input mapping.
+pub fn keybinding_is_valid(input: &str) -> bool {
+    parse_keybinding(input).is_some()
+}
+
+/// Returns whether an input area height is safe for the bounded TUI layout.
+pub fn input_lines_is_valid(input_lines: u16) -> bool {
+    (TUI_INPUT_LINES_MIN..=TUI_INPUT_LINES_MAX).contains(&input_lines)
 }
 
 fn default_leader_key() -> KeyBinding {

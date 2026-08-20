@@ -180,6 +180,36 @@ pub fn remove_plugin(doc: &mut DocumentMut, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Updates only the named TUI theme fields, preserving all unrelated raw TOML.
+pub fn set_tui_theme(
+    doc: &mut DocumentMut,
+    preset: &str,
+    overrides: &[(&str, &str)],
+) -> Result<()> {
+    validate_existing_plugins(doc)?;
+    let theme = tui_section_mut(doc, "theme")?;
+    set_string_field(theme, "preset", preset)?;
+    let overrides_section = subsection_mut(theme, "overrides")?;
+    for (name, color) in overrides {
+        set_string_field(overrides_section, name, color)?;
+    }
+    Ok(())
+}
+
+/// Updates the TUI input height without rewriting other TUI sections.
+pub fn set_tui_input_lines(doc: &mut DocumentMut, input_lines: u16) -> Result<()> {
+    validate_existing_plugins(doc)?;
+    let layout = tui_section_mut(doc, "layout")?;
+    set_integer_field(layout, "input_lines", input_lines.into())
+}
+
+/// Updates one supported TUI key binding without rewriting the keys table.
+pub fn set_tui_key(doc: &mut DocumentMut, name: &str, key: &str) -> Result<()> {
+    validate_existing_plugins(doc)?;
+    let keys = tui_section_mut(doc, "keys")?;
+    set_string_field(keys, name, key)
+}
+
 #[derive(Deserialize, Default)]
 struct RawPluginList {
     #[serde(default)]
@@ -214,6 +244,64 @@ fn array_of_tables_mut<'a>(doc: &'a mut DocumentMut, name: &str) -> Result<&'a m
     doc[name]
         .as_array_of_tables_mut()
         .with_context(|| format!("{name} must be an array of tables"))
+}
+
+fn tui_section_mut<'a>(doc: &'a mut DocumentMut, name: &str) -> Result<&'a mut Item> {
+    let root = doc.as_table_mut();
+    if !root.contains_key("tui") {
+        root.insert("tui", Item::Table(Table::new()));
+    }
+    let tui = item_as_table_mut(&mut root["tui"], "tui")?;
+    if !tui.contains_key(name) {
+        tui.insert(name, Item::Table(Table::new()));
+    }
+    Ok(tui.get_mut(name).expect("tui section was inserted"))
+}
+
+fn set_string_field(section: &mut Item, name: &str, field: &str) -> Result<()> {
+    if let Some(table) = section.as_table_mut() {
+        table[name] = value(field);
+        return Ok(());
+    }
+    if let Some(table) = section.as_inline_table_mut() {
+        table.insert(name, TomlValue::from(field));
+        return Ok(());
+    }
+    bail!("tui section must be a table: {name}")
+}
+
+fn set_integer_field(section: &mut Item, name: &str, field: i64) -> Result<()> {
+    if let Some(table) = section.as_table_mut() {
+        table[name] = value(field);
+        return Ok(());
+    }
+    if let Some(table) = section.as_inline_table_mut() {
+        table.insert(name, TomlValue::from(field));
+        return Ok(());
+    }
+    bail!("tui section must be a table: {name}")
+}
+
+fn subsection_mut<'a>(section: &'a mut Item, name: &str) -> Result<&'a mut Item> {
+    let table = item_as_table_mut(section, "tui section")?;
+    if !table.contains_key(name) {
+        table.insert(name, Item::Table(Table::new()));
+    }
+    Ok(table.get_mut(name).expect("tui subsection was inserted"))
+}
+
+fn item_as_table_mut<'a>(item: &'a mut Item, name: &str) -> Result<&'a mut Table> {
+    if item.as_table().is_none() {
+        let inline = item
+            .as_inline_table()
+            .with_context(|| format!("{name} must be a table"))?;
+        let mut table = Table::new();
+        for (key, value) in inline.iter() {
+            table.insert(key, Item::Value(value.clone()));
+        }
+        *item = Item::Table(table);
+    }
+    Ok(item.as_table_mut().expect("item was converted to a table"))
 }
 
 fn value_array(values: &[String]) -> Array {
@@ -380,6 +468,31 @@ mod tests {
         assert!(edited.contains("runtime = \"wasm\""));
         assert!(edited.contains("manifest = \"plugins/echo/plugin.json\""));
         assert!(edited.contains("manifest_sha256"));
+    }
+
+    #[test]
+    fn tui_edits_preserve_unknown_inline_fields_and_placeholders() {
+        let source = "# keep\nunknown = \"${KEEP}\"\n[tui]\nowner = \"user\"\ntheme = { preset = \"slate\", custom = \"keep\" }\n";
+        let edited = edit_text(source, |doc| {
+            set_tui_theme(doc, "grey_storm", &[("accent", "#44e0d3")])?;
+            set_tui_input_lines(doc, 6)?;
+            set_tui_key(doc, "help", "ctrl-h")
+        })
+        .unwrap();
+        assert!(edited.contains("# keep"));
+        assert!(edited.contains("${KEEP}"));
+        assert!(edited.contains("owner = \"user\""));
+        assert!(edited.contains("custom = \"keep\""));
+        assert!(edited.contains("preset = \"grey_storm\""));
+        assert!(edited.contains("accent = \"#44e0d3\""));
+        assert!(edited.contains("input_lines = 6"));
+        assert!(edited.contains("help = \"ctrl-h\""));
+    }
+
+    #[test]
+    fn tui_edits_reject_duplicate_plugin_ids() {
+        let source = "[[plugins]]\nid = \"duplicate\"\n[[plugins]]\nid = \"duplicate\"\n";
+        assert!(edit_text(source, |doc| set_tui_key(doc, "help", "h")).is_err());
     }
 
     #[cfg(unix)]

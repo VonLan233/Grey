@@ -59,6 +59,135 @@ fn auth_help_lists_the_three_openai_oauth_actions() {
 }
 
 #[test]
+fn tui_show_and_setters_preserve_unmanaged_toml() {
+    let env = temp_home();
+    let config_dir = env.home.path().join(".config/grey");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let config_path = config_dir.join("grey.toml");
+    std::fs::write(
+        &config_path,
+        "# keep\nunknown = \"${KEEP_ME}\"\n\n[tui]\nowner = \"user\"\n\n[tui.theme]\npreset = \"slate\"\n\n[tui.keys]\nhelp = \"k\"\n",
+    )
+    .unwrap();
+
+    let show = env.command().args(["tui", "show"]).output().unwrap();
+    assert!(
+        show.status.success(),
+        "{}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&show.stdout);
+    assert!(stdout.contains("preset = \"slate\""));
+    assert!(!stdout.contains("KEEP_ME"));
+
+    let theme = env
+        .command()
+        .args([
+            "tui",
+            "set-theme",
+            "--preset",
+            "grey_storm",
+            "--accent",
+            "#44e0d3",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        theme.status.success(),
+        "{}",
+        String::from_utf8_lossy(&theme.stderr)
+    );
+    let layout = env
+        .command()
+        .args(["tui", "set-layout", "--input-lines", "6"])
+        .output()
+        .unwrap();
+    assert!(
+        layout.status.success(),
+        "{}",
+        String::from_utf8_lossy(&layout.stderr)
+    );
+    let key = env
+        .command()
+        .args(["tui", "set-key", "--name", "help", "--value", "ctrl-h"])
+        .output()
+        .unwrap();
+    assert!(
+        key.status.success(),
+        "{}",
+        String::from_utf8_lossy(&key.stderr)
+    );
+
+    let saved = std::fs::read_to_string(config_path).unwrap();
+    assert!(saved.contains("# keep"));
+    assert!(saved.contains("unknown = \"${KEEP_ME}\""));
+    assert!(saved.contains("owner = \"user\""));
+    assert!(saved.contains("preset = \"grey_storm\""));
+    assert!(saved.contains("accent = \"#44e0d3\""));
+    assert!(saved.contains("input_lines = 6"));
+    assert!(saved.contains("help = \"ctrl-h\""));
+}
+
+#[test]
+fn tui_rejects_invalid_edits_without_mutating_config() {
+    let env = temp_home();
+    let config_dir = env.home.path().join(".config/grey");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let config_path = config_dir.join("grey.toml");
+    let source = "[tui.theme]\npreset = \"slate\"\n";
+    std::fs::write(&config_path, source).unwrap();
+
+    for args in [
+        &["tui", "set-theme", "--preset", "default"][..],
+        &[
+            "tui",
+            "set-theme",
+            "--preset",
+            "slate",
+            "--accent",
+            "not-a-color",
+        ][..],
+        &["tui", "set-layout", "--input-lines", "0"][..],
+        &["tui", "set-layout", "--input-lines", "21"][..],
+        &[
+            "tui",
+            "set-key",
+            "--name",
+            "help",
+            "--value",
+            "ctrl-too-long",
+        ][..],
+    ] {
+        let output = env.command().args(args).output().unwrap();
+        assert!(!output.status.success());
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), source);
+    }
+}
+
+#[test]
+fn tui_setters_do_not_lose_concurrent_updates() {
+    let env = temp_home();
+    let config_dir = env.home.path().join(".config/grey");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let config_path = config_dir.join("grey.toml");
+    std::fs::write(&config_path, "[tui]\nowner = \"user\"\n").unwrap();
+
+    let mut layout = env.command();
+    layout.args(["tui", "set-layout", "--input-lines", "6"]);
+    let mut key = env.command();
+    key.args(["tui", "set-key", "--name", "help", "--value", "ctrl-h"]);
+    let layout = std::thread::spawn(move || layout.output().unwrap());
+    let key = std::thread::spawn(move || key.output().unwrap());
+    assert!(layout.join().unwrap().status.success());
+    assert!(key.join().unwrap().status.success());
+
+    let saved = std::fs::read_to_string(config_path).unwrap();
+    assert!(saved.contains("owner = \"user\""));
+    assert!(saved.contains("input_lines = 6"));
+    assert!(saved.contains("help = \"ctrl-h\""));
+}
+
+#[test]
 fn providers_list_shows_configured_providers() {
     let env = temp_home();
     let output = env.command().args(["providers", "list"]).output().unwrap();

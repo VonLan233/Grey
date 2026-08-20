@@ -228,6 +228,11 @@ enum Command {
         #[command(subcommand)]
         action: AuthAction,
     },
+    /// Inspect and persist the bounded interactive TUI preferences.
+    Tui {
+        #[command(subcommand)]
+        action: TuiAction,
+    },
     /// Multi-agent orchestration: run sub-agents in parallel and synthesize.
     Orchestrate {
         prompt: String,
@@ -275,6 +280,91 @@ enum AuthAction {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum AuthProvider {
     Openai,
+}
+
+#[derive(Subcommand, Clone)]
+#[allow(clippy::large_enum_variant)] // clap owns this short-lived parsed command value.
+enum TuiAction {
+    /// Print the effective non-secret TUI configuration.
+    Show,
+    /// Set one built-in theme preset and optional color overrides.
+    SetTheme {
+        #[arg(long, value_enum)]
+        preset: TuiThemePreset,
+        #[arg(long)]
+        border: Option<String>,
+        #[arg(long)]
+        accent: Option<String>,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long = "status-fg")]
+        status_fg: Option<String>,
+        #[arg(long = "status-bg")]
+        status_bg: Option<String>,
+        #[arg(long)]
+        muted: Option<String>,
+        #[arg(long)]
+        error: Option<String>,
+        #[arg(long)]
+        success: Option<String>,
+        #[arg(long)]
+        warning: Option<String>,
+    },
+    /// Set the bounded TUI input area height.
+    SetLayout {
+        #[arg(long)]
+        input_lines: u16,
+    },
+    /// Set one supported TUI keyboard binding.
+    SetKey {
+        #[arg(long, value_enum)]
+        name: TuiKeyName,
+        #[arg(long)]
+        value: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum TuiKeyName {
+    Leader,
+    Help,
+    Quit,
+    Clear,
+    ScrollUp,
+    ScrollDown,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum TuiThemePreset {
+    #[value(name = "grey_storm")]
+    GreyStorm,
+    Slate,
+    Sunset,
+    Mono,
+}
+
+impl TuiThemePreset {
+    fn config_name(self) -> &'static str {
+        match self {
+            Self::GreyStorm => "grey_storm",
+            Self::Slate => "slate",
+            Self::Sunset => "sunset",
+            Self::Mono => "mono",
+        }
+    }
+}
+
+impl TuiKeyName {
+    fn config_name(self) -> &'static str {
+        match self {
+            Self::Leader => "leader",
+            Self::Help => "help",
+            Self::Quit => "quit",
+            Self::Clear => "clear",
+            Self::ScrollUp => "scroll_up",
+            Self::ScrollDown => "scroll_down",
+        }
+    }
 }
 
 #[derive(Subcommand, Clone)]
@@ -618,6 +708,7 @@ async fn run_command(cli: &Cli, command: Command) -> Result<()> {
         Command::Cache { action } => run_cache(action),
         Command::Usage { action } => run_usage(action),
         Command::Auth { action } => run_auth(action).await,
+        Command::Tui { action } => run_tui_preferences(action),
         Command::Orchestrate {
             prompt,
             agent,
@@ -706,6 +797,95 @@ fn browser_opener_spec(url: &str) -> Result<grey_core::process::CommandSpec> {
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     let spec = bail!("opening a browser is not supported on this platform");
     Ok(spec.timeout(Duration::from_secs(10)))
+}
+
+fn run_tui_preferences(action: TuiAction) -> Result<()> {
+    match action {
+        TuiAction::Show => {
+            let config = config::load()?;
+            println!("{}", toml::to_string_pretty(&config.redacted().tui)?);
+        }
+        TuiAction::SetTheme {
+            preset,
+            border,
+            accent,
+            prompt,
+            status_fg,
+            status_bg,
+            muted,
+            error,
+            success,
+            warning,
+        } => {
+            let mut theme = config::load()?.tui.theme;
+            theme.preset = preset.config_name().to_string();
+            let overrides = [
+                ("border", border),
+                ("accent", accent),
+                ("prompt", prompt),
+                ("status_fg", status_fg),
+                ("status_bg", status_bg),
+                ("muted", muted),
+                ("error", error),
+                ("success", success),
+                ("warning", warning),
+            ];
+            for (name, color) in &overrides {
+                if let Some(color) = color {
+                    match *name {
+                        "border" => theme.overrides.border = Some(color.clone()),
+                        "accent" => theme.overrides.accent = Some(color.clone()),
+                        "prompt" => theme.overrides.prompt = Some(color.clone()),
+                        "status_fg" => theme.overrides.status_fg = Some(color.clone()),
+                        "status_bg" => theme.overrides.status_bg = Some(color.clone()),
+                        "muted" => theme.overrides.muted = Some(color.clone()),
+                        "error" => theme.overrides.error = Some(color.clone()),
+                        "success" => theme.overrides.success = Some(color.clone()),
+                        "warning" => theme.overrides.warning = Some(color.clone()),
+                        _ => unreachable!("fixed TUI color field"),
+                    }
+                }
+            }
+            anyhow::ensure!(
+                grey_tui::theme_config_is_valid(&theme),
+                "invalid TUI theme preset or color override"
+            );
+            let raw_overrides = overrides
+                .iter()
+                .filter_map(|(name, color)| color.as_deref().map(|color| (*name, color)))
+                .collect::<Vec<_>>();
+            let path = grey_core::raw_config::mutation_target()?;
+            grey_core::raw_config::edit_file(&path, |doc| {
+                grey_core::raw_config::set_tui_theme(doc, &theme.preset, &raw_overrides)
+            })?;
+            println!("updated TUI theme");
+        }
+        TuiAction::SetLayout { input_lines } => {
+            anyhow::ensure!(
+                grey_tui::input_lines_is_valid(input_lines),
+                "--input-lines must be between {} and {}",
+                grey_tui::TUI_INPUT_LINES_MIN,
+                grey_tui::TUI_INPUT_LINES_MAX
+            );
+            let path = grey_core::raw_config::mutation_target()?;
+            grey_core::raw_config::edit_file(&path, |doc| {
+                grey_core::raw_config::set_tui_input_lines(doc, input_lines)
+            })?;
+            println!("updated TUI input lines");
+        }
+        TuiAction::SetKey { name, value } => {
+            anyhow::ensure!(
+                grey_tui::keybinding_is_valid(&value),
+                "invalid TUI key binding: {value}"
+            );
+            let path = grey_core::raw_config::mutation_target()?;
+            grey_core::raw_config::edit_file(&path, |doc| {
+                grey_core::raw_config::set_tui_key(doc, name.config_name(), &value)
+            })?;
+            println!("updated TUI key {}", name.config_name());
+        }
+    }
+    Ok(())
 }
 
 const ORCHESTRATE_AGENT_TIMEOUT_SECS: u64 = 120;
