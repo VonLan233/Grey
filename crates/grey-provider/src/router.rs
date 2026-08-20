@@ -348,8 +348,9 @@ pub fn enabled_provider_plugins(plugins: &[PluginConfig]) -> Vec<PluginConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures_util::stream;
-    use grey_core::FallbackConfig;
+    use futures_util::{stream, StreamExt};
+    use grey_core::{ChatMessage, FallbackConfig, PluginRuntime};
+    use sha2::{Digest, Sha256};
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -366,6 +367,57 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn router_executes_hash_pinned_wasm_provider_from_config_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("plugins/router");
+        std::fs::create_dir_all(&dir).unwrap();
+        let output = br#"{"schema_version":1,"text":"router-wasm"}"#;
+        let mut bytes = Vec::from([8, 0, 0, 0]);
+        bytes.extend_from_slice(&(output.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(output);
+        let data = bytes
+            .iter()
+            .map(|byte| format!("\\{:02x}", byte))
+            .collect::<String>();
+        let module = wat::parse_str(format!(r#"(module (import "wasi_snapshot_preview1" "fd_write" (func $w (param i32 i32 i32 i32) (result i32))) (memory 1) (export "memory" (memory 0)) (data (i32.const 0) "{data}") (func (export "_start") i32.const 1 i32.const 0 i32.const 1 i32.const 64 call $w drop))"#)).unwrap();
+        std::fs::write(dir.join("module.wasm"), &module).unwrap();
+        let manifest = format!(
+            r#"{{"schema_version":1,"id":"router-wasm","kind":"provider","protocol":"grey.wasm-plugin.v1","wasi":"preview1-stdio","module":"module.wasm","module_sha256":"{}"}}"#,
+            hex::encode(Sha256::digest(&module))
+        );
+        std::fs::write(dir.join("plugin.json"), &manifest).unwrap();
+        let cfg = GreyConfig {
+            default_provider: "router-wasm".into(),
+            default_model: "m".into(),
+            plugin_config_dir: root.path().to_path_buf(),
+            plugins: vec![PluginConfig {
+                id: "router-wasm".into(),
+                kind: PluginKind::Provider,
+                enabled: true,
+                runtime: PluginRuntime::Wasm,
+                manifest: Some("plugins/router/plugin.json".into()),
+                manifest_sha256: Some(hex::encode(Sha256::digest(manifest.as_bytes()))),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let router = ProviderRouter::from_config_in_workspace(&cfg, root.path()).unwrap();
+        let provider = router.resolve(&TaskKind::Default).unwrap().provider;
+        let events = provider
+            .stream_chat(&grey_core::ChatRequest::new(
+                "m",
+                vec![ChatMessage::new(grey_core::Role::User, "hi")],
+            ))
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(
+            matches!(&events[0], grey_core::ProviderEvent::Delta(text) if text == "router-wasm")
+        );
     }
 
     #[test]
