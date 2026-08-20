@@ -279,6 +279,10 @@ fn default_wasm_fuel() -> u64 {
 }
 
 impl RuntimeConfig {
+    pub fn normalized(&self) -> Self {
+        self.clone().clamped()
+    }
+
     fn clamped(mut self) -> Self {
         self.event_queue_capacity = self
             .event_queue_capacity

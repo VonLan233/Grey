@@ -8,6 +8,7 @@ use std::{
 };
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use wasmtime::{Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{
     p1::{self, WasiP1Ctx},
@@ -64,6 +65,8 @@ impl std::error::Error for WasmPluginError {}
 pub struct WasmPluginOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
 }
 
 impl fmt::Debug for WasmPluginOutput {
@@ -71,6 +74,8 @@ impl fmt::Debug for WasmPluginOutput {
         f.debug_struct("WasmPluginOutput")
             .field("stdout_bytes", &self.stdout.len())
             .field("stderr_bytes", &self.stderr.len())
+            .field("stdout_truncated", &self.stdout_truncated)
+            .field("stderr_truncated", &self.stderr_truncated)
             .finish()
     }
 }
@@ -113,6 +118,7 @@ struct WasmPluginManifest {
     protocol: String,
     wasi: String,
     module: String,
+    module_sha256: String,
 }
 
 struct WasiState {
@@ -165,6 +171,7 @@ impl WasmPlugin {
         })?;
         let module_path = resolve_relative_file(module_base, &manifest.module)?;
         let module_bytes = read_bounded_file(&module_path, MAX_MODULE_BYTES, "wasm plugin module")?;
+        verify_module_hash(&module_bytes, &manifest.module_sha256)?;
         let timeout =
             Duration::from_millis(plugin.timeout_ms.unwrap_or(
                 u64::try_from(DEFAULT_WASM_TIMEOUT.as_millis()).expect("timeout fits u64"),
@@ -185,7 +192,7 @@ impl WasmPlugin {
                 "could not initialize wasm runtime",
             )
         })?;
-        // ponytail: fixed 4MiB module input ceiling bounds startup compilation; raise only after a measured plugin need.
+        // ponytail: Wasmtime has no cancellable compile API; this 4MiB hash-pinned local asset bounds startup input/integrity. Add a multi-process compiler only for untrusted remote installation.
         let module = Module::from_binary(&engine, &module_bytes).map_err(|_| {
             WasmPluginError::new(
                 WasmPluginErrorKind::Runtime,
@@ -248,24 +255,7 @@ impl WasmPlugin {
 }
 
 fn normalized_runtime(runtime: &RuntimeConfig) -> RuntimeConfig {
-    RuntimeConfig {
-        wasm_memory_bytes: runtime.wasm_memory_bytes.clamp(
-            crate::config::RUNTIME_WASM_MEMORY_MIN,
-            crate::config::RUNTIME_WASM_MEMORY_MAX,
-        ),
-        wasm_fuel: runtime.wasm_fuel.clamp(
-            crate::config::RUNTIME_WASM_FUEL_MIN,
-            crate::config::RUNTIME_WASM_FUEL_MAX,
-        ),
-        command_stdout_max_bytes: runtime
-            .command_stdout_max_bytes
-            .clamp(1024, 64 * 1024 * 1024),
-        command_stderr_max_bytes: runtime
-            .command_stderr_max_bytes
-            .clamp(1024, 64 * 1024 * 1024),
-        response_max_bytes: runtime.response_max_bytes.clamp(1024, 64 * 1024 * 1024),
-        ..RuntimeConfig::default()
-    }
+    runtime.normalized()
 }
 
 fn regular_directory(path: &Path) -> Result<PathBuf, WasmPluginError> {
@@ -328,6 +318,22 @@ fn parse_manifest(path: &Path) -> Result<WasmPluginManifest, WasmPluginError> {
             "invalid wasm plugin manifest",
         )
     })
+}
+
+fn verify_module_hash(bytes: &[u8], expected: &str) -> Result<(), WasmPluginError> {
+    let expected = hex::decode(expected).map_err(|_| {
+        WasmPluginError::new(
+            WasmPluginErrorKind::Manifest,
+            "invalid wasm plugin module hash",
+        )
+    })?;
+    if expected.len() != 32 || expected.as_slice() != Sha256::digest(bytes).as_slice() {
+        return Err(WasmPluginError::new(
+            WasmPluginErrorKind::Manifest,
+            "wasm plugin module hash does not match manifest",
+        ));
+    }
+    Ok(())
 }
 
 fn read_bounded_file(path: &Path, max_bytes: u64, label: &str) -> Result<Vec<u8>, WasmPluginError> {
@@ -457,7 +463,13 @@ async fn invoke_async(
             "wasm plugin output exceeds configured limit",
         ));
     }
-    Ok(WasmPluginOutput { stdout, stderr })
+    // A full pipe is conservatively marked truncated because Preview1 fd_write may short-write.
+    Ok(WasmPluginOutput {
+        stdout_truncated: stdout.len() == stdout_limit,
+        stderr_truncated: stderr.len() == stderr_limit,
+        stdout,
+        stderr,
+    })
 }
 
 #[cfg(test)]
@@ -505,14 +517,14 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let plugins = root.path().join("plugins/echo");
         fs::create_dir_all(&plugins).unwrap();
-        fs::write(
-            plugins.join("module.wasm"),
-            wat::parse_str(wat_source).unwrap(),
-        )
-        .unwrap();
+        let module = wat::parse_str(wat_source).unwrap();
+        fs::write(plugins.join("module.wasm"), &module).unwrap();
         fs::write(
             plugins.join("plugin.json"),
-            r#"{"schema_version":1,"id":"echo","kind":"tool","protocol":"grey.wasm-plugin.v1","wasi":"preview1-stdio","module":"module.wasm"}"#,
+            format!(
+                r#"{{"schema_version":1,"id":"echo","kind":"tool","protocol":"grey.wasm-plugin.v1","wasi":"preview1-stdio","module":"module.wasm","module_sha256":"{}"}}"#,
+                hex::encode(Sha256::digest(&module))
+            ),
         )
         .unwrap();
         root
@@ -670,6 +682,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn module_content_swap_or_hash_mismatch_is_rejected_before_compilation() {
+        let root = write_fixture(ECHO);
+        let module = root.path().join("plugins/echo/module.wasm");
+        fs::write(&module, wat::parse_str("(module)").unwrap()).unwrap();
+        assert_eq!(
+            WasmPlugin::from_config(
+                &plugin("plugins/echo/plugin.json"),
+                root.path(),
+                &RuntimeConfig::default(),
+            )
+            .unwrap_err()
+            .kind(),
+            WasmPluginErrorKind::Manifest
+        );
+    }
+
     #[tokio::test]
     async fn dropping_an_infinite_invocation_cancels_without_waiting_for_plugin_timeout() {
         let looped = write_fixture(r#"(module (func (export "_start") (loop br 0)))"#);
@@ -720,6 +749,7 @@ mod tests {
                 .unwrap();
         let output = wasm.invoke(vec![b'x'; 1_025]).await.unwrap();
         assert_eq!(output.stdout.len(), 1_024);
+        assert!(output.stdout_truncated);
 
         let no_start = write_fixture("(module)");
         let wasm = WasmPlugin::from_config(
