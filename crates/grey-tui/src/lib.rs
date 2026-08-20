@@ -2272,6 +2272,35 @@ mod tests {
         assert_eq!(REMINDER_NOTIFICATIONS.load(Ordering::SeqCst), 1);
     }
 
+    #[test]
+    #[ignore = "P6-performance-smoke"]
+    fn p6_render_pipeline_smoke_fps_baseline() {
+        let mut state = AppState::default();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let iterations = 400u32;
+        let mut longest_delta_ms = 0.0_f64;
+        let start = std::time::Instant::now();
+
+        for i in 0..iterations {
+            state.reduce_agent_event(AgentEvent::Delta(format!("line-{i}")));
+            state.update_viewport(100, 30);
+            assert!(draw_if_dirty(&mut terminal, &mut state).unwrap());
+            let frame_ms = state.frame_stats().last_frame().as_secs_f64() * 1000.0;
+            if frame_ms > longest_delta_ms {
+                longest_delta_ms = frame_ms;
+            }
+        }
+        let elapsed = start.elapsed();
+        let fps = iterations as f64 / elapsed.as_secs_f64();
+        let avg_ms = elapsed.as_secs_f64() * 1000.0 / iterations as f64;
+        println!("P6_RENDER_FPS={fps}");
+        println!("P6_RENDER_AVG_MS={avg_ms}");
+        println!("P6_RENDER_MAX_FRAME_MS={longest_delta_ms}");
+        assert!(fps >= 15.0);
+        assert!(avg_ms <= 66.0);
+        assert!(longest_delta_ms <= 1000.0);
+    }
+
     #[tokio::test]
     async fn submit_action_is_forwarded_through_the_prompt_sender() {
         let (sender, mut receiver) = mpsc::channel(1);

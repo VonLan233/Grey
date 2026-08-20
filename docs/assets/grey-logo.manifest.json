@@ -15,6 +15,12 @@
       "size": "512x512",
       "mode": "RGBA",
       "variant": "single-color black character line art with transparent background"
+    },
+    {
+      "file": "grey-logo-transparent.png",
+      "size": "512x512",
+      "mode": "RGBA",
+      "variant": "detailed color README character emblem with transparent outer background"
     }
   ]
 }

@@ -21,3 +21,4 @@ jobs:
       - run: cargo test --workspace --all-features --locked
       - run: cargo build --workspace --release --locked
       - run: target/release/grey --no-save --format json "CI smoke"
+      - run: scripts/run-grey-p6-perf-gates.sh

@@ -1338,6 +1338,9 @@ fn apply_env(cfg: &mut GreyConfig) -> Result<()> {
         if let Some(event) = &plugin.hook_event {
             plugin.hook_event = Some(expand_env_refs(event)?);
         }
+        if let Some(version) = &plugin.version {
+            plugin.version = Some(expand_env_refs(version)?);
+        }
     }
     Ok(())
 }
@@ -1748,7 +1751,7 @@ hook_event = "pre_prompt"
     }
 
     #[test]
-    fn parses_hook_and_provider_plugin_kinds() {
+    fn parses_hook_provider_and_theme_plugin_kinds() {
         let _lock = crate::test_support::test_env_lock();
         let _restore = EnvRestore::capture(&["PLUGIN_VERSION"]);
         let toml_str = r#"
@@ -1762,11 +1765,23 @@ hook_event = "pre_prompt"
 id = "custom-provider"
 kind = "provider"
 command = "provider-proxy"
+version = "${PLUGIN_VERSION}"
+
+[[plugins]]
+id = "custom-theme"
+kind = "theme"
+command = "theme-proxy"
 "#;
-        let cfg: GreyConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(cfg.plugins.len(), 2);
+        unsafe {
+            env::set_var("PLUGIN_VERSION", "0.1.0");
+        }
+        let mut cfg: GreyConfig = toml::from_str(toml_str).unwrap();
+        apply_env(&mut cfg).unwrap();
+        assert_eq!(cfg.plugins.len(), 3);
         assert_eq!(cfg.plugins[0].kind, PluginKind::Hook);
         assert_eq!(cfg.plugins[1].kind, PluginKind::Provider);
+        assert_eq!(cfg.plugins[1].version.as_deref(), Some("0.1.0"));
+        assert_eq!(cfg.plugins[2].kind, PluginKind::Theme);
     }
 
     #[test]

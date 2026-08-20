@@ -23,6 +23,8 @@
 - `crates/grey-tools/tests/tools.rs`：权限决策钩子与插件工具行为回归。
 - `docs/adr/ADR-006-p6-hook-lifecycle.md`：P6 Hook 生命周期决策记录。
 - `docs/阶段性开发文档.md`：P6 当前状态与已完成/待补齐项同步。
+- `scripts/run-grey-p6-perf-gates.sh`：P6 性能基准门禁脚本（启动时间、内存、渲染 FPS、大仓库扫描）。
+- `.github/workflows/ci.yml`：CI 门禁入口接入 `run-grey-p6-perf-gates.sh`。
 
 ## 三、当前验收证据
 
@@ -31,6 +33,8 @@
   - `pre_prompt` / `pre_message_send` / `permission_decision` 在集成测试和工具测试中有覆盖。
 - Loop/Goal 可执行性：
   - `grey_cli/tests/p2.rs` 中增加 `loop_mode_runs_and_reports_iteration_count` 与 `goal_mode_outputs_json_and_respects_no_stop_token_by_default`。
+- 性能基准门禁：
+  - `scripts/run-grey-p6-perf-gates.sh` 已接入 CI，并覆盖启动时延、内存、TUI 渲染帧率及 10k 文件扫描场景。
 - 编译与门禁恢复（Rust 1.97.1）：
   - `RUSTC=~/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/rustc ~/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/cargo check -p grey-cli`
 
@@ -39,9 +43,10 @@
 - WASM 插件宿主能力（清单、版本、沙箱）
 - Provider/Theme 插件运行时扩展
 - [x] 插件安装/更新/卸载生命周期：CLI 已支持 `list/show/add/remove/enable/disable`，配置持久化与测试已补齐
-- 性能基准门禁：启动时延、渲染帧率、大仓库场景延迟
+- 性能基准门禁：
+  - 已完成（脚本+CI 接入）
 - P7 相关发布流程（文档、打包、发布清单）
 
 ## 五、交付建议
 
-- 下一步优先补齐性能基准脚本与 CI 门禁，再将 P6 状态从“进行中”切到“已交付”并补齐 `README` 中 Hook/Loop/Goal + 示例插件使用说明。
+- 下一步优先补齐 WASM/Provider-Theme 运行时，再将 P6 状态从“进行中”切到“已交付”并补齐 `README` 中插件样例/配置说明。
