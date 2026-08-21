@@ -713,21 +713,26 @@ fn next_char_byte(text: &str, start: usize) -> usize {
         .map_or(text.len(), |(relative, _)| start + relative)
 }
 
-fn input_wrapped_rows(content: &str, width: usize) -> usize {
+/// Splits one logical input line into visual lines that fit `width`,
+/// breaking at character boundaries (matches how the input is rendered).
+fn wrap_input_line(content: &str, width: usize) -> Vec<String> {
     if width == 0 {
-        return content.chars().count().saturating_add(1);
+        return vec![content.to_owned()];
     }
-    let mut rows = 1usize;
-    let mut column = 0usize;
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
     for character in content.chars() {
         let character_width = character.width().unwrap_or(0);
-        if column + character_width > width {
-            rows += 1;
-            column = 0;
+        if current_width + character_width > width && !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+            current_width = 0;
         }
-        column += character_width;
+        current.push(character);
+        current_width += character_width;
     }
-    rows
+    lines.push(current);
+    lines
 }
 
 /// Measurements for frames that were actually drawn.
@@ -1085,29 +1090,51 @@ impl AppState {
     /// logical line renders with a `> ` prefix, so it wraps at `width -
     /// prompt_width`; later lines wrap at `width`.
     pub fn input_cursor_position(&self, width: usize, prompt_width: usize) -> (usize, usize) {
-        let text = self.input.text.as_str();
-        let cursor_byte = self.input.cursor_byte();
-        let before = &text[..cursor_byte];
-        let column = match before.rfind('\n') {
-            Some(last) => UnicodeWidthStr::width(&before[last + 1..]),
-            None => UnicodeWidthStr::width(before),
+        let logical_lines: Vec<&str> = self.input.text.split('\n').collect();
+        let line = self
+            .input
+            .cursor_line()
+            .min(logical_lines.len().saturating_sub(1));
+        let column_chars = self.input.cursor_col();
+        let rows_before: usize = logical_lines
+            .iter()
+            .enumerate()
+            .take(line)
+            .map(|(index, content)| {
+                let effective_width = if index == 0 {
+                    width.saturating_sub(prompt_width)
+                } else {
+                    width
+                };
+                wrap_input_line(content, effective_width).len()
+            })
+            .sum();
+        let effective_width = if line == 0 {
+            width.saturating_sub(prompt_width)
+        } else {
+            width
         };
-        let row = match before.rfind('\n') {
-            Some(last) => before[..=last].split_inclusive('\n').enumerate().fold(
-                0usize,
-                |row, (index, line)| {
-                    let content = line.trim_end_matches('\n');
-                    let effective_width = if index == 0 {
-                        width.saturating_sub(prompt_width)
-                    } else {
-                        width
-                    };
-                    row.saturating_add(input_wrapped_rows(content, effective_width))
-                },
-            ),
-            None => 0,
-        };
-        (column, row)
+        let content = logical_lines.get(line).copied().unwrap_or("");
+        let prefix: String = content.chars().take(column_chars).collect();
+        let prefix_visual = wrap_input_line(&prefix, effective_width);
+        let visual_row = prefix_visual.len().saturating_sub(1);
+        let column =
+            UnicodeWidthStr::width(prefix_visual.last().map(String::as_str).unwrap_or_default());
+        (column, rows_before + visual_row)
+    }
+
+    /// Pre-wrapped visual lines of the whole input, matching rendering.
+    fn input_visual_lines(&self, width: usize, prompt_width: usize) -> Vec<String> {
+        let mut visual = Vec::new();
+        for (index, logical) in self.input.text.split('\n').enumerate() {
+            let effective_width = if index == 0 {
+                width.saturating_sub(prompt_width)
+            } else {
+                width
+            };
+            visual.extend(wrap_input_line(logical, effective_width));
+        }
+        visual
     }
 
     /// Scroll the input so the cursor's wrapped row stays visible.
@@ -1693,17 +1720,23 @@ fn render(frame: &mut Frame<'_>, state: &mut AppState) {
     let input_visible_rows = usize::from(input_inner.height);
     state.input_scroll(input_width, prompt_width, input_visible_rows);
     let mut input_text = Text::default();
-    let mut input_lines = state.input.text.split('\n');
-    if let Some(first) = input_lines.next() {
-        input_text.push_line(Line::from(vec![prompt, Span::raw(first)]));
-    }
-    for rest in input_lines {
-        input_text.push_line(Line::from(Span::raw(rest)));
+    for (index, visual_line) in state
+        .input_visual_lines(input_width, prompt_width)
+        .iter()
+        .enumerate()
+    {
+        if index == 0 {
+            input_text.push_line(Line::from(vec![
+                prompt.clone(),
+                Span::raw(visual_line.clone()),
+            ]));
+        } else {
+            input_text.push_line(Line::from(Span::raw(visual_line.clone())));
+        }
     }
     let input = Paragraph::new(input_text)
         .block(input_block)
         .style(Style::default().fg(Color::White))
-        .wrap(Wrap { trim: false })
         .scroll((state.input_scroll, 0));
     frame.render_widget(input, chunks[2]);
     if input_inner.width > 0 && input_inner.height > 0 {
@@ -2604,6 +2637,33 @@ mod tests {
         assert!(
             row.contains("line-0"),
             "scroll offset was not rendered: {row:?}"
+        );
+    }
+
+    #[test]
+    fn wrapped_input_renders_and_places_cursor_on_the_right_row() {
+        let mut state = AppState::default();
+        for ch in "0123456789 0123456789 0123456789\nsecond line".chars() {
+            state.reduce_key(key(KeyCode::Char(ch)));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(20, 8)).unwrap();
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        let rows = rendered_rows(&terminal);
+        for (i, row) in rows.iter().enumerate() {
+            println!("[ROW {i}] {row:?}");
+        }
+        // cursor should sit on the last line ("second line" -> col 11, row after the wrapped first line)
+        // real input inner width is 18 (20 - 2 borders); cursor at the end of
+        // the second logical line sits below the wrapped first line
+        let (column, row) = state.input_cursor_position(18, 2);
+        assert_eq!(column, 11, "cursor column on the last line");
+        assert_eq!(row, 2, "cursor row below the wrapped first line");
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        let rows = rendered_rows(&terminal);
+        assert!(
+            rows[5].contains("second line"),
+            "cursor line must be visible after auto-scroll, got {:?}",
+            rows[5]
         );
     }
 
