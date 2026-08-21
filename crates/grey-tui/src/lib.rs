@@ -25,9 +25,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use grey_core::{
-    AgentEvent, RuntimeConfig, TuiCompletionConfig, TuiConfig, TuiKeysConfig, TuiLayoutConfig,
-};
+use grey_core::{AgentEvent, RuntimeConfig, TuiCompletionConfig, TuiConfig, TuiKeysConfig};
 use notify_rust::Notification;
 use ratatui::{
     backend::{Backend, CrosstermBackend},
@@ -171,7 +169,6 @@ impl TuiTheme {
 #[derive(Debug, Clone)]
 struct TuiSettings {
     theme: TuiTheme,
-    layout: TuiLayoutConfig,
     completion: TuiCompletionConfig,
     keys: TuiKeyBindings,
     git_branch: Option<String>,
@@ -191,12 +188,6 @@ impl From<&TuiConfig> for TuiSettings {
     fn from(config: &TuiConfig) -> Self {
         Self {
             theme: TuiTheme::from_config(&config.theme),
-            layout: TuiLayoutConfig {
-                input_lines: config
-                    .layout
-                    .input_lines
-                    .clamp(TUI_INPUT_LINES_MIN, TUI_INPUT_LINES_MAX),
-            },
             completion: config.completion.clone(),
             keys: TuiKeyBindings::from_config(&config.keys),
             git_branch: None,
@@ -845,6 +836,13 @@ fn wrap_input_line(content: &str, width: usize) -> Vec<String> {
     }
     lines.push(current);
     lines
+}
+
+/// Input area height: content-driven, clamped to 40% of the terminal height.
+/// `ponytail: clamp upper bound is 40% of frame; raise only when users request more visible input rows.`
+fn input_area_height(visual_rows: usize, frame_height: u16) -> u16 {
+    let max = (u32::from(frame_height) * 40 / 100).max(1) as u16;
+    (visual_rows as u16).clamp(1, max)
 }
 
 /// Measurements for frames that were actually drawn.
@@ -1898,11 +1896,16 @@ fn trigger_completion_notification(_config: &CompletionSettings, message: String
 
 fn render(frame: &mut Frame<'_>, state: &mut AppState) {
     let theme = state.settings.theme.colors.clone();
-    let input_lines = state.settings.layout.input_lines.max(1);
+    let prompt_width = UnicodeWidthStr::width("> ");
+    let frame_width = usize::from(frame.area().width);
+    let visual_rows = state.input_visual_lines(frame_width, prompt_width).len();
+    // bordered input needs +2 for top/bottom borders; keep outer at least 3
+    let max_outer = (u32::from(frame.area().height) * 40 / 100).max(3) as u16;
+    let input_height = (visual_rows as u16 + 2).clamp(3, max_outer);
     let chunks = Layout::vertical([
         Constraint::Min(0),
         Constraint::Length(1),
-        Constraint::Length(input_lines),
+        Constraint::Length(input_height),
         Constraint::Length(1),
     ])
     .split(frame.area());
@@ -2922,13 +2925,11 @@ mod tests {
         config.theme.preset = "slate".into();
         config.theme.overrides.border = Some("#1f2937".into());
         config.theme.overrides.prompt = Some("red".into());
-        config.layout.input_lines = 6;
         config.completion.enabled = false;
         config.completion.long_running_steps = 2;
         config.completion.long_running_seconds = 45;
 
         let settings = TuiSettings::from(&config);
-        assert_eq!(settings.layout.input_lines, 6);
         assert!(!settings.completion.enabled);
         assert_eq!(settings.completion.long_running_steps, 2);
         assert_eq!(settings.completion.long_running_seconds, 45);
@@ -3691,5 +3692,34 @@ mod tests {
             "splash avatar should not be rendered"
         );
         assert!(rows.iter().any(|row| row.contains("Grey v")));
+    }
+
+    #[test]
+    fn input_area_height_clamps_to_frame_40_percent() {
+        assert_eq!(input_area_height(0, 20), 1);
+        assert_eq!(input_area_height(1, 20), 1);
+        assert_eq!(input_area_height(5, 20), 5);
+        assert_eq!(input_area_height(12, 20), 8);
+        assert_eq!(input_area_height(8, 20), 8);
+        assert_eq!(input_area_height(10, 1), 1);
+        assert_eq!(input_area_height(10, 5), 2);
+    }
+
+    #[test]
+    fn input_area_grows_with_content_and_scrolls_beyond_max() {
+        let mut state = AppState::with_settings(TuiSettings::default());
+        state.input.text = "hello".into();
+        state.input.cursor_chars = 5;
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        // single line input should not be scrolled
+        assert_eq!(state.input_scroll, 0);
+        let mut tall = AppState::with_settings(TuiSettings::default());
+        tall.input.text = (0..12).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        tall.input.cursor_chars = tall.input.text.chars().count();
+        let mut terminal2 = Terminal::new(TestBackend::new(40, 14)).unwrap();
+        terminal2.draw(|frame| render(frame, &mut tall)).unwrap();
+        // 40% * 14 = 5, 12 visual rows clamped to 5 so input_scroll should be >0
+        assert!(tall.input_scroll > 0, "overflow should scroll, input_scroll={}", tall.input_scroll);
     }
 }
