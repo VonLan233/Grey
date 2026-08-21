@@ -508,6 +508,8 @@ enum SlashCommand {
     Quit,
     Model { model: String },
     Usage,
+    Status,
+    Models,
     Unknown(String),
 }
 
@@ -524,6 +526,8 @@ impl SlashCommand {
                 model: argument.trim().to_owned(),
             },
             "usage" | "tokens" => Self::Usage,
+            "status" => Self::Status,
+            "models" => Self::Models,
             other => Self::Unknown(other.to_owned()),
         }
     }
@@ -816,6 +820,7 @@ pub struct AppState {
     show_help: bool,
     leader_armed: bool,
     show_splash: bool,
+    available_models: Vec<String>,
 }
 
 impl Default for AppState {
@@ -848,6 +853,7 @@ impl Default for AppState {
             show_help: false,
             leader_armed: false,
             show_splash: false,
+            available_models: Vec::new(),
         }
     }
 }
@@ -1008,6 +1014,37 @@ impl AppState {
                     "usage: {total_input_tokens} input / {total_output_tokens} output tokens\n\n"
                 ));
                 self.status = "usage reported".into();
+                self.status_error = false;
+                self.dirty = true;
+                UiAction::None
+            }
+            SlashCommand::Status => {
+                self.input.take();
+                let (total_input_tokens, total_output_tokens) = self.total_usage();
+                let (provider_label, model_label) = self
+                    .model_info()
+                    .map_or(("-", "-"), |(provider, model)| (provider, model));
+                self.append_output(&format!(
+                    "status: v{} · model {provider_label}/{model_label} · branch {} · i:{total_input_tokens} o:{total_output_tokens}\n\n",
+                    env!("CARGO_PKG_VERSION"),
+                    self.branch_label()
+                ));
+                self.status = "status reported".into();
+                self.status_error = false;
+                self.dirty = true;
+                UiAction::None
+            }
+            SlashCommand::Models => {
+                self.input.take();
+                if self.available_models.is_empty() {
+                    self.append_output("models: (none configured)\n\n");
+                } else {
+                    self.append_output(&format!(
+                        "models:\n{}\n\n",
+                        self.available_models.join("\n")
+                    ));
+                }
+                self.status = "models listed".into();
                 self.status_error = false;
                 self.dirty = true;
                 UiAction::None
@@ -1477,6 +1514,7 @@ pub async fn run_agent_tui(
     events: mpsc::Receiver<AgentEvent>,
     prompts: PromptSender,
     model_switch: watch::Sender<Option<String>>,
+    available_models: &[String],
     tui_config: &TuiConfig,
     runtime_config: &RuntimeConfig,
     git_branch: Option<&str>,
@@ -1489,6 +1527,7 @@ pub async fn run_agent_tui(
     let settings =
         TuiSettings::from(tui_config).with_git_branch(git_branch.map(ToString::to_string));
     let mut state = AppState::with_runtime(settings, runtime_config);
+    state.available_models = available_models.to_vec();
     state.show_splash = true;
     let result = run_loop(
         &mut terminal,
@@ -1521,6 +1560,7 @@ pub async fn run_stream_demo() -> Result<()> {
         agent_events,
         prompt_sender,
         model_switch,
+        &[],
         &TuiConfig::default(),
         &runtime,
         None,
@@ -2460,6 +2500,8 @@ mod tests {
         );
         assert_eq!(Command::parse("/usage"), Command::Usage);
         assert_eq!(Command::parse("/tokens"), Command::Usage);
+        assert_eq!(Command::parse("/status"), Command::Status);
+        assert_eq!(Command::parse("/models"), Command::Models);
         assert_eq!(Command::parse("/wat"), Command::Unknown("wat".into()));
     }
 
@@ -2835,6 +2877,32 @@ mod tests {
             quitting.reduce_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             UiAction::Quit
         );
+    }
+
+    #[test]
+    fn slash_status_and_models_report_into_the_transcript() {
+        let mut state = AppState {
+            current_provider: Some("volcano".into()),
+            current_model: Some("deepseek-v4-flash-ga-260731".into()),
+            available_models: vec![
+                "volcano/deepseek-v4-flash-ga-260731".into(),
+                "volcano/doubao-seed-1-6".into(),
+            ],
+            ..Default::default()
+        };
+        type_text(&mut state, "/status");
+        assert_eq!(state.reduce_key(key(KeyCode::Enter)), UiAction::None);
+        assert!(state.output.contains("status: v"));
+        assert!(state.output.contains("deepseek-v4-flash-ga-260731"));
+
+        type_text(&mut state, "/models");
+        assert_eq!(state.reduce_key(key(KeyCode::Enter)), UiAction::None);
+        assert!(state.output.contains("volcano/doubao-seed-1-6"));
+
+        let mut empty = AppState::default();
+        type_text(&mut empty, "/models");
+        assert_eq!(empty.reduce_key(key(KeyCode::Enter)), UiAction::None);
+        assert!(empty.output.contains("(none configured)"));
     }
 
     #[test]

@@ -2917,10 +2917,12 @@ async fn run_tui(cli: &Cli, config: &GreyConfig, workspace: &Path) -> Result<()>
     });
     let branch = detect_git_branch(&workspace_for_worker);
     let ui_result = {
+        let available_models = available_model_labels(config);
         let ui = grey_tui::run_agent_tui(
             events_rx,
             prompts_tx.clone(),
             model_switch_tx,
+            &available_models,
             &tui_config,
             &config.runtime,
             branch.as_deref(),
@@ -3711,6 +3713,17 @@ fn show_raw_plugin(path: &Path, id: &str) -> Result<()> {
     grey_core::raw_config::redact(&mut output);
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
+}
+
+fn available_model_labels(config: &GreyConfig) -> Vec<String> {
+    let mut labels = Vec::new();
+    for provider in &config.providers {
+        for model in &provider.models {
+            labels.push(format!("{}/{}", provider.id, model.id));
+        }
+    }
+    labels.sort();
+    labels
 }
 
 fn mcp_server_matches(server: &McpServerConfig, query: &str) -> bool {
