@@ -504,13 +504,48 @@ struct CommandSpec {
 }
 
 const COMMANDS: &[CommandSpec] = &[
-    CommandSpec { name: "help", aliases: &["?"], args_hint: "", description: "显示帮助" },
-    CommandSpec { name: "clear", aliases: &[], args_hint: "", description: "清空输出" },
-    CommandSpec { name: "quit", aliases: &["exit"], args_hint: "", description: "退出 Grey" },
-    CommandSpec { name: "model", aliases: &[], args_hint: "<name>", description: "切换模型（下一条生效）" },
-    CommandSpec { name: "usage", aliases: &["tokens"], args_hint: "", description: "查看累积 token 用量" },
-    CommandSpec { name: "status", aliases: &[], args_hint: "", description: "查看版本/模型/分支/token" },
-    CommandSpec { name: "models", aliases: &[], args_hint: "", description: "列出可用模型" },
+    CommandSpec {
+        name: "help",
+        aliases: &["?"],
+        args_hint: "",
+        description: "显示帮助",
+    },
+    CommandSpec {
+        name: "clear",
+        aliases: &[],
+        args_hint: "",
+        description: "清空输出",
+    },
+    CommandSpec {
+        name: "quit",
+        aliases: &["exit"],
+        args_hint: "",
+        description: "退出 Grey",
+    },
+    CommandSpec {
+        name: "model",
+        aliases: &[],
+        args_hint: "<name>",
+        description: "切换模型（下一条生效）",
+    },
+    CommandSpec {
+        name: "usage",
+        aliases: &["tokens"],
+        args_hint: "",
+        description: "查看累积 token 用量",
+    },
+    CommandSpec {
+        name: "status",
+        aliases: &[],
+        args_hint: "",
+        description: "查看版本/模型/分支/token",
+    },
+    CommandSpec {
+        name: "models",
+        aliases: &[],
+        args_hint: "",
+        description: "列出可用模型",
+    },
 ];
 
 /// One candidate row in the slash-command completion popup.
@@ -618,14 +653,16 @@ impl SlashCommand {
         let body = trimmed.strip_prefix('/').unwrap_or(trimmed).trim();
         let (name, argument) = body.split_once(char::is_whitespace).unwrap_or((body, ""));
         let name = name.trim().to_ascii_lowercase();
-        let spec = COMMANDS.iter().find(|spec| {
-            spec.name == name || spec.aliases.contains(&name.as_str())
-        });
+        let spec = COMMANDS
+            .iter()
+            .find(|spec| spec.name == name || spec.aliases.contains(&name.as_str()));
         match spec.map(|spec| spec.name) {
             Some("help") => Self::Help,
             Some("clear") => Self::Clear,
             Some("quit") => Self::Quit,
-            Some("model") => Self::Model { model: argument.trim().to_owned() },
+            Some("model") => Self::Model {
+                model: argument.trim().to_owned(),
+            },
             Some("usage") => Self::Usage,
             Some("status") => Self::Status,
             Some("models") => Self::Models,
@@ -1282,17 +1319,14 @@ impl AppState {
                 }
             }
             if rect_contains(rects.input, column, row) {
-                let visual_rows =
-                    self.input_visual_lines(usize::from(rects.input.width), INPUT_PROMPT_WIDTH)
-                        .len();
+                let visual_rows = self
+                    .input_visual_lines(usize::from(rects.input.width), INPUT_PROMPT_WIDTH)
+                    .len();
                 if visual_rows > usize::from(rects.input.height) {
                     if lines < 0 {
-                        self.input_scroll = self
-                            .input_scroll
-                            .saturating_sub(lines.unsigned_abs());
+                        self.input_scroll = self.input_scroll.saturating_sub(lines.unsigned_abs());
                     } else {
-                        let max_offset =
-                            (visual_rows - usize::from(rects.input.height)) as u16;
+                        let max_offset = (visual_rows - usize::from(rects.input.height)) as u16;
                         self.input_scroll = (self.input_scroll + lines as u16).min(max_offset);
                     }
                     self.input_scroll_manual = true;
@@ -1488,7 +1522,9 @@ impl AppState {
                     return UiAction::None;
                 }
                 KeyCode::Enter
-                    if !key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
                 {
                     let exact = self.popup.selected_item().is_some_and(|item| {
                         SlashCommand::parse(&item.replaces) == SlashCommand::parse(&self.input.text)
@@ -1993,7 +2029,11 @@ fn render_footer(frame: &mut Frame<'_>, state: &AppState, theme: &RenderTheme, a
     let dim = Style::default().fg(theme.muted);
     let (input_tokens, output_tokens) = state.total_usage();
     let mut left_spans = vec![Span::styled(
-        format!("↑{} ↓{}", format_tokens(input_tokens), format_tokens(output_tokens)),
+        format!(
+            "↑{} ↓{}",
+            format_tokens(input_tokens),
+            format_tokens(output_tokens)
+        ),
         dim,
     )];
     if let Some(task) = state.current_task.as_deref() {
@@ -3121,27 +3161,42 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
         let rows = rendered_rows(&terminal);
         let footer = rows.last().unwrap();
-        assert!(footer.contains("↑") && footer.contains("↓"), "footer should contain usage arrows, footer={footer:?}");
-        assert!(!footer.contains("[OK]"), "footer decluttered, no [OK], footer={footer:?}");
+        assert!(
+            footer.contains("↑") && footer.contains("↓"),
+            "footer should contain usage arrows, footer={footer:?}"
+        );
+        assert!(
+            !footer.contains("[OK]"),
+            "footer decluttered, no [OK], footer={footer:?}"
+        );
 
         let mut config = TuiConfig::default();
         config.completion.persistent = true;
         let mut held = AppState::with_settings(TuiSettings::from(&config));
         held.schedule_completion_notice("done".into());
-        assert!(held.completion_notice().is_some(), "persistent notice should be stored");
+        assert!(
+            held.completion_notice().is_some(),
+            "persistent notice should be stored"
+        );
 
         state.reduce_agent_event(AgentEvent::Failed("boom".into()));
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
         let rows_err = rendered_rows(&terminal);
         let footer_err = rows_err.last().unwrap();
-        assert!(footer_err.contains("ERR"), "error footer should contain ERR, footer={footer_err:?}");
+        assert!(
+            footer_err.contains("ERR"),
+            "error footer should contain ERR, footer={footer_err:?}"
+        );
         let error = Color::Rgb(0xff, 0x7b, 0x72);
-        assert!(terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .any(|cell| cell.fg == error), "error color should appear");
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .any(|cell| cell.fg == error),
+            "error color should appear"
+        );
     }
 
     #[test]
@@ -3532,11 +3587,15 @@ mod tests {
         assert_eq!(SlashCommand::parse("  /clear  "), SlashCommand::Clear);
         assert_eq!(
             SlashCommand::parse("/model"),
-            SlashCommand::Model { model: String::new() }
+            SlashCommand::Model {
+                model: String::new()
+            }
         );
         assert_eq!(
             SlashCommand::parse("/model gpt-5"),
-            SlashCommand::Model { model: "gpt-5".into() }
+            SlashCommand::Model {
+                model: "gpt-5".into()
+            }
         );
         assert_eq!(
             SlashCommand::parse("/bogus"),
@@ -3544,6 +3603,7 @@ mod tests {
         );
     }
 
+    #[allow(clippy::field_reassign_with_default)]
     fn with_popup_state(models: &[&str]) -> AppState {
         let mut state = AppState::default();
         state.available_models = models.iter().map(|s| s.to_string()).collect();
@@ -3668,8 +3728,10 @@ mod tests {
 
     #[test]
     fn model_secondary_completion_lists_available_models() {
-        let mut state = AppState::default();
-        state.available_models = vec!["gpt-5".into(), "claude-4".into(), "gemini-2".into()];
+        let mut state = AppState {
+            available_models: vec!["gpt-5".into(), "claude-4".into(), "gemini-2".into()],
+            ..Default::default()
+        };
         for ch in "/model ".chars() {
             state.reduce_key(key(KeyCode::Char(ch)));
         }
@@ -3738,12 +3800,19 @@ mod tests {
         // single line input should not be scrolled
         assert_eq!(state.input_scroll, 0);
         let mut tall = AppState::with_settings(TuiSettings::default());
-        tall.input.text = (0..12).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        tall.input.text = (0..12)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         tall.input.cursor_chars = tall.input.text.chars().count();
         let mut terminal2 = Terminal::new(TestBackend::new(40, 14)).unwrap();
         terminal2.draw(|frame| render(frame, &mut tall)).unwrap();
         // 40% * 14 = 5, 12 visual rows clamped to 5 so input_scroll should be >0
-        assert!(tall.input_scroll > 0, "overflow should scroll, input_scroll={}", tall.input_scroll);
+        assert!(
+            tall.input_scroll > 0,
+            "overflow should scroll, input_scroll={}",
+            tall.input_scroll
+        );
     }
 
     #[test]
@@ -3776,7 +3845,10 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
         let rows = rendered_rows(&terminal);
         let footer = rows.last().unwrap();
-        assert!(footer.contains("↑1.5k ↓42"), "left usage stats, footer={footer:?}");
+        assert!(
+            footer.contains("↑1.5k ↓42"),
+            "left usage stats, footer={footer:?}"
+        );
         assert!(
             footer.contains("(openai) gpt-5 (main)"),
             "right identity, footer={footer:?}"
@@ -3793,7 +3865,10 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
         let rows = rendered_rows(&terminal);
         let footer = rows.last().unwrap();
-        assert!(footer.contains('…'), "right side truncated, footer={footer:?}");
+        assert!(
+            footer.contains('…'),
+            "right side truncated, footer={footer:?}"
+        );
         assert!(footer.contains("↑0 ↓0"), "left side kept");
     }
 
@@ -3805,7 +3880,8 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
         let rows = rendered_rows(&terminal);
         assert!(
-            rows.iter().all(|row| !row.contains('┌') && !row.contains('┐')),
+            rows.iter()
+                .all(|row| !row.contains('┌') && !row.contains('┐')),
             "no box-drawing borders, rows={rows:?}"
         );
         assert!(
@@ -3813,7 +3889,8 @@ mod tests {
             "separator line, rows={rows:?}"
         );
         assert!(
-            rows.iter().all(|row| !row.contains(" fps") && !row.contains("GREY")),
+            rows.iter()
+                .all(|row| !row.contains(" fps") && !row.contains("GREY")),
             "status decluttered"
         );
     }
@@ -3824,27 +3901,56 @@ mod tests {
         state.total_input_tokens = 0;
         state.total_output_tokens = 0;
         state.last_layout = Some(LayoutRects {
-            conversation: Rect { x: 0, y: 0, width: 40, height: 6 },
-            input: Rect { x: 0, y: 7, width: 40, height: 2 },
+            conversation: Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 6,
+            },
+            input: Rect {
+                x: 0,
+                y: 7,
+                width: 40,
+                height: 2,
+            },
             popup: None,
         });
         state.scroll = 0;
         state.max_scroll = 20;
         state.scroll_at(5, 2, MOUSE_SCROLL_LINES);
-        assert_eq!(state.scroll, 3, "wheel over conversation scrolls transcript");
+        assert_eq!(
+            state.scroll, 3,
+            "wheel over conversation scrolls transcript"
+        );
         state.input.text = "hi".into();
         state.input.cursor_chars = 2;
         state.input_scroll = 0;
         state.input_scroll_manual = false;
         state.scroll_at(5, 8, MOUSE_SCROLL_LINES);
-        assert_eq!(state.scroll, 6, "wheel over non-overflow input falls through");
+        assert_eq!(
+            state.scroll, 6,
+            "wheel over non-overflow input falls through"
+        );
         assert_eq!(state.input_scroll, 0);
         let mut over = AppState::with_settings(TuiSettings::default());
-        over.input.text = (0..6).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        over.input.text = (0..6)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         over.input.cursor_chars = over.input.text.chars().count();
         over.last_layout = Some(LayoutRects {
-            conversation: Rect { x: 0, y: 0, width: 40, height: 6 },
-            input: Rect { x: 0, y: 7, width: 40, height: 2 },
+            conversation: Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 6,
+            },
+            input: Rect {
+                x: 0,
+                y: 7,
+                width: 40,
+                height: 2,
+            },
             popup: None,
         });
         over.scroll = 5;
@@ -3852,13 +3958,17 @@ mod tests {
         over.input_scroll = 0;
         over.input_scroll_manual = false;
         over.scroll_at(5, 8, MOUSE_SCROLL_LINES);
-        assert_eq!(over.input_scroll, 3, "wheel over overflow input scrolls input");
+        assert_eq!(
+            over.input_scroll, 3,
+            "wheel over overflow input scrolls input"
+        );
         assert_eq!(over.scroll, 5, "conversation untouched");
         over.scroll_at(5, 8, -MOUSE_SCROLL_LINES);
         assert_eq!(over.input_scroll, 0);
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn wheel_over_popup_navigates_selection() {
         let mut state = AppState::with_settings(TuiSettings::default());
         state.available_models = vec!["a".into(), "b".into(), "c".into()];
@@ -3866,10 +3976,25 @@ mod tests {
             state.reduce_key(key(KeyCode::Char(ch)));
         }
         assert!(state.popup.open);
-        let popup_rect = Rect { x: 0, y: 4, width: 20, height: 3 };
+        let popup_rect = Rect {
+            x: 0,
+            y: 4,
+            width: 20,
+            height: 3,
+        };
         state.last_layout = Some(LayoutRects {
-            conversation: Rect { x: 0, y: 0, width: 40, height: 4 },
-            input: Rect { x: 0, y: 7, width: 40, height: 2 },
+            conversation: Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 4,
+            },
+            input: Rect {
+                x: 0,
+                y: 7,
+                width: 40,
+                height: 2,
+            },
             popup: Some(popup_rect),
         });
         assert_eq!(state.popup.selected, 0);
@@ -3884,6 +4009,9 @@ mod tests {
         let mut state = AppState::with_settings(TuiSettings::default());
         state.input_scroll_manual = true;
         state.reduce_key(key(KeyCode::Char('a')));
-        assert!(!state.input_scroll_manual, "editing should reset manual flag");
+        assert!(
+            !state.input_scroll_manual,
+            "editing should reset manual flag"
+        );
     }
 }

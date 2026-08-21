@@ -80,12 +80,12 @@ Grey 是一个用 Rust 写的 Coding Agent Harness：同一套 Core 同时服务
 - 多 Agent 编排：`grey orchestrate` 并行子 agent + `grey loop` / `grey goal`
 
 **界面**
-- ratatui 对话界面：流式状态、主题（`slate` / `grey_storm` 等）、布局配置、Markdown 渲染
-- 开屏页（Grey + Gray 头像、按键/斜杠命令提示，任意键进入）
-- 多行输入：`Shift+Enter` / `Alt+Enter` 换行（行尾 `\` + Enter 兜底）、Up/Down 行内移动
-- 斜杠命令：`/help` `/clear` `/quit` `/exit` `/model <name>` `/status` `/usage` `/models`
-- 消息区滚动：滚轮 / `PageUp` / `PageDown`，自动跟随新输出
-- 独立任务行（输入框上方）；底部状态栏展示模型、分支、i/o token 与事件状态
+- ratatui 对话界面：流式状态、主题（`slate` / `grey_storm` 等）、Markdown 渲染（无边框文档流，分隔线 + footer 两端布局）
+- Pi 式 header：`Grey vX.Y.Z` + 快捷键提示（`Enter 发送 · Shift+Enter 换行 · / 命令 · \k 帮助`），随消息上滚，`/clear` 后重现
+- 输入区自适应高度（最大 40% 终端高度，超出内部滚动）；`Shift+Enter` / `Alt+Enter` 换行（行尾 `\` + Enter 兜底）、Up/Down 行内移动
+- 斜杠命令：`/help` `/clear` `/quit` `/exit` `/model <name>` `/status` `/usage` `/models`；`/` 触发补全浮窗（`↑/↓` 或 `Ctrl+N/P` 导航，`Tab/Enter` 采纳，`Esc` 关闭；`/model ` 后空格触发模型名二级补全）
+- 消息区滚动：滚轮 / `PageUp` / `PageDown`，自动跟随；补全浮窗与输入溢出时按鼠标位置分流滚轮（popup/input/会话）
+- 底部 footer 两端布局：左 `↑in ↓out · task`，右 `(provider) model (branch)`，超宽截断；仅错误时红色 `ERR`
 - 长任务完成提醒（终端鸣铃 / 强鸣铃 / 系统通知）
 
 ## 快速开始
@@ -233,13 +233,13 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
 # transport 固定为 "stdio"；env 可注入环境变量（支持 ${VAR} 展开），timeout_ms 可选
 
 [tui]
-layout = { input_lines = 6 }
+# layout.input_lines 已废弃（v0.1.1 起输入区自适应高度，最大 40% 终端高度，保留仅为兼容）
 theme = { preset = "slate", overrides = { border = "#1f2937", accent = "#60a5fa", prompt = "yellow", status_fg = "black", status_bg = "#60a5fa" } }
 completion = { enabled = true, long_running_steps = 4, long_running_seconds = 120, bell = true, strong_bell = true, notify = true, persistent = true }
 keys = { leader = "\\", help = "k", quit = "ctrl-c", clear = "ctrl-l", scroll_up = "pageup", scroll_down = "pagedown" }
 ```
 
-状态栏会展示当前任务、模型（provider/model）、分支、输入/输出 token、错误状态，并支持 `<leader>k` 打开快捷键帮助（默认 leader 为 `\`）。
+底部 footer 两端布局：左侧 `↑in ↓out · task`（`1.5k` 缩写），右侧 `(provider) model (branch)`，超宽右侧截断为 `…`；仅错误时显示红色 `ERR`。快捷键帮助由 `<leader>k` 打开（默认 leader 为 `\`），输入区以 `─` 分隔线与会话区分隔。
 
 ### 旧版配置兼容
 

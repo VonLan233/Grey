@@ -577,6 +577,9 @@ impl Default for TuiThemeConfig {
     }
 }
 
+/// Deprecated since v0.1.1: `tui.layout.input_lines` is ignored at render time.
+/// Input height is now content-driven and clamped to 40% of the frame.
+/// Kept for config compatibility.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TuiLayoutConfig {
