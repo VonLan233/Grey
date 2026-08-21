@@ -83,7 +83,7 @@ Grey 是一个用 Rust 写的 Coding Agent Harness：同一套 Core 同时服务
 - ratatui 对话界面：流式状态、主题（`slate` / `grey_storm` 等）、布局配置、Markdown 渲染
 - 开屏页（Grey + Gray 头像、按键/斜杠命令提示，任意键进入）
 - 多行输入：`Shift+Enter` / `Alt+Enter` 换行（行尾 `\` + Enter 兜底）、Up/Down 行内移动
-- 斜杠命令：`/help` `/clear` `/quit` `/exit` `/model <name>` `/usage`
+- 斜杠命令：`/help` `/clear` `/quit` `/exit` `/model <name>` `/status` `/usage` `/models`
 - 消息区滚动：滚轮 / `PageUp` / `PageDown`，自动跟随新输出
 - 独立任务行（输入框上方）；底部状态栏展示模型、分支、i/o token 与事件状态
 - 长任务完成提醒（终端鸣铃 / 强鸣铃 / 系统通知）

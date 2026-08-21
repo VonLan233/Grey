@@ -2042,7 +2042,9 @@ fn render_help_overlay(frame: &mut Frame<'_>, state: &AppState, theme: &RenderTh
         Line::from(" /clear         清空输出"),
         Line::from(" /quit  /exit   退出"),
         Line::from(" /model <name>  切换模型（下一条生效）"),
+        Line::from(" /status        查看版本/模型/分支/token"),
         Line::from(" /usage         查看累积 token 用量"),
+        Line::from(" /models        列出可用模型"),
         Line::from(""),
         Line::from("界面"),
         Line::from(" task: 输入框上方显示当前任务名".to_string()),
@@ -2111,7 +2113,7 @@ fn render_splash(frame: &mut Frame<'_>, state: &AppState) {
     body.push_line(Line::from(""));
     body.push_line(Line::from(Span::styled("斜杠命令", accent)));
     body.push_line(Line::from(Span::styled(
-        "  /help  /clear  /quit  /exit  /model <name>",
+        "  /help /clear /quit /exit /model /status /usage /models",
         dim,
     )));
     body.push_line(Line::from(""));
