@@ -34,7 +34,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame, Terminal,
 };
 use tokio::sync::{mpsc, watch};
@@ -49,6 +49,7 @@ const PERSISTENT_REMINDER_TICK: Duration = Duration::from_millis(1800);
 const TRUNCATED_MARKER: &str = "[cut]";
 pub const TUI_INPUT_LINES_MIN: u16 = 1;
 pub const TUI_INPUT_LINES_MAX: u16 = 20;
+const COMPLETION_MAX_VISIBLE_ROWS: usize = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum CompletionBell {
@@ -929,6 +930,7 @@ pub struct AppState {
     show_splash: bool,
     available_models: Vec<String>,
     popup: CompletionPopup,
+    popup_rect: Option<Rect>,
 }
 
 impl Default for AppState {
@@ -963,6 +965,7 @@ impl Default for AppState {
             show_splash: false,
             available_models: Vec::new(),
             popup: CompletionPopup::default(),
+            popup_rect: None,
         }
     }
 }
@@ -1970,9 +1973,80 @@ fn render(frame: &mut Frame<'_>, state: &mut AppState) {
     }
 
     render_status_line(frame, state, &theme, chunks[3]);
+    let popup_rect = if state.popup.open {
+        render_completion_popup(frame, state, &theme, chunks[2])
+    } else {
+        None
+    };
+    state.popup_rect = popup_rect;
     if state.show_help {
         render_help_overlay(frame, state, &theme);
     }
+}
+
+fn render_completion_popup(
+    frame: &mut Frame<'_>,
+    state: &mut AppState,
+    theme: &RenderTheme,
+    input_area: Rect,
+) -> Option<Rect> {
+    let visible = state.popup.items.len().min(COMPLETION_MAX_VISIBLE_ROWS);
+    if visible == 0 || input_area.width == 0 || input_area.height == 0 || input_area.y == 0 {
+        return None;
+    }
+    if state.popup.selected < state.popup.offset {
+        state.popup.offset = state.popup.selected;
+    } else if state.popup.selected >= state.popup.offset + visible {
+        state.popup.offset = state.popup.selected + 1 - visible;
+    }
+    let width = state
+        .popup
+        .items
+        .iter()
+        .map(|item| {
+            UnicodeWidthStr::width(item.label.as_str())
+                + UnicodeWidthStr::width(item.description.as_str())
+                + 4
+        })
+        .max()
+        .unwrap_or(0)
+        .clamp(12, usize::from(input_area.width)) as u16;
+    let area = Rect {
+        x: input_area.x,
+        y: input_area.y.saturating_sub(visible as u16),
+        width,
+        height: visible as u16,
+    };
+    if area.y >= frame.area().height {
+        return None;
+    }
+    frame.render_widget(Clear, area);
+    let highlight = Style::default()
+        .fg(theme.prompt)
+        .add_modifier(Modifier::BOLD);
+    let normal = Style::default().fg(theme.muted);
+    let mut text = Text::default();
+    for index in state.popup.offset..state.popup.offset + visible {
+        let Some(item) = state.popup.items.get(index) else {
+            break;
+        };
+        let style = if index == state.popup.selected {
+            highlight
+        } else {
+            normal
+        };
+        let line = if item.description.is_empty() {
+            Line::from(Span::styled(format!(" {}", item.label), style))
+        } else {
+            Line::from(Span::styled(
+                format!(" {}  {}", item.label, item.description),
+                style,
+            ))
+        };
+        text.push_line(line);
+    }
+    frame.render_widget(Paragraph::new(text), area);
+    Some(area)
 }
 
 fn markdown_text(source: &str, theme: &RenderTheme) -> Text<'static> {
@@ -3634,5 +3708,47 @@ mod tests {
         assert_eq!(state.input(), "/help");
         assert_eq!(state.reduce_key(key(KeyCode::Enter)), UiAction::None);
         assert!(state.show_help);
+    }
+
+    #[test]
+    fn completion_popup_renders_above_input_and_highlights_selection() {
+        let mut state = AppState::default();
+        for ch in "/".chars() {
+            state.reduce_key(key(KeyCode::Char(ch)));
+        }
+        assert!(state.popup.open);
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        let rows = rendered_rows(&terminal);
+        assert!(
+            rows.iter().any(|row| row.contains("/help")),
+            "popup should render /help label, rows={rows:?}"
+        );
+        // wide chars occupy two cells; TestBackend inserts a filler space between them
+        assert!(
+            rows.iter()
+                .any(|row| row.replace(' ', "").contains("显示帮助")),
+            "popup should render description, rows={rows:?}"
+        );
+        state.reduce_key(key(KeyCode::Down));
+        let mut terminal2 = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal2.draw(|frame| render(frame, &mut state)).unwrap();
+        let rows2 = rendered_rows(&terminal2);
+        assert!(rows2.iter().any(|row| row.contains("/help")));
+    }
+
+    #[test]
+    fn model_secondary_completion_lists_available_models() {
+        let mut state = AppState::default();
+        state.available_models = vec!["gpt-5".into(), "claude-4".into(), "gemini-2".into()];
+        for ch in "/model ".chars() {
+            state.reduce_key(key(KeyCode::Char(ch)));
+        }
+        assert!(state.popup.open, "second-level popup should be open");
+        assert_eq!(state.popup.items.len(), 3);
+        state.reduce_key(key(KeyCode::Char('g')));
+        assert_eq!(state.popup.items.len(), 2);
+        state.reduce_key(key(KeyCode::Tab));
+        assert_eq!(state.input(), "/model gpt-5");
     }
 }
