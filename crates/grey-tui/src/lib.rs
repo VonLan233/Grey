@@ -1883,6 +1883,10 @@ fn render_status_line(frame: &mut Frame<'_>, state: &AppState, theme: &RenderThe
         .map_or(("-", "-"), |(provider, model)| (provider, model));
     let status = Line::from(vec![
         Span::styled(
+            format!(" v{} ", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(theme.muted),
+        ),
+        Span::styled(
             format!(" model:{provider_label}/{model_label} "),
             Style::default().fg(theme.status_fg),
         ),
