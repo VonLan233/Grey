@@ -500,6 +500,25 @@ pub enum UiAction {
     Quit,
 }
 
+/// One `/` command: name, aliases, argument hint and description for the completion popup.
+#[derive(Debug, Clone)]
+struct CommandSpec {
+    name: &'static str,
+    aliases: &'static [&'static str],
+    args_hint: &'static str,
+    description: &'static str,
+}
+
+const COMMANDS: &[CommandSpec] = &[
+    CommandSpec { name: "help", aliases: &["?"], args_hint: "", description: "显示帮助" },
+    CommandSpec { name: "clear", aliases: &[], args_hint: "", description: "清空输出" },
+    CommandSpec { name: "quit", aliases: &["exit"], args_hint: "", description: "退出 Grey" },
+    CommandSpec { name: "model", aliases: &[], args_hint: "<name>", description: "切换模型（下一条生效）" },
+    CommandSpec { name: "usage", aliases: &["tokens"], args_hint: "", description: "查看累积 token 用量" },
+    CommandSpec { name: "status", aliases: &[], args_hint: "", description: "查看版本/模型/分支/token" },
+    CommandSpec { name: "models", aliases: &[], args_hint: "", description: "列出可用模型" },
+];
+
 /// A `/`-prefixed command parsed from the input line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SlashCommand {
@@ -515,20 +534,22 @@ enum SlashCommand {
 
 impl SlashCommand {
     fn parse(input: &str) -> Self {
-        let body = input.strip_prefix('/').unwrap_or(input).trim();
+        let trimmed = input.trim();
+        let body = trimmed.strip_prefix('/').unwrap_or(trimmed).trim();
         let (name, argument) = body.split_once(char::is_whitespace).unwrap_or((body, ""));
         let name = name.trim().to_ascii_lowercase();
-        match name.as_str() {
-            "help" | "?" => Self::Help,
-            "clear" => Self::Clear,
-            "quit" | "exit" => Self::Quit,
-            "model" => Self::Model {
-                model: argument.trim().to_owned(),
-            },
-            "usage" | "tokens" => Self::Usage,
-            "status" => Self::Status,
-            "models" => Self::Models,
-            other => Self::Unknown(other.to_owned()),
+        let spec = COMMANDS.iter().find(|spec| {
+            spec.name == name || spec.aliases.contains(&name.as_str())
+        });
+        match spec.map(|spec| spec.name) {
+            Some("help") => Self::Help,
+            Some("clear") => Self::Clear,
+            Some("quit") => Self::Quit,
+            Some("model") => Self::Model { model: argument.trim().to_owned() },
+            Some("usage") => Self::Usage,
+            Some("status") => Self::Status,
+            Some("models") => Self::Models,
+            _ => Self::Unknown(name),
         }
     }
 }
@@ -3332,5 +3353,35 @@ mod tests {
 
         assert!(!finished.recv_timeout(Duration::from_millis(250)).unwrap());
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn command_registry_covers_every_parsed_command() {
+        for spec in COMMANDS {
+            let parsed = SlashCommand::parse(&format!("/{}", spec.name));
+            assert_ne!(
+                parsed,
+                SlashCommand::Unknown(spec.name.to_string()),
+                "spec `{}` not matched by parse",
+                spec.name
+            );
+        }
+        assert_eq!(SlashCommand::parse("/?"), SlashCommand::Help);
+        assert_eq!(SlashCommand::parse("/exit"), SlashCommand::Quit);
+        assert_eq!(SlashCommand::parse("/tokens"), SlashCommand::Usage);
+        assert_eq!(SlashCommand::parse("/HELP"), SlashCommand::Help);
+        assert_eq!(SlashCommand::parse("  /clear  "), SlashCommand::Clear);
+        assert_eq!(
+            SlashCommand::parse("/model"),
+            SlashCommand::Model { model: String::new() }
+        );
+        assert_eq!(
+            SlashCommand::parse("/model gpt-5"),
+            SlashCommand::Model { model: "gpt-5".into() }
+        );
+        assert_eq!(
+            SlashCommand::parse("/bogus"),
+            SlashCommand::Unknown("bogus".into())
+        );
     }
 }
