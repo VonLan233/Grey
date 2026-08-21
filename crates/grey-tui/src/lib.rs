@@ -2863,7 +2863,7 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
         let rows = rendered_rows(&terminal);
         assert!(
-            rows.iter().any(|row| row.contains("/model <name>")),
+            rows.iter().any(|row| row.contains("/models")),
             "splash renders slash-command hints"
         );
         assert!(rows.iter().any(|row| row.contains("Grey")));
