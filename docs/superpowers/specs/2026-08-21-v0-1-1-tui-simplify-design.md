@@ -91,8 +91,8 @@ static COMMANDS: &[CommandSpec] = &[ /* help clear quit exit model usage status 
 
 - 左段（dim）：`↑{in} ↓{out}`（<1000 原样，≥1000 缩写 `1.2k`）；
   有任务标签时追加 `· task:{name}`；仅 `status_has_error()` 时追加红色 `ERR`。
-- 右段（dim）：`({provider}) {model} ({branch})`；provider 仅在多 provider 时显示
-  （沿用 pi 规则）；branch 为空则省略括号段。
+- 右段（dim）：`({provider}) {model} ({branch})`；provider/branch 缺失时各自省略
+  括号段（Grey 无 provider 计数数据源，不实现 pi 的多 provider 才显示规则）。
 - 宽度不足：左段优先完整，右段截断加 `…`；仍不足则只渲染左段。
 - 版本号只在 header 与 `/status` 出现；快捷键提示只在 header 与 help overlay。
 
