@@ -519,6 +519,92 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec { name: "models", aliases: &[], args_hint: "", description: "列出可用模型" },
 ];
 
+/// One candidate row in the slash-command completion popup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompletionItem {
+    /// Full new input text after accepting this item.
+    replaces: String,
+    /// Left column shown in the popup, e.g. `/model <name>`.
+    label: String,
+    /// Right column shown in the popup.
+    description: String,
+}
+
+/// Neovim-style popup state for `/` command completion.
+#[derive(Debug, Clone, Default)]
+struct CompletionPopup {
+    items: Vec<CompletionItem>,
+    selected: usize,
+    offset: usize,
+    open: bool,
+}
+
+impl CompletionPopup {
+    /// Recompute candidates from the current input; closes when nothing matches.
+    fn sync(&mut self, input: &str, available_models: &[String]) {
+        self.items.clear();
+        self.selected = 0;
+        self.offset = 0;
+        self.open = false;
+        if let Some(rest) = input.strip_prefix("/model ") {
+            let argument = rest.trim_start();
+            self.items = available_models
+                .iter()
+                .filter(|model| model.starts_with(argument))
+                .map(|model| CompletionItem {
+                    replaces: format!("/model {model}"),
+                    label: format!("/model {model}"),
+                    description: String::new(),
+                })
+                .collect();
+            self.open = !self.items.is_empty();
+            return;
+        }
+        if input.starts_with('/') && !input[1..].contains(char::is_whitespace) {
+            let prefix = input[1..].to_ascii_lowercase();
+            self.items = COMMANDS
+                .iter()
+                .filter(|spec| {
+                    spec.name.starts_with(&prefix)
+                        || spec.aliases.iter().any(|alias| alias.starts_with(&prefix))
+                })
+                .map(|spec| CompletionItem {
+                    replaces: if spec.name == "model" {
+                        "/model ".to_string()
+                    } else {
+                        format!("/{}", spec.name)
+                    },
+                    label: if spec.args_hint.is_empty() {
+                        format!("/{}", spec.name)
+                    } else {
+                        format!("/{} {}", spec.name, spec.args_hint)
+                    },
+                    description: spec.description.to_string(),
+                })
+                .collect();
+            self.open = !self.items.is_empty();
+        }
+    }
+
+    fn select_next(&mut self) {
+        if self.items.is_empty() {
+            return;
+        }
+        self.selected = (self.selected + 1) % self.items.len();
+    }
+
+    fn select_prev(&mut self) {
+        if self.items.is_empty() {
+            return;
+        }
+        self.selected = (self.selected + self.items.len() - 1) % self.items.len();
+    }
+
+    fn selected_item(&self) -> Option<&CompletionItem> {
+        self.items.get(self.selected)
+    }
+}
+
 /// A `/`-prefixed command parsed from the input line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SlashCommand {
@@ -842,6 +928,7 @@ pub struct AppState {
     leader_armed: bool,
     show_splash: bool,
     available_models: Vec<String>,
+    popup: CompletionPopup,
 }
 
 impl Default for AppState {
@@ -875,6 +962,7 @@ impl Default for AppState {
             leader_armed: false,
             show_splash: false,
             available_models: Vec::new(),
+            popup: CompletionPopup::default(),
         }
     }
 }
@@ -991,6 +1079,17 @@ impl AppState {
         self.scroll = 0;
         self.max_scroll = 0;
         self.status_error = false;
+        self.dirty = true;
+    }
+
+    fn accept_completion(&mut self) {
+        let Some(item) = self.popup.selected_item() else {
+            return;
+        };
+        self.input.text = item.replaces.clone();
+        self.input.cursor_chars = self.input.text.chars().count();
+        let text = self.input.text.clone();
+        self.popup.sync(&text, &self.available_models);
         self.dirty = true;
     }
 
@@ -1288,6 +1387,54 @@ impl AppState {
             return UiAction::None;
         }
 
+        if self.popup.open {
+            match key.code {
+                KeyCode::Up => {
+                    self.popup.select_prev();
+                    self.dirty = true;
+                    return UiAction::None;
+                }
+                KeyCode::Down => {
+                    self.popup.select_next();
+                    self.dirty = true;
+                    return UiAction::None;
+                }
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.popup.select_prev();
+                    self.dirty = true;
+                    return UiAction::None;
+                }
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.popup.select_next();
+                    self.dirty = true;
+                    return UiAction::None;
+                }
+                KeyCode::Tab => {
+                    self.accept_completion();
+                    return UiAction::None;
+                }
+                KeyCode::Esc => {
+                    self.popup.open = false;
+                    self.dirty = true;
+                    return UiAction::None;
+                }
+                KeyCode::Enter
+                    if !key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                {
+                    let exact = self.popup.selected_item().is_some_and(|item| {
+                        SlashCommand::parse(&item.replaces) == SlashCommand::parse(&self.input.text)
+                    });
+                    if exact {
+                        self.popup.open = false;
+                    } else {
+                        self.accept_completion();
+                        return UiAction::None;
+                    }
+                }
+                _ => {}
+            }
+        }
+
         if key.code == KeyCode::Esc && self.input.text.is_empty() {
             return UiAction::Quit;
         }
@@ -1330,9 +1477,11 @@ impl AppState {
                     return UiAction::None;
                 }
                 if self.input.text.starts_with('/') {
+                    self.popup.open = false;
                     return self.apply_slash_command();
                 }
                 let rejected_input = self.input.take();
+                self.popup.open = false;
                 let prompt = rejected_input.trim().to_owned();
                 self.dirty = true;
                 if prompt.is_empty() {
@@ -1346,6 +1495,13 @@ impl AppState {
             _ => false,
         };
         self.dirty |= changed;
+        if changed {
+            let text = self.input.text.clone();
+            self.popup.sync(&text, &self.available_models);
+            if self.popup.open {
+                self.dirty = true;
+            }
+        }
         UiAction::None
     }
 
@@ -3383,5 +3539,100 @@ mod tests {
             SlashCommand::parse("/bogus"),
             SlashCommand::Unknown("bogus".into())
         );
+    }
+
+    fn with_popup_state(models: &[&str]) -> AppState {
+        let mut state = AppState::default();
+        state.available_models = models.iter().map(|s| s.to_string()).collect();
+        state
+    }
+
+    #[test]
+    fn completion_popup_filters_by_prefix_and_wraps_navigation() {
+        let mut popup = CompletionPopup::default();
+        popup.sync("/", &[]);
+        assert!(popup.open);
+        assert_eq!(popup.items.len(), COMMANDS.len());
+        popup.sync("/he", &[]);
+        assert!(popup.open);
+        assert_eq!(popup.items.len(), 1);
+        assert_eq!(popup.items[0].label, "/help");
+        popup.sync("/HE", &[]);
+        assert_eq!(popup.items.len(), 1);
+        let mut popup2 = CompletionPopup::default();
+        popup2.sync("/?", &[]);
+        assert!(popup2.open);
+        assert!(popup2.items.iter().any(|item| item.label == "/help"));
+        let mut empty = CompletionPopup::default();
+        empty.sync("/bogus", &[]);
+        assert!(!empty.open);
+        assert!(empty.items.is_empty());
+        let mut spaced = CompletionPopup::default();
+        spaced.sync("/help foo", &[]);
+        assert!(!spaced.open);
+        let mut nav = CompletionPopup::default();
+        nav.sync("/", &[]);
+        let len = nav.items.len();
+        assert!(len >= 2);
+        assert_eq!(nav.selected, 0);
+        nav.select_next();
+        assert_eq!(nav.selected, 1);
+        nav.select_prev();
+        assert_eq!(nav.selected, 0);
+        nav.select_prev();
+        assert_eq!(nav.selected, len - 1);
+    }
+
+    #[test]
+    fn completion_accept_replaces_input_and_resyncs() {
+        let mut state = with_popup_state(&[]);
+        for ch in "/mod".chars() {
+            state.reduce_key(key(KeyCode::Char(ch)));
+        }
+        assert!(state.popup.open, "popup should be open for /mod");
+        let replaces = state.popup.selected_item().unwrap().replaces.clone();
+        state.accept_completion();
+        assert_eq!(state.input(), replaces);
+        assert_eq!(state.input(), "/model ");
+    }
+
+    #[test]
+    fn popup_keys_navigate_accept_and_dismiss() {
+        let mut state = with_popup_state(&[]);
+        for ch in "/".chars() {
+            state.reduce_key(key(KeyCode::Char(ch)));
+        }
+        assert!(state.popup.open);
+        state.reduce_key(key(KeyCode::Down));
+        assert_eq!(state.popup.selected, 1);
+        state.reduce_key(key(KeyCode::Up));
+        assert_eq!(state.popup.selected, 0);
+        state.reduce_key(key_with(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert_eq!(state.popup.selected, 1);
+        state.reduce_key(key_with(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert_eq!(state.popup.selected, 0);
+        let before = state.popup.selected_item().unwrap().replaces.clone();
+        state.reduce_key(key(KeyCode::Tab));
+        assert_eq!(state.input(), before);
+        let mut state2 = with_popup_state(&[]);
+        for ch in "/h".chars() {
+            state2.reduce_key(key(KeyCode::Char(ch)));
+        }
+        assert!(state2.popup.open);
+        state2.reduce_key(key(KeyCode::Esc));
+        assert!(!state2.popup.open);
+    }
+
+    #[test]
+    fn enter_accepts_or_executes_exact_match() {
+        let mut state = with_popup_state(&[]);
+        for ch in "/hel".chars() {
+            state.reduce_key(key(KeyCode::Char(ch)));
+        }
+        assert!(state.popup.open);
+        assert_eq!(state.reduce_key(key(KeyCode::Enter)), UiAction::None);
+        assert_eq!(state.input(), "/help");
+        assert_eq!(state.reduce_key(key(KeyCode::Enter)), UiAction::None);
+        assert!(state.show_help);
     }
 }
