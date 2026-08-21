@@ -48,6 +48,8 @@ const TRUNCATED_MARKER: &str = "[cut]";
 pub const TUI_INPUT_LINES_MIN: u16 = 1;
 pub const TUI_INPUT_LINES_MAX: u16 = 20;
 const COMPLETION_MAX_VISIBLE_ROWS: usize = 6;
+const INPUT_PROMPT: &str = "> ";
+const INPUT_PROMPT_WIDTH: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum CompletionBell {
@@ -928,6 +930,24 @@ pub struct AppState {
     available_models: Vec<String>,
     popup: CompletionPopup,
     popup_rect: Option<Rect>,
+    last_layout: Option<LayoutRects>,
+    input_scroll_manual: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+struct LayoutRects {
+    conversation: Rect,
+    input: Rect,
+    popup: Option<Rect>,
+}
+
+#[allow(dead_code)]
+fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
+    column >= rect.x
+        && column < rect.x.saturating_add(rect.width)
+        && row >= rect.y
+        && row < rect.y.saturating_add(rect.height)
 }
 
 impl Default for AppState {
@@ -962,6 +982,8 @@ impl Default for AppState {
             available_models: Vec::new(),
             popup: CompletionPopup::default(),
             popup_rect: None,
+            last_layout: None,
+            input_scroll_manual: false,
         }
     }
 }
@@ -1026,10 +1048,12 @@ impl AppState {
             .zip(self.current_model.as_deref())
     }
 
+    #[allow(dead_code)]
     fn current_task_label(&self) -> &str {
         self.current_task.as_deref().unwrap_or("-")
     }
 
+    #[allow(dead_code)]
     fn branch_label(&self) -> &str {
         self.branch.as_deref().unwrap_or("-")
     }
@@ -1190,6 +1214,7 @@ impl AppState {
         }
     }
 
+    #[allow(dead_code)]
     fn completion_notice(&self) -> Option<&str> {
         self.persistent_completion_message.as_deref()
     }
@@ -1894,14 +1919,88 @@ fn trigger_completion_notification(_config: &CompletionSettings, message: String
         .map_err(|error| anyhow::anyhow!(error))
 }
 
+fn format_tokens(count: u64) -> String {
+    if count < 1000 {
+        count.to_string()
+    } else {
+        format!("{:.1}k", count as f64 / 1000.0)
+    }
+}
+
+fn truncate_to_width(text: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_string();
+    }
+    let mut truncated = String::new();
+    let mut used = 1usize;
+    for character in text.chars() {
+        let width = UnicodeWidthStr::width(character.to_string().as_str());
+        if used + width > max_width {
+            break;
+        }
+        truncated.push(character);
+        used += width;
+    }
+    format!("{truncated}…")
+}
+
+fn render_footer(frame: &mut Frame<'_>, state: &AppState, theme: &RenderTheme, area: Rect) {
+    let dim = Style::default().fg(theme.muted);
+    let (input_tokens, output_tokens) = state.total_usage();
+    let mut left_spans = vec![Span::styled(
+        format!("↑{} ↓{}", format_tokens(input_tokens), format_tokens(output_tokens)),
+        dim,
+    )];
+    if let Some(task) = state.current_task.as_deref() {
+        left_spans.push(Span::styled(format!(" · task:{task}"), dim));
+    }
+    if state.status_has_error() {
+        left_spans.push(Span::styled(
+            " ERR",
+            Style::default()
+                .fg(theme.error)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    let left_width: usize = left_spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum();
+    let (provider, model_label) = state
+        .model_info()
+        .map_or((None, "-".to_string()), |(provider, model)| {
+            (Some(provider.to_string()), model.to_string())
+        });
+    let mut right = match provider {
+        Some(provider) => format!("({provider}) {model_label}"),
+        None => model_label,
+    };
+    if let Some(branch) = state.branch.as_deref() {
+        right.push_str(&format!(" ({branch})"));
+    }
+    let width = usize::from(area.width);
+    let min_gap = 2usize;
+    let right_width = UnicodeWidthStr::width(right.as_str());
+    let right_final = if left_width + min_gap + right_width <= width {
+        right
+    } else {
+        let available = width.saturating_sub(left_width + min_gap);
+        truncate_to_width(&right, available)
+    };
+    let right_actual_width = UnicodeWidthStr::width(right_final.as_str());
+    let padding = width.saturating_sub(left_width + right_actual_width);
+    let mut spans = left_spans;
+    spans.push(Span::raw(" ".repeat(padding)));
+    spans.push(Span::styled(right_final, dim));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
 fn render(frame: &mut Frame<'_>, state: &mut AppState) {
     let theme = state.settings.theme.colors.clone();
-    let prompt_width = UnicodeWidthStr::width("> ");
+    let prompt_width = INPUT_PROMPT_WIDTH;
     let frame_width = usize::from(frame.area().width);
     let visual_rows = state.input_visual_lines(frame_width, prompt_width).len();
-    // bordered input needs +2 for top/bottom borders; keep outer at least 3
-    let max_outer = (u32::from(frame.area().height) * 40 / 100).max(3) as u16;
-    let input_height = (visual_rows as u16 + 2).clamp(3, max_outer);
+    let input_height = input_area_height(visual_rows, frame.area().height);
     let chunks = Layout::vertical([
         Constraint::Min(0),
         Constraint::Length(1),
@@ -1910,36 +2009,30 @@ fn render(frame: &mut Frame<'_>, state: &mut AppState) {
     ])
     .split(frame.area());
 
-    let conversation_block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Grey ")
-        .border_style(Style::default().fg(theme.border));
-    let conversation_inner = conversation_block.inner(chunks[0]);
-    state.update_viewport(conversation_inner.width, conversation_inner.height);
+    state.update_viewport(chunks[0].width, chunks[0].height);
     let conversation = Paragraph::new(markdown_text(state.output.as_str(), &theme))
-        .block(conversation_block)
         .wrap(Wrap { trim: false })
         .scroll((state.scroll, 0));
     frame.render_widget(conversation, chunks[0]);
 
-    render_task_line(frame, state, &theme, chunks[1]);
+    let separator = Paragraph::new(Line::from(Span::styled(
+        "─".repeat(usize::from(chunks[1].width)),
+        Style::default().fg(theme.muted),
+    )));
+    frame.render_widget(separator, chunks[1]);
 
-    let input_block = Block::default()
-        .borders(Borders::ALL)
-        .title(" input ")
-        .border_style(Style::default().fg(theme.border))
-        .style(Style::default().fg(theme.accent));
-    let input_inner = input_block.inner(chunks[2]);
+    let input_inner = chunks[2];
     let prompt = Span::styled(
-        "> ",
+        INPUT_PROMPT,
         Style::default()
             .fg(theme.prompt)
             .add_modifier(Modifier::BOLD),
     );
-    let prompt_width = UnicodeWidthStr::width("> ");
     let input_width = usize::from(input_inner.width);
     let input_visible_rows = usize::from(input_inner.height);
-    state.input_scroll(input_width, prompt_width, input_visible_rows);
+    if !state.input_scroll_manual {
+        state.input_scroll(input_width, prompt_width, input_visible_rows);
+    }
     let mut input_text = Text::default();
     for (index, visual_line) in state
         .input_visual_lines(input_width, prompt_width)
@@ -1956,7 +2049,6 @@ fn render(frame: &mut Frame<'_>, state: &mut AppState) {
         }
     }
     let input = Paragraph::new(input_text)
-        .block(input_block)
         .style(Style::default().fg(Color::White))
         .scroll((state.input_scroll, 0));
     frame.render_widget(input, chunks[2]);
@@ -1973,13 +2065,18 @@ fn render(frame: &mut Frame<'_>, state: &mut AppState) {
         frame.set_cursor_position((cursor_x, cursor_y));
     }
 
-    render_status_line(frame, state, &theme, chunks[3]);
+    render_footer(frame, state, &theme, chunks[3]);
     let popup_rect = if state.popup.open {
         render_completion_popup(frame, state, &theme, chunks[2])
     } else {
         None
     };
     state.popup_rect = popup_rect;
+    state.last_layout = Some(LayoutRects {
+        conversation: chunks[0],
+        input: chunks[2],
+        popup: popup_rect,
+    });
     if state.show_help {
         render_help_overlay(frame, state, &theme);
     }
@@ -2182,85 +2279,6 @@ fn markdown_text(source: &str, theme: &RenderTheme) -> Text<'static> {
     }
     flush(&mut line, &mut text);
     text
-}
-
-fn render_task_line(frame: &mut Frame<'_>, state: &AppState, theme: &RenderTheme, area: Rect) {
-    let line = Line::from(vec![
-        Span::styled(
-            " task: ",
-            Style::default()
-                .fg(theme.status_fg)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            state.current_task_label(),
-            Style::default().fg(theme.status_fg),
-        ),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
-}
-
-fn render_status_line(frame: &mut Frame<'_>, state: &AppState, theme: &RenderTheme, area: Rect) {
-    let labels = state.settings.keys.labels();
-    let (total_input_tokens, total_output_tokens) = state.total_usage();
-    let (provider_label, model_label) = state
-        .model_info()
-        .map_or(("-", "-"), |(provider, model)| (provider, model));
-    let status = Line::from(vec![
-        Span::styled(
-            format!(" v{} ", env!("CARGO_PKG_VERSION")),
-            Style::default().fg(theme.muted),
-        ),
-        Span::styled(
-            format!(" model:{provider_label}/{model_label} "),
-            Style::default().fg(theme.status_fg),
-        ),
-        Span::styled(
-            format!(" branch:{} ", state.branch_label()),
-            Style::default().fg(theme.status_fg),
-        ),
-        Span::styled(
-            format!(" i:{total_input_tokens} o:{total_output_tokens} "),
-            Style::default().fg(theme.status_fg),
-        ),
-        if state.status_has_error() {
-            Span::styled(
-                " [ERR] ",
-                Style::default()
-                    .fg(theme.error)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Span::styled(" [OK] ", Style::default().fg(theme.success))
-        },
-        Span::styled(
-            format!(" {} ", state.status),
-            Style::default().fg(theme.status_fg),
-        ),
-        if state.completion_notice().is_some() {
-            Span::styled(
-                " [HOLD] ",
-                Style::default()
-                    .fg(theme.warning)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Span::raw("")
-        },
-        Span::styled(
-            format!(
-                " {}+{}:help  {}:quit  {}:clear  {}:up  {}:down ",
-                labels.leader,
-                labels.help,
-                labels.quit,
-                labels.clear,
-                labels.scroll_up,
-                labels.scroll_down
-            ),
-            Style::default().fg(theme.muted),
-        ),
-    ]);
-    frame.render_widget(Paragraph::new(status), area);
 }
 
 fn render_help_overlay(frame: &mut Frame<'_>, state: &AppState, theme: &RenderTheme) {
@@ -2845,29 +2863,23 @@ mod tests {
         assert_eq!(state.scroll(), 5);
         assert!(state.follows_output());
 
-        // 11 rows: 1 task + 3 input + 1 status leaves the conversation
-        // inner area 4 rows tall, matching the viewport used above.
-        let backend = TestBackend::new(30, 11);
+        // 7 rows: 1 separator + 1 input + 1 footer leaves conversation 4 rows tall,
+        // matching the viewport used above (borderless layout).
+        let backend = TestBackend::new(30, 7);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
-        let tail_row: String = terminal.backend().buffer().content[31..59]
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect();
+        let rows = rendered_rows(&terminal);
         assert!(
-            tail_row.contains("line-5"),
-            "non-zero scroll offset was not rendered: {tail_row:?}"
+            rows.iter().any(|row| row.contains("line-5")),
+            "non-zero scroll offset was not rendered: {rows:?}"
         );
 
         state.reduce_key(key(KeyCode::PageUp));
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
-        let row: String = terminal.backend().buffer().content[31..59]
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect();
+        let rows2 = rendered_rows(&terminal);
         assert!(
-            row.contains("line-0"),
-            "scroll offset was not rendered: {row:?}"
+            rows2.iter().any(|row| row.contains("line-0")),
+            "scroll offset was not rendered: {rows2:?}"
         );
     }
 
@@ -2883,18 +2895,15 @@ mod tests {
         for (i, row) in rows.iter().enumerate() {
             println!("[ROW {i}] {row:?}");
         }
-        // cursor should sit on the last line ("second line" -> col 11, row after the wrapped first line)
-        // real input inner width is 18 (20 - 2 borders); cursor at the end of
-        // the second logical line sits below the wrapped first line
-        let (column, row) = state.input_cursor_position(18, 2);
+        // borderless layout: input width is full frame width
+        let (column, row) = state.input_cursor_position(20, 2);
         assert_eq!(column, 11, "cursor column on the last line");
         assert_eq!(row, 2, "cursor row below the wrapped first line");
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
         let rows = rendered_rows(&terminal);
         assert!(
-            rows[5].contains("second line"),
-            "cursor line must be visible after auto-scroll, got {:?}",
-            rows[5]
+            rows.iter().any(|row| row.contains("second line")),
+            "cursor line must be visible after auto-scroll, got {rows:?}"
         );
     }
 
@@ -3005,40 +3014,6 @@ mod tests {
     }
 
     #[test]
-    fn task_line_sits_above_input_and_status_is_decluttered() {
-        let mut state = AppState {
-            current_task: Some("refactor parser".into()),
-            ..Default::default()
-        };
-        let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
-        terminal.draw(|frame| render(frame, &mut state)).unwrap();
-        let rows = rendered_rows(&terminal);
-        let task_index = rows
-            .iter()
-            .position(|row| row.contains("task: refactor parser"))
-            .expect("task line rendered");
-        let prompt_index = rows
-            .iter()
-            .position(|row| row.contains("> "))
-            .expect("input prompt rendered");
-        let status_index = rows
-            .iter()
-            .position(|row| row.contains("model:") && row.contains("branch:"))
-            .expect("status bar rendered");
-        assert!(task_index < prompt_index, "task line above input");
-        assert!(prompt_index < status_index, "status below input");
-        assert!(
-            rows.iter()
-                .all(|row| !row.contains("fps") && !row.contains("GREY")),
-            "status bar is decluttered"
-        );
-        assert!(
-            rows[status_index].contains(" [OK] "),
-            "status keeps error indicator"
-        );
-    }
-
-    #[test]
     fn slash_status_and_models_report_into_the_transcript() {
         let mut state = AppState {
             current_provider: Some("volcano".into()),
@@ -3093,34 +3068,29 @@ mod tests {
         let mut state = AppState::default();
         let mut terminal = Terminal::new(TestBackend::new(100, 10)).unwrap();
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
-        assert!(terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .any(|cell| cell.symbol() == "[" && cell.fg == Color::Green));
+        let rows = rendered_rows(&terminal);
+        let footer = rows.last().unwrap();
+        assert!(footer.contains("↑") && footer.contains("↓"), "footer should contain usage arrows, footer={footer:?}");
+        assert!(!footer.contains("[OK]"), "footer decluttered, no [OK], footer={footer:?}");
 
         let mut config = TuiConfig::default();
         config.completion.persistent = true;
         let mut held = AppState::with_settings(TuiSettings::from(&config));
         held.schedule_completion_notice("done".into());
-        terminal.draw(|frame| render(frame, &mut held)).unwrap();
-        assert!(terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .any(|cell| cell.symbol() == "[" && cell.fg == Color::Yellow));
+        assert!(held.completion_notice().is_some(), "persistent notice should be stored");
 
         state.reduce_agent_event(AgentEvent::Failed("boom".into()));
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        let rows_err = rendered_rows(&terminal);
+        let footer_err = rows_err.last().unwrap();
+        assert!(footer_err.contains("ERR"), "error footer should contain ERR, footer={footer_err:?}");
         let error = Color::Rgb(0xff, 0x7b, 0x72);
         assert!(terminal
             .backend()
             .buffer()
             .content
             .iter()
-            .any(|cell| cell.symbol() == "[" && cell.fg == error));
+            .any(|cell| cell.fg == error), "error color should appear");
     }
 
     #[test]
@@ -3155,6 +3125,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(dead_code)]
     fn completion_notice_persistence_controls_hold_and_repeat_interval() {
         let mut config = TuiConfig::default();
         config.completion.notify = true;
@@ -3171,6 +3142,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(dead_code)]
     fn completion_notice_is_cleared_on_new_turn() {
         let mut config = TuiConfig::default();
         config.completion.notify = true;
@@ -3721,5 +3693,77 @@ mod tests {
         terminal2.draw(|frame| render(frame, &mut tall)).unwrap();
         // 40% * 14 = 5, 12 visual rows clamped to 5 so input_scroll should be >0
         assert!(tall.input_scroll > 0, "overflow should scroll, input_scroll={}", tall.input_scroll);
+    }
+
+    #[test]
+    fn format_tokens_abbreviates_thousands() {
+        assert_eq!(format_tokens(0), "0");
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(1000), "1.0k");
+        assert_eq!(format_tokens(1532), "1.5k");
+        assert_eq!(format_tokens(10000), "10.0k");
+    }
+
+    #[test]
+    fn truncate_to_width_keeps_within_limit() {
+        assert_eq!(truncate_to_width("hello", 10), "hello");
+        assert_eq!(truncate_to_width("hello", 5), "hello");
+        let truncated = truncate_to_width("hello world", 8);
+        assert!(UnicodeWidthStr::width(truncated.as_str()) <= 8);
+        assert!(truncated.ends_with('…'));
+    }
+
+    #[test]
+    fn footer_shows_usage_model_branch_two_end_layout() {
+        let mut state = AppState::with_settings(TuiSettings::default());
+        state.total_input_tokens = 1500;
+        state.total_output_tokens = 42;
+        state.current_provider = Some("openai".into());
+        state.current_model = Some("gpt-5".into());
+        state.branch = Some("main".into());
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        let rows = rendered_rows(&terminal);
+        let footer = rows.last().unwrap();
+        assert!(footer.contains("↑1.5k ↓42"), "left usage stats, footer={footer:?}");
+        assert!(
+            footer.contains("(openai) gpt-5 (main)"),
+            "right identity, footer={footer:?}"
+        );
+    }
+
+    #[test]
+    fn footer_truncates_right_side_on_narrow_terminal() {
+        let mut state = AppState::with_settings(TuiSettings::default());
+        state.current_provider = Some("openai".into());
+        state.current_model = Some("a-very-long-model-name-that-overflows".into());
+        state.branch = Some("main".into());
+        let mut terminal = Terminal::new(TestBackend::new(30, 10)).unwrap();
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        let rows = rendered_rows(&terminal);
+        let footer = rows.last().unwrap();
+        assert!(footer.contains('…'), "right side truncated, footer={footer:?}");
+        assert!(footer.contains("↑0 ↓0"), "left side kept");
+    }
+
+    #[test]
+    fn conversation_has_no_borders_and_separator_divides_input() {
+        let mut state = AppState::with_settings(TuiSettings::default());
+        state.append_output("hello transcript");
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        let rows = rendered_rows(&terminal);
+        assert!(
+            rows.iter().all(|row| !row.contains('┌') && !row.contains('┐')),
+            "no box-drawing borders, rows={rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.starts_with('─')),
+            "separator line, rows={rows:?}"
+        );
+        assert!(
+            rows.iter().all(|row| !row.contains(" fps") && !row.contains("GREY")),
+            "status decluttered"
+        );
     }
 }
