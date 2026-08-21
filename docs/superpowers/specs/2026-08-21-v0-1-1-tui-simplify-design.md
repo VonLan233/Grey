@@ -96,7 +96,16 @@ static COMMANDS: &[CommandSpec] = &[ /* help clear quit exit model usage status 
 - 宽度不足：左段优先完整，右段截断加 `…`；仍不足则只渲染左段。
 - 版本号只在 header 与 `/status` 出现；快捷键提示只在 header 与 help overlay。
 
-### 6. Taste 审核 checklist（review 门禁）
+### 6. 滚轮支持（按鼠标位置划分语义）
+
+- 会话区：保持现状 —— 滚轮滚动历史 + PageUp/PageDown + auto-follow。
+- 补全浮动窗：候选数超过窗高时，滚轮滚动候选列表，选中项始终跟随可见
+  （窗口内偏移，不影响会话区滚动）。
+- 输入区：仅当内容超过 MAX 高度、处于内部滚动态时，滚轮滚动输入内容；
+  否则该区域滚轮事件穿透给会话区。
+- 判定依据为鼠标事件坐标落在哪个区域，与视觉分区一致。
+
+### 7. Taste 审核 checklist（review 门禁）
 
 1. 无边框、无区块标题；持久 UI 仅分隔线 + footer 各一行。
 2. 装饰色只允许 accent/dim(muted)/prompt 三种用途；错误红仅在错误态出现。
@@ -117,6 +126,7 @@ static COMMANDS: &[CommandSpec] = &[ /* help clear quit exit model usage status 
   - Footer：k 缩写、两端布局 padding、右段截断、错误态 ERR、缺 branch/provider。
   - 输入高度：clamp 边界（1 行、恰好 MAX、超 MAX）、MAX 随终端高度变化。
   - Header：文本生成含动态 keybinding labels；`/clear` 后重现。
+  - 滚轮：补全窗列表滚动边界、输入区内部滚动与穿透判定、会话区 auto-follow 不回归。
 - 迁移：删除 splash 断言，新增 header/footer 断言。
 - 验证门禁：`cargo fmt --check`、`cargo clippy -- -D warnings`、
   `cargo test --workspace`、release build 全绿并贴实际输出。
