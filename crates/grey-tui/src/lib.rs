@@ -927,7 +927,6 @@ pub struct AppState {
     completion: CompletionSettings,
     show_help: bool,
     leader_armed: bool,
-    show_splash: bool,
     available_models: Vec<String>,
     popup: CompletionPopup,
     popup_rect: Option<Rect>,
@@ -962,7 +961,6 @@ impl Default for AppState {
             completion: CompletionSettings::default(),
             show_help: false,
             leader_armed: false,
-            show_splash: false,
             available_models: Vec::new(),
             popup: CompletionPopup::default(),
             popup_rect: None,
@@ -970,17 +968,29 @@ impl Default for AppState {
     }
 }
 
+fn header_text(settings: &TuiSettings) -> String {
+    let labels = settings.keys.labels();
+    format!(
+        "Grey v{}\nEnter 发送 · Shift+Enter 换行 · / 命令 · {} {} 帮助\n\n",
+        env!("CARGO_PKG_VERSION"),
+        labels.leader,
+        labels.help
+    )
+}
+
 impl AppState {
     fn with_settings(settings: TuiSettings) -> Self {
         let branch = settings.branch_label().map(str::to_string);
         let completion = CompletionSettings::from(settings.completion.clone());
-        Self {
+        let mut state = Self {
             settings: settings.clone(),
             branch,
             status_error: false,
             completion,
             ..AppState::default()
-        }
+        };
+        state.append_output(&header_text(&state.settings));
+        state
     }
 
     fn with_runtime(settings: TuiSettings, runtime: &RuntimeConfig) -> Self {
@@ -1083,6 +1093,7 @@ impl AppState {
         self.max_scroll = 0;
         self.status_error = false;
         self.dirty = true;
+        self.append_output(&header_text(&self.settings));
     }
 
     fn accept_completion(&mut self) {
@@ -1310,14 +1321,6 @@ impl AppState {
     /// Reduce one terminal key event into state and, optionally, an action.
     pub fn reduce_key(&mut self, key: KeyEvent) -> UiAction {
         if key.kind == KeyEventKind::Release {
-            return UiAction::None;
-        }
-        if self.show_splash {
-            if self.settings.keys.quit.matches(key) {
-                return UiAction::Quit;
-            }
-            self.show_splash = false;
-            self.dirty = true;
             return UiAction::None;
         }
         if self.show_help {
@@ -1708,7 +1711,6 @@ pub async fn run_agent_tui(
         TuiSettings::from(tui_config).with_git_branch(git_branch.map(ToString::to_string));
     let mut state = AppState::with_runtime(settings, runtime_config);
     state.available_models = available_models.to_vec();
-    state.show_splash = true;
     let result = run_loop(
         &mut terminal,
         events,
@@ -1895,10 +1897,6 @@ fn trigger_completion_notification(_config: &CompletionSettings, message: String
 }
 
 fn render(frame: &mut Frame<'_>, state: &mut AppState) {
-    if state.show_splash {
-        render_splash(frame, state);
-        return;
-    }
     let theme = state.settings.theme.colors.clone();
     let input_lines = state.settings.layout.input_lines.max(1);
     let chunks = Layout::vertical([
@@ -2308,75 +2306,6 @@ fn render_help_overlay(frame: &mut Frame<'_>, state: &AppState, theme: &RenderTh
     );
 }
 
-fn render_splash(frame: &mut Frame<'_>, state: &AppState) {
-    let theme = state.settings.theme.colors.clone();
-    let labels = state.settings.keys.labels();
-    let panel = centered_rect(76, 92, frame.area());
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Grey ")
-        .border_style(Style::default().fg(theme.border));
-    let avatar = [
-        "      ▄▄▄▄▄▄▄      ",
-        "     █ ▔  ▔ █     ",
-        "     █   ◡  █     ",
-        "      ▀▀▀▀▀▀▀      ",
-    ];
-    let accent = Style::default()
-        .fg(theme.accent)
-        .add_modifier(Modifier::BOLD);
-    let dim = Style::default().fg(theme.muted);
-    let mut body = Text::default();
-    for line in avatar {
-        body.push_line(Line::from(Span::styled(line, accent)));
-    }
-    body.push_line(Line::from(""));
-    body.push_line(Line::from(Span::styled(
-        "Grey — 轻量、高性能、可扩展的 Coding Agent Harness",
-        accent,
-    )));
-    body.push_line(Line::from(Span::styled(
-        format!(
-            "v{} · 默认极简，一切按需扩展。快是特性，省是特性，顺是特性。",
-            env!("CARGO_PKG_VERSION")
-        ),
-        dim,
-    )));
-    body.push_line(Line::from(""));
-    body.push_line(Line::from(Span::styled("快捷键", accent)));
-    body.push_line(Line::from(Span::styled(
-        format!(
-            "  {} {}  帮助        {}  退出        {}  清空",
-            labels.leader, labels.help, labels.quit, labels.clear
-        ),
-        dim,
-    )));
-    body.push_line(Line::from(Span::styled(
-        "  滚轮 / PageUp / PageDown  滚动消息",
-        dim,
-    )));
-    body.push_line(Line::from(""));
-    body.push_line(Line::from(Span::styled("输入", accent)));
-    body.push_line(Line::from(Span::styled(
-        "  Enter 发送 · Shift+Enter / Alt+Enter 换行 · 行尾 \\ + Enter 换行",
-        dim,
-    )));
-    body.push_line(Line::from(""));
-    body.push_line(Line::from(Span::styled("斜杠命令", accent)));
-    body.push_line(Line::from(Span::styled(
-        "  /help /clear /quit /exit /model /status /usage /models",
-        dim,
-    )));
-    body.push_line(Line::from(""));
-    body.push_line(Line::from(Span::styled(
-        "按任意键开始",
-        Style::default()
-            .fg(theme.prompt)
-            .add_modifier(Modifier::BOLD),
-    )));
-    frame.render_widget(Paragraph::new(body).block(block), panel);
-}
-
 fn centered_rect(width_percent: u16, height_percent: u16, area: Rect) -> Rect {
     let width = area.width.saturating_mul(width_percent).div_ceil(100);
     let height = area.height.saturating_mul(height_percent).div_ceil(100);
@@ -2685,7 +2614,11 @@ mod tests {
         clear.output.push_str("old transcript");
         type_text(&mut clear, "/clear");
         assert_eq!(clear.reduce_key(key(KeyCode::Enter)), UiAction::None);
-        assert!(clear.output.is_empty());
+        assert!(
+            clear.output().starts_with("Grey v"),
+            "clear should leave header"
+        );
+        assert!(!clear.output().contains("old transcript"));
 
         assert_eq!(
             AppState::default().reduce_key(key(KeyCode::Enter)),
@@ -3101,34 +3034,6 @@ mod tests {
         assert!(
             rows[status_index].contains(" [OK] "),
             "status keeps error indicator"
-        );
-    }
-
-    #[test]
-    fn splash_renders_and_dismisses_on_any_key() {
-        let mut state = AppState {
-            show_splash: true,
-            ..Default::default()
-        };
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal.draw(|frame| render(frame, &mut state)).unwrap();
-        let rows = rendered_rows(&terminal);
-        assert!(
-            rows.iter().any(|row| row.contains("/models")),
-            "splash renders slash-command hints"
-        );
-        assert!(rows.iter().any(|row| row.contains("Grey")));
-
-        assert_eq!(state.reduce_key(key(KeyCode::Char('x'))), UiAction::None);
-        assert!(!state.show_splash);
-
-        let mut quitting = AppState {
-            show_splash: true,
-            ..Default::default()
-        };
-        assert_eq!(
-            quitting.reduce_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-            UiAction::Quit
         );
     }
 
@@ -3750,5 +3655,41 @@ mod tests {
         assert_eq!(state.popup.items.len(), 2);
         state.reduce_key(key(KeyCode::Tab));
         assert_eq!(state.input(), "/model gpt-5");
+    }
+
+    #[test]
+    fn startup_header_precedes_transcript_and_survives_clear() {
+        let header_state = AppState::with_settings(TuiSettings::default());
+        assert!(
+            header_state.output().starts_with("Grey v"),
+            "header missing, output={:?}",
+            header_state.output()
+        );
+        assert!(header_state.output().contains("帮助"));
+        assert!(header_state.output().contains("/"));
+        let mut cleared = AppState::with_settings(TuiSettings::default());
+        cleared.append_output("old transcript\n");
+        cleared.input.text = "/clear".into();
+        cleared.input.cursor_chars = cleared.input.text.chars().count();
+        assert_eq!(cleared.reduce_key(key(KeyCode::Enter)), UiAction::None);
+        assert!(
+            cleared.output().starts_with("Grey v"),
+            "header should be re-inserted after /clear, output={:?}",
+            cleared.output()
+        );
+        assert!(!cleared.output().contains("old transcript"));
+    }
+
+    #[test]
+    fn no_splash_state_or_render_path_remains() {
+        let mut state = AppState::with_settings(TuiSettings::default());
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        let rows = rendered_rows(&terminal);
+        assert!(
+            rows.iter().all(|row| !row.contains("▄▄▄▄▄▄▄")),
+            "splash avatar should not be rendered"
+        );
+        assert!(rows.iter().any(|row| row.contains("Grey v")));
     }
 }
