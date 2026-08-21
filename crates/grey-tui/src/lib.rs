@@ -942,7 +942,6 @@ struct LayoutRects {
     popup: Option<Rect>,
 }
 
-#[allow(dead_code)]
 fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
     column >= rect.x
         && column < rect.x.saturating_add(rect.width)
@@ -1267,6 +1266,44 @@ impl AppState {
         }
     }
 
+    /// Dispatch a mouse scroll to the region under the pointer; falls back to the
+    /// conversation scroll when the pointer is over no known region.
+    fn scroll_at(&mut self, column: u16, row: u16, lines: i16) {
+        if let Some(rects) = self.last_layout {
+            if let Some(popup) = rects.popup {
+                if rect_contains(popup, column, row) {
+                    if lines < 0 {
+                        self.popup.select_prev();
+                    } else {
+                        self.popup.select_next();
+                    }
+                    self.dirty = true;
+                    return;
+                }
+            }
+            if rect_contains(rects.input, column, row) {
+                let visual_rows =
+                    self.input_visual_lines(usize::from(rects.input.width), INPUT_PROMPT_WIDTH)
+                        .len();
+                if visual_rows > usize::from(rects.input.height) {
+                    if lines < 0 {
+                        self.input_scroll = self
+                            .input_scroll
+                            .saturating_sub(lines.unsigned_abs());
+                    } else {
+                        let max_offset =
+                            (visual_rows - usize::from(rects.input.height)) as u16;
+                        self.input_scroll = (self.input_scroll + lines as u16).min(max_offset);
+                    }
+                    self.input_scroll_manual = true;
+                    self.dirty = true;
+                    return;
+                }
+            }
+        }
+        self.scroll_mouse(lines);
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
@@ -1333,6 +1370,9 @@ impl AppState {
 
     /// Scroll the input so the cursor's wrapped row stays visible.
     pub fn input_scroll(&mut self, width: usize, prompt_width: usize, visible_rows: usize) {
+        if self.input_scroll_manual {
+            return;
+        }
         let (_, cursor_row) = self.input_cursor_position(width, prompt_width);
         if cursor_row >= visible_rows {
             self.input_scroll = (cursor_row - visible_rows + 1) as u16;
@@ -1525,6 +1565,7 @@ impl AppState {
         };
         self.dirty |= changed;
         if changed {
+            self.input_scroll_manual = false;
             let text = self.input.text.clone();
             self.popup.sync(&text, &self.available_models);
             if self.popup.open {
@@ -1798,8 +1839,12 @@ async fn run_loop<B: Backend>(
                             return Ok(());
                         }
                     }
-                    InputMessage::ScrollUp => state.scroll_mouse(-MOUSE_SCROLL_LINES),
-                    InputMessage::ScrollDown => state.scroll_mouse(MOUSE_SCROLL_LINES),
+                    InputMessage::ScrollUp { column, row } => {
+                        state.scroll_at(column, row, -MOUSE_SCROLL_LINES)
+                    }
+                    InputMessage::ScrollDown { column, row } => {
+                        state.scroll_at(column, row, MOUSE_SCROLL_LINES)
+                    }
                     InputMessage::Resize => state.note_resize(),
                     InputMessage::Error(error) => anyhow::bail!("reading terminal input: {error}"),
                 }
@@ -2442,8 +2487,8 @@ fn restore_terminal() -> io::Result<()> {
 #[derive(Debug)]
 enum InputMessage {
     Key(KeyEvent),
-    ScrollUp,
-    ScrollDown,
+    ScrollUp { column: u16, row: u16 },
+    ScrollDown { column: u16, row: u16 },
     Resize,
     Error(String),
 }
@@ -2500,8 +2545,14 @@ fn read_input(stop: Arc<AtomicBool>, sender: mpsc::Sender<InputMessage>) {
                 }
                 Ok(Event::Mouse(mouse)) => {
                     let message = match mouse.kind {
-                        MouseEventKind::ScrollUp => Some(InputMessage::ScrollUp),
-                        MouseEventKind::ScrollDown => Some(InputMessage::ScrollDown),
+                        MouseEventKind::ScrollUp => Some(InputMessage::ScrollUp {
+                            column: mouse.column,
+                            row: mouse.row,
+                        }),
+                        MouseEventKind::ScrollDown => Some(InputMessage::ScrollDown {
+                            column: mouse.column,
+                            row: mouse.row,
+                        }),
                         _ => None,
                     };
                     if let Some(message) = message {
@@ -3765,5 +3816,74 @@ mod tests {
             rows.iter().all(|row| !row.contains(" fps") && !row.contains("GREY")),
             "status decluttered"
         );
+    }
+
+    #[test]
+    fn wheel_routes_by_pointer_region_and_input_overflow() {
+        let mut state = AppState::with_settings(TuiSettings::default());
+        state.total_input_tokens = 0;
+        state.total_output_tokens = 0;
+        state.last_layout = Some(LayoutRects {
+            conversation: Rect { x: 0, y: 0, width: 40, height: 6 },
+            input: Rect { x: 0, y: 7, width: 40, height: 2 },
+            popup: None,
+        });
+        state.scroll = 0;
+        state.max_scroll = 20;
+        state.scroll_at(5, 2, MOUSE_SCROLL_LINES);
+        assert_eq!(state.scroll, 3, "wheel over conversation scrolls transcript");
+        state.input.text = "hi".into();
+        state.input.cursor_chars = 2;
+        state.input_scroll = 0;
+        state.input_scroll_manual = false;
+        state.scroll_at(5, 8, MOUSE_SCROLL_LINES);
+        assert_eq!(state.scroll, 6, "wheel over non-overflow input falls through");
+        assert_eq!(state.input_scroll, 0);
+        let mut over = AppState::with_settings(TuiSettings::default());
+        over.input.text = (0..6).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        over.input.cursor_chars = over.input.text.chars().count();
+        over.last_layout = Some(LayoutRects {
+            conversation: Rect { x: 0, y: 0, width: 40, height: 6 },
+            input: Rect { x: 0, y: 7, width: 40, height: 2 },
+            popup: None,
+        });
+        over.scroll = 5;
+        over.max_scroll = 10;
+        over.input_scroll = 0;
+        over.input_scroll_manual = false;
+        over.scroll_at(5, 8, MOUSE_SCROLL_LINES);
+        assert_eq!(over.input_scroll, 3, "wheel over overflow input scrolls input");
+        assert_eq!(over.scroll, 5, "conversation untouched");
+        over.scroll_at(5, 8, -MOUSE_SCROLL_LINES);
+        assert_eq!(over.input_scroll, 0);
+    }
+
+    #[test]
+    fn wheel_over_popup_navigates_selection() {
+        let mut state = AppState::with_settings(TuiSettings::default());
+        state.available_models = vec!["a".into(), "b".into(), "c".into()];
+        for ch in "/".chars() {
+            state.reduce_key(key(KeyCode::Char(ch)));
+        }
+        assert!(state.popup.open);
+        let popup_rect = Rect { x: 0, y: 4, width: 20, height: 3 };
+        state.last_layout = Some(LayoutRects {
+            conversation: Rect { x: 0, y: 0, width: 40, height: 4 },
+            input: Rect { x: 0, y: 7, width: 40, height: 2 },
+            popup: Some(popup_rect),
+        });
+        assert_eq!(state.popup.selected, 0);
+        state.scroll_at(2, 5, MOUSE_SCROLL_LINES);
+        assert_eq!(state.popup.selected, 1);
+        state.scroll_at(2, 5, -MOUSE_SCROLL_LINES);
+        assert_eq!(state.popup.selected, 0);
+    }
+
+    #[test]
+    fn editing_resets_input_manual_scroll() {
+        let mut state = AppState::with_settings(TuiSettings::default());
+        state.input_scroll_manual = true;
+        state.reduce_key(key(KeyCode::Char('a')));
+        assert!(!state.input_scroll_manual, "editing should reset manual flag");
     }
 }
