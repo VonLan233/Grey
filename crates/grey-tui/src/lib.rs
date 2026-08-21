@@ -25,16 +25,14 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use grey_core::{
-    AgentEvent, RuntimeConfig, TuiCompletionConfig, TuiConfig, TuiKeysConfig, TuiLayoutConfig,
-};
+use grey_core::{AgentEvent, RuntimeConfig, TuiCompletionConfig, TuiConfig, TuiKeysConfig};
 use notify_rust::Notification;
 use ratatui::{
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame, Terminal,
 };
 use tokio::sync::{mpsc, watch};
@@ -49,6 +47,9 @@ const PERSISTENT_REMINDER_TICK: Duration = Duration::from_millis(1800);
 const TRUNCATED_MARKER: &str = "[cut]";
 pub const TUI_INPUT_LINES_MIN: u16 = 1;
 pub const TUI_INPUT_LINES_MAX: u16 = 20;
+const COMPLETION_MAX_VISIBLE_ROWS: usize = 6;
+const INPUT_PROMPT: &str = "> ";
+const INPUT_PROMPT_WIDTH: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum CompletionBell {
@@ -170,7 +171,6 @@ impl TuiTheme {
 #[derive(Debug, Clone)]
 struct TuiSettings {
     theme: TuiTheme,
-    layout: TuiLayoutConfig,
     completion: TuiCompletionConfig,
     keys: TuiKeyBindings,
     git_branch: Option<String>,
@@ -190,12 +190,6 @@ impl From<&TuiConfig> for TuiSettings {
     fn from(config: &TuiConfig) -> Self {
         Self {
             theme: TuiTheme::from_config(&config.theme),
-            layout: TuiLayoutConfig {
-                input_lines: config
-                    .layout
-                    .input_lines
-                    .clamp(TUI_INPUT_LINES_MIN, TUI_INPUT_LINES_MAX),
-            },
             completion: config.completion.clone(),
             keys: TuiKeyBindings::from_config(&config.keys),
             git_branch: None,
@@ -500,6 +494,146 @@ pub enum UiAction {
     Quit,
 }
 
+/// One `/` command: name, aliases, argument hint and description for the completion popup.
+#[derive(Debug, Clone)]
+struct CommandSpec {
+    name: &'static str,
+    aliases: &'static [&'static str],
+    args_hint: &'static str,
+    description: &'static str,
+}
+
+const COMMANDS: &[CommandSpec] = &[
+    CommandSpec {
+        name: "help",
+        aliases: &["?"],
+        args_hint: "",
+        description: "显示帮助",
+    },
+    CommandSpec {
+        name: "clear",
+        aliases: &[],
+        args_hint: "",
+        description: "清空输出",
+    },
+    CommandSpec {
+        name: "quit",
+        aliases: &["exit"],
+        args_hint: "",
+        description: "退出 Grey",
+    },
+    CommandSpec {
+        name: "model",
+        aliases: &[],
+        args_hint: "<name>",
+        description: "切换模型（下一条生效）",
+    },
+    CommandSpec {
+        name: "usage",
+        aliases: &["tokens"],
+        args_hint: "",
+        description: "查看累积 token 用量",
+    },
+    CommandSpec {
+        name: "status",
+        aliases: &[],
+        args_hint: "",
+        description: "查看版本/模型/分支/token",
+    },
+    CommandSpec {
+        name: "models",
+        aliases: &[],
+        args_hint: "",
+        description: "列出可用模型",
+    },
+];
+
+/// One candidate row in the slash-command completion popup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompletionItem {
+    /// Full new input text after accepting this item.
+    replaces: String,
+    /// Left column shown in the popup, e.g. `/model <name>`.
+    label: String,
+    /// Right column shown in the popup.
+    description: String,
+}
+
+/// Neovim-style popup state for `/` command completion.
+#[derive(Debug, Clone, Default)]
+struct CompletionPopup {
+    items: Vec<CompletionItem>,
+    selected: usize,
+    offset: usize,
+    open: bool,
+}
+
+impl CompletionPopup {
+    /// Recompute candidates from the current input; closes when nothing matches.
+    fn sync(&mut self, input: &str, available_models: &[String]) {
+        self.items.clear();
+        self.selected = 0;
+        self.offset = 0;
+        self.open = false;
+        if let Some(rest) = input.strip_prefix("/model ") {
+            let argument = rest.trim_start();
+            self.items = available_models
+                .iter()
+                .filter(|model| model.starts_with(argument))
+                .map(|model| CompletionItem {
+                    replaces: format!("/model {model}"),
+                    label: format!("/model {model}"),
+                    description: String::new(),
+                })
+                .collect();
+            self.open = !self.items.is_empty();
+            return;
+        }
+        if input.starts_with('/') && !input[1..].contains(char::is_whitespace) {
+            let prefix = input[1..].to_ascii_lowercase();
+            self.items = COMMANDS
+                .iter()
+                .filter(|spec| {
+                    spec.name.starts_with(&prefix)
+                        || spec.aliases.iter().any(|alias| alias.starts_with(&prefix))
+                })
+                .map(|spec| CompletionItem {
+                    replaces: if spec.name == "model" {
+                        "/model ".to_string()
+                    } else {
+                        format!("/{}", spec.name)
+                    },
+                    label: if spec.args_hint.is_empty() {
+                        format!("/{}", spec.name)
+                    } else {
+                        format!("/{} {}", spec.name, spec.args_hint)
+                    },
+                    description: spec.description.to_string(),
+                })
+                .collect();
+            self.open = !self.items.is_empty();
+        }
+    }
+
+    fn select_next(&mut self) {
+        if self.items.is_empty() {
+            return;
+        }
+        self.selected = (self.selected + 1) % self.items.len();
+    }
+
+    fn select_prev(&mut self) {
+        if self.items.is_empty() {
+            return;
+        }
+        self.selected = (self.selected + self.items.len() - 1) % self.items.len();
+    }
+
+    fn selected_item(&self) -> Option<&CompletionItem> {
+        self.items.get(self.selected)
+    }
+}
+
 /// A `/`-prefixed command parsed from the input line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SlashCommand {
@@ -515,20 +649,24 @@ enum SlashCommand {
 
 impl SlashCommand {
     fn parse(input: &str) -> Self {
-        let body = input.strip_prefix('/').unwrap_or(input).trim();
+        let trimmed = input.trim();
+        let body = trimmed.strip_prefix('/').unwrap_or(trimmed).trim();
         let (name, argument) = body.split_once(char::is_whitespace).unwrap_or((body, ""));
         let name = name.trim().to_ascii_lowercase();
-        match name.as_str() {
-            "help" | "?" => Self::Help,
-            "clear" => Self::Clear,
-            "quit" | "exit" => Self::Quit,
-            "model" => Self::Model {
+        let spec = COMMANDS
+            .iter()
+            .find(|spec| spec.name == name || spec.aliases.contains(&name.as_str()));
+        match spec.map(|spec| spec.name) {
+            Some("help") => Self::Help,
+            Some("clear") => Self::Clear,
+            Some("quit") => Self::Quit,
+            Some("model") => Self::Model {
                 model: argument.trim().to_owned(),
             },
-            "usage" | "tokens" => Self::Usage,
-            "status" => Self::Status,
-            "models" => Self::Models,
-            other => Self::Unknown(other.to_owned()),
+            Some("usage") => Self::Usage,
+            Some("status") => Self::Status,
+            Some("models") => Self::Models,
+            _ => Self::Unknown(name),
         }
     }
 }
@@ -739,6 +877,13 @@ fn wrap_input_line(content: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// Input area height: content-driven, clamped to 40% of the terminal height.
+/// `ponytail: clamp upper bound is 40% of frame; raise only when users request more visible input rows.`
+fn input_area_height(visual_rows: usize, frame_height: u16) -> u16 {
+    let max = (u32::from(frame_height) * 40 / 100).max(1) as u16;
+    (visual_rows as u16).clamp(1, max)
+}
+
 /// Measurements for frames that were actually drawn.
 #[derive(Debug, Clone)]
 pub struct FrameStats {
@@ -819,8 +964,26 @@ pub struct AppState {
     completion: CompletionSettings,
     show_help: bool,
     leader_armed: bool,
-    show_splash: bool,
     available_models: Vec<String>,
+    popup: CompletionPopup,
+    popup_rect: Option<Rect>,
+    last_layout: Option<LayoutRects>,
+    input_scroll_manual: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+struct LayoutRects {
+    conversation: Rect,
+    input: Rect,
+    popup: Option<Rect>,
+}
+
+fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
+    column >= rect.x
+        && column < rect.x.saturating_add(rect.width)
+        && row >= rect.y
+        && row < rect.y.saturating_add(rect.height)
 }
 
 impl Default for AppState {
@@ -852,23 +1015,38 @@ impl Default for AppState {
             completion: CompletionSettings::default(),
             show_help: false,
             leader_armed: false,
-            show_splash: false,
             available_models: Vec::new(),
+            popup: CompletionPopup::default(),
+            popup_rect: None,
+            last_layout: None,
+            input_scroll_manual: false,
         }
     }
+}
+
+fn header_text(settings: &TuiSettings) -> String {
+    let labels = settings.keys.labels();
+    format!(
+        "Grey v{}\nEnter 发送 · Shift+Enter 换行 · / 命令 · {} {} 帮助\n\n",
+        env!("CARGO_PKG_VERSION"),
+        labels.leader,
+        labels.help
+    )
 }
 
 impl AppState {
     fn with_settings(settings: TuiSettings) -> Self {
         let branch = settings.branch_label().map(str::to_string);
         let completion = CompletionSettings::from(settings.completion.clone());
-        Self {
+        let mut state = Self {
             settings: settings.clone(),
             branch,
             status_error: false,
             completion,
             ..AppState::default()
-        }
+        };
+        state.append_output(&header_text(&state.settings));
+        state
     }
 
     fn with_runtime(settings: TuiSettings, runtime: &RuntimeConfig) -> Self {
@@ -906,10 +1084,12 @@ impl AppState {
             .zip(self.current_model.as_deref())
     }
 
+    #[allow(dead_code)]
     fn current_task_label(&self) -> &str {
         self.current_task.as_deref().unwrap_or("-")
     }
 
+    #[allow(dead_code)]
     fn branch_label(&self) -> &str {
         self.branch.as_deref().unwrap_or("-")
     }
@@ -970,6 +1150,18 @@ impl AppState {
         self.scroll = 0;
         self.max_scroll = 0;
         self.status_error = false;
+        self.dirty = true;
+        self.append_output(&header_text(&self.settings));
+    }
+
+    fn accept_completion(&mut self) {
+        let Some(item) = self.popup.selected_item() else {
+            return;
+        };
+        self.input.text = item.replaces.clone();
+        self.input.cursor_chars = self.input.text.chars().count();
+        let text = self.input.text.clone();
+        self.popup.sync(&text, &self.available_models);
         self.dirty = true;
     }
 
@@ -1058,6 +1250,7 @@ impl AppState {
         }
     }
 
+    #[allow(dead_code)]
     fn completion_notice(&self) -> Option<&str> {
         self.persistent_completion_message.as_deref()
     }
@@ -1108,6 +1301,41 @@ impl AppState {
             self.follow_output = self.scroll == self.max_scroll;
             self.dirty = true;
         }
+    }
+
+    /// Dispatch a mouse scroll to the region under the pointer; falls back to the
+    /// conversation scroll when the pointer is over no known region.
+    fn scroll_at(&mut self, column: u16, row: u16, lines: i16) {
+        if let Some(rects) = self.last_layout {
+            if let Some(popup) = rects.popup {
+                if rect_contains(popup, column, row) {
+                    if lines < 0 {
+                        self.popup.select_prev();
+                    } else {
+                        self.popup.select_next();
+                    }
+                    self.dirty = true;
+                    return;
+                }
+            }
+            if rect_contains(rects.input, column, row) {
+                let visual_rows = self
+                    .input_visual_lines(usize::from(rects.input.width), INPUT_PROMPT_WIDTH)
+                    .len();
+                if visual_rows > usize::from(rects.input.height) {
+                    if lines < 0 {
+                        self.input_scroll = self.input_scroll.saturating_sub(lines.unsigned_abs());
+                    } else {
+                        let max_offset = (visual_rows - usize::from(rects.input.height)) as u16;
+                        self.input_scroll = (self.input_scroll + lines as u16).min(max_offset);
+                    }
+                    self.input_scroll_manual = true;
+                    self.dirty = true;
+                    return;
+                }
+            }
+        }
+        self.scroll_mouse(lines);
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -1176,6 +1404,9 @@ impl AppState {
 
     /// Scroll the input so the cursor's wrapped row stays visible.
     pub fn input_scroll(&mut self, width: usize, prompt_width: usize, visible_rows: usize) {
+        if self.input_scroll_manual {
+            return;
+        }
         let (_, cursor_row) = self.input_cursor_position(width, prompt_width);
         if cursor_row >= visible_rows {
             self.input_scroll = (cursor_row - visible_rows + 1) as u16;
@@ -1187,14 +1418,6 @@ impl AppState {
     /// Reduce one terminal key event into state and, optionally, an action.
     pub fn reduce_key(&mut self, key: KeyEvent) -> UiAction {
         if key.kind == KeyEventKind::Release {
-            return UiAction::None;
-        }
-        if self.show_splash {
-            if self.settings.keys.quit.matches(key) {
-                return UiAction::Quit;
-            }
-            self.show_splash = false;
-            self.dirty = true;
             return UiAction::None;
         }
         if self.show_help {
@@ -1267,6 +1490,56 @@ impl AppState {
             return UiAction::None;
         }
 
+        if self.popup.open {
+            match key.code {
+                KeyCode::Up => {
+                    self.popup.select_prev();
+                    self.dirty = true;
+                    return UiAction::None;
+                }
+                KeyCode::Down => {
+                    self.popup.select_next();
+                    self.dirty = true;
+                    return UiAction::None;
+                }
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.popup.select_prev();
+                    self.dirty = true;
+                    return UiAction::None;
+                }
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.popup.select_next();
+                    self.dirty = true;
+                    return UiAction::None;
+                }
+                KeyCode::Tab => {
+                    self.accept_completion();
+                    return UiAction::None;
+                }
+                KeyCode::Esc => {
+                    self.popup.open = false;
+                    self.dirty = true;
+                    return UiAction::None;
+                }
+                KeyCode::Enter
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                {
+                    let exact = self.popup.selected_item().is_some_and(|item| {
+                        SlashCommand::parse(&item.replaces) == SlashCommand::parse(&self.input.text)
+                    });
+                    if exact {
+                        self.popup.open = false;
+                    } else {
+                        self.accept_completion();
+                        return UiAction::None;
+                    }
+                }
+                _ => {}
+            }
+        }
+
         if key.code == KeyCode::Esc && self.input.text.is_empty() {
             return UiAction::Quit;
         }
@@ -1309,9 +1582,11 @@ impl AppState {
                     return UiAction::None;
                 }
                 if self.input.text.starts_with('/') {
+                    self.popup.open = false;
                     return self.apply_slash_command();
                 }
                 let rejected_input = self.input.take();
+                self.popup.open = false;
                 let prompt = rejected_input.trim().to_owned();
                 self.dirty = true;
                 if prompt.is_empty() {
@@ -1325,6 +1600,14 @@ impl AppState {
             _ => false,
         };
         self.dirty |= changed;
+        if changed {
+            self.input_scroll_manual = false;
+            let text = self.input.text.clone();
+            self.popup.sync(&text, &self.available_models);
+            if self.popup.open {
+                self.dirty = true;
+            }
+        }
         UiAction::None
     }
 
@@ -1528,7 +1811,6 @@ pub async fn run_agent_tui(
         TuiSettings::from(tui_config).with_git_branch(git_branch.map(ToString::to_string));
     let mut state = AppState::with_runtime(settings, runtime_config);
     state.available_models = available_models.to_vec();
-    state.show_splash = true;
     let result = run_loop(
         &mut terminal,
         events,
@@ -1593,8 +1875,12 @@ async fn run_loop<B: Backend>(
                             return Ok(());
                         }
                     }
-                    InputMessage::ScrollUp => state.scroll_mouse(-MOUSE_SCROLL_LINES),
-                    InputMessage::ScrollDown => state.scroll_mouse(MOUSE_SCROLL_LINES),
+                    InputMessage::ScrollUp { column, row } => {
+                        state.scroll_at(column, row, -MOUSE_SCROLL_LINES)
+                    }
+                    InputMessage::ScrollDown { column, row } => {
+                        state.scroll_at(column, row, MOUSE_SCROLL_LINES)
+                    }
                     InputMessage::Resize => state.note_resize(),
                     InputMessage::Error(error) => anyhow::bail!("reading terminal input: {error}"),
                 }
@@ -1714,51 +2000,124 @@ fn trigger_completion_notification(_config: &CompletionSettings, message: String
         .map_err(|error| anyhow::anyhow!(error))
 }
 
-fn render(frame: &mut Frame<'_>, state: &mut AppState) {
-    if state.show_splash {
-        render_splash(frame, state);
-        return;
+fn format_tokens(count: u64) -> String {
+    if count < 1000 {
+        count.to_string()
+    } else {
+        format!("{:.1}k", count as f64 / 1000.0)
     }
+}
+
+fn truncate_to_width(text: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_string();
+    }
+    let mut truncated = String::new();
+    let mut used = 1usize;
+    for character in text.chars() {
+        let width = UnicodeWidthStr::width(character.to_string().as_str());
+        if used + width > max_width {
+            break;
+        }
+        truncated.push(character);
+        used += width;
+    }
+    format!("{truncated}…")
+}
+
+fn render_footer(frame: &mut Frame<'_>, state: &AppState, theme: &RenderTheme, area: Rect) {
+    let dim = Style::default().fg(theme.muted);
+    let (input_tokens, output_tokens) = state.total_usage();
+    let mut left_spans = vec![Span::styled(
+        format!(
+            "↑{} ↓{}",
+            format_tokens(input_tokens),
+            format_tokens(output_tokens)
+        ),
+        dim,
+    )];
+    if let Some(task) = state.current_task.as_deref() {
+        left_spans.push(Span::styled(format!(" · task:{task}"), dim));
+    }
+    if state.status_has_error() {
+        left_spans.push(Span::styled(
+            " ERR",
+            Style::default()
+                .fg(theme.error)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    let left_width: usize = left_spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum();
+    let (provider, model_label) = state
+        .model_info()
+        .map_or((None, "-".to_string()), |(provider, model)| {
+            (Some(provider.to_string()), model.to_string())
+        });
+    let mut right = match provider {
+        Some(provider) => format!("({provider}) {model_label}"),
+        None => model_label,
+    };
+    if let Some(branch) = state.branch.as_deref() {
+        right.push_str(&format!(" ({branch})"));
+    }
+    let width = usize::from(area.width);
+    let min_gap = 2usize;
+    let right_width = UnicodeWidthStr::width(right.as_str());
+    let right_final = if left_width + min_gap + right_width <= width {
+        right
+    } else {
+        let available = width.saturating_sub(left_width + min_gap);
+        truncate_to_width(&right, available)
+    };
+    let right_actual_width = UnicodeWidthStr::width(right_final.as_str());
+    let padding = width.saturating_sub(left_width + right_actual_width);
+    let mut spans = left_spans;
+    spans.push(Span::raw(" ".repeat(padding)));
+    spans.push(Span::styled(right_final, dim));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn render(frame: &mut Frame<'_>, state: &mut AppState) {
     let theme = state.settings.theme.colors.clone();
-    let input_lines = state.settings.layout.input_lines.max(1);
+    let prompt_width = INPUT_PROMPT_WIDTH;
+    let frame_width = usize::from(frame.area().width);
+    let visual_rows = state.input_visual_lines(frame_width, prompt_width).len();
+    let input_height = input_area_height(visual_rows, frame.area().height);
     let chunks = Layout::vertical([
         Constraint::Min(0),
         Constraint::Length(1),
-        Constraint::Length(input_lines),
+        Constraint::Length(input_height),
         Constraint::Length(1),
     ])
     .split(frame.area());
 
-    let conversation_block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Grey ")
-        .border_style(Style::default().fg(theme.border));
-    let conversation_inner = conversation_block.inner(chunks[0]);
-    state.update_viewport(conversation_inner.width, conversation_inner.height);
+    state.update_viewport(chunks[0].width, chunks[0].height);
     let conversation = Paragraph::new(markdown_text(state.output.as_str(), &theme))
-        .block(conversation_block)
         .wrap(Wrap { trim: false })
         .scroll((state.scroll, 0));
     frame.render_widget(conversation, chunks[0]);
 
-    render_task_line(frame, state, &theme, chunks[1]);
+    let separator = Paragraph::new(Line::from(Span::styled(
+        "─".repeat(usize::from(chunks[1].width)),
+        Style::default().fg(theme.muted),
+    )));
+    frame.render_widget(separator, chunks[1]);
 
-    let input_block = Block::default()
-        .borders(Borders::ALL)
-        .title(" input ")
-        .border_style(Style::default().fg(theme.border))
-        .style(Style::default().fg(theme.accent));
-    let input_inner = input_block.inner(chunks[2]);
+    let input_inner = chunks[2];
     let prompt = Span::styled(
-        "> ",
+        INPUT_PROMPT,
         Style::default()
             .fg(theme.prompt)
             .add_modifier(Modifier::BOLD),
     );
-    let prompt_width = UnicodeWidthStr::width("> ");
     let input_width = usize::from(input_inner.width);
     let input_visible_rows = usize::from(input_inner.height);
-    state.input_scroll(input_width, prompt_width, input_visible_rows);
+    if !state.input_scroll_manual {
+        state.input_scroll(input_width, prompt_width, input_visible_rows);
+    }
     let mut input_text = Text::default();
     for (index, visual_line) in state
         .input_visual_lines(input_width, prompt_width)
@@ -1775,7 +2134,6 @@ fn render(frame: &mut Frame<'_>, state: &mut AppState) {
         }
     }
     let input = Paragraph::new(input_text)
-        .block(input_block)
         .style(Style::default().fg(Color::White))
         .scroll((state.input_scroll, 0));
     frame.render_widget(input, chunks[2]);
@@ -1792,10 +2150,86 @@ fn render(frame: &mut Frame<'_>, state: &mut AppState) {
         frame.set_cursor_position((cursor_x, cursor_y));
     }
 
-    render_status_line(frame, state, &theme, chunks[3]);
+    render_footer(frame, state, &theme, chunks[3]);
+    let popup_rect = if state.popup.open {
+        render_completion_popup(frame, state, &theme, chunks[2])
+    } else {
+        None
+    };
+    state.popup_rect = popup_rect;
+    state.last_layout = Some(LayoutRects {
+        conversation: chunks[0],
+        input: chunks[2],
+        popup: popup_rect,
+    });
     if state.show_help {
         render_help_overlay(frame, state, &theme);
     }
+}
+
+fn render_completion_popup(
+    frame: &mut Frame<'_>,
+    state: &mut AppState,
+    theme: &RenderTheme,
+    input_area: Rect,
+) -> Option<Rect> {
+    let visible = state.popup.items.len().min(COMPLETION_MAX_VISIBLE_ROWS);
+    if visible == 0 || input_area.width == 0 || input_area.height == 0 || input_area.y == 0 {
+        return None;
+    }
+    if state.popup.selected < state.popup.offset {
+        state.popup.offset = state.popup.selected;
+    } else if state.popup.selected >= state.popup.offset + visible {
+        state.popup.offset = state.popup.selected + 1 - visible;
+    }
+    let width = state
+        .popup
+        .items
+        .iter()
+        .map(|item| {
+            UnicodeWidthStr::width(item.label.as_str())
+                + UnicodeWidthStr::width(item.description.as_str())
+                + 4
+        })
+        .max()
+        .unwrap_or(0)
+        .clamp(12, usize::from(input_area.width)) as u16;
+    let area = Rect {
+        x: input_area.x,
+        y: input_area.y.saturating_sub(visible as u16),
+        width,
+        height: visible as u16,
+    };
+    if area.y >= frame.area().height {
+        return None;
+    }
+    frame.render_widget(Clear, area);
+    let highlight = Style::default()
+        .fg(theme.prompt)
+        .add_modifier(Modifier::BOLD);
+    let normal = Style::default().fg(theme.muted);
+    let mut text = Text::default();
+    for index in state.popup.offset..state.popup.offset + visible {
+        let Some(item) = state.popup.items.get(index) else {
+            break;
+        };
+        let style = if index == state.popup.selected {
+            highlight
+        } else {
+            normal
+        };
+        let line = if item.description.is_empty() {
+            Line::from(Span::styled(format!(" {}", item.label), style))
+        } else {
+            Line::from(Span::styled(
+                format!(" {}  {}", item.label, item.description),
+                style,
+            ))
+        };
+        text.push_line(line);
+    }
+    frame.render_widget(Paragraph::new(text), area);
+    Some(area)
 }
 
 fn markdown_text(source: &str, theme: &RenderTheme) -> Text<'static> {
@@ -1932,85 +2366,6 @@ fn markdown_text(source: &str, theme: &RenderTheme) -> Text<'static> {
     text
 }
 
-fn render_task_line(frame: &mut Frame<'_>, state: &AppState, theme: &RenderTheme, area: Rect) {
-    let line = Line::from(vec![
-        Span::styled(
-            " task: ",
-            Style::default()
-                .fg(theme.status_fg)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            state.current_task_label(),
-            Style::default().fg(theme.status_fg),
-        ),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
-}
-
-fn render_status_line(frame: &mut Frame<'_>, state: &AppState, theme: &RenderTheme, area: Rect) {
-    let labels = state.settings.keys.labels();
-    let (total_input_tokens, total_output_tokens) = state.total_usage();
-    let (provider_label, model_label) = state
-        .model_info()
-        .map_or(("-", "-"), |(provider, model)| (provider, model));
-    let status = Line::from(vec![
-        Span::styled(
-            format!(" v{} ", env!("CARGO_PKG_VERSION")),
-            Style::default().fg(theme.muted),
-        ),
-        Span::styled(
-            format!(" model:{provider_label}/{model_label} "),
-            Style::default().fg(theme.status_fg),
-        ),
-        Span::styled(
-            format!(" branch:{} ", state.branch_label()),
-            Style::default().fg(theme.status_fg),
-        ),
-        Span::styled(
-            format!(" i:{total_input_tokens} o:{total_output_tokens} "),
-            Style::default().fg(theme.status_fg),
-        ),
-        if state.status_has_error() {
-            Span::styled(
-                " [ERR] ",
-                Style::default()
-                    .fg(theme.error)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Span::styled(" [OK] ", Style::default().fg(theme.success))
-        },
-        Span::styled(
-            format!(" {} ", state.status),
-            Style::default().fg(theme.status_fg),
-        ),
-        if state.completion_notice().is_some() {
-            Span::styled(
-                " [HOLD] ",
-                Style::default()
-                    .fg(theme.warning)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Span::raw("")
-        },
-        Span::styled(
-            format!(
-                " {}+{}:help  {}:quit  {}:clear  {}:up  {}:down ",
-                labels.leader,
-                labels.help,
-                labels.quit,
-                labels.clear,
-                labels.scroll_up,
-                labels.scroll_down
-            ),
-            Style::default().fg(theme.muted),
-        ),
-    ]);
-    frame.render_widget(Paragraph::new(status), area);
-}
-
 fn render_help_overlay(frame: &mut Frame<'_>, state: &AppState, theme: &RenderTheme) {
     let area = centered_rect(68, 70, frame.area());
     let labels = state.settings.keys.labels();
@@ -2055,75 +2410,6 @@ fn render_help_overlay(frame: &mut Frame<'_>, state: &AppState, theme: &RenderTh
         Paragraph::new(body).block(block).wrap(Wrap { trim: false }),
         area,
     );
-}
-
-fn render_splash(frame: &mut Frame<'_>, state: &AppState) {
-    let theme = state.settings.theme.colors.clone();
-    let labels = state.settings.keys.labels();
-    let panel = centered_rect(76, 92, frame.area());
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Grey ")
-        .border_style(Style::default().fg(theme.border));
-    let avatar = [
-        "      ▄▄▄▄▄▄▄      ",
-        "     █ ▔  ▔ █     ",
-        "     █   ◡  █     ",
-        "      ▀▀▀▀▀▀▀      ",
-    ];
-    let accent = Style::default()
-        .fg(theme.accent)
-        .add_modifier(Modifier::BOLD);
-    let dim = Style::default().fg(theme.muted);
-    let mut body = Text::default();
-    for line in avatar {
-        body.push_line(Line::from(Span::styled(line, accent)));
-    }
-    body.push_line(Line::from(""));
-    body.push_line(Line::from(Span::styled(
-        "Grey — 轻量、高性能、可扩展的 Coding Agent Harness",
-        accent,
-    )));
-    body.push_line(Line::from(Span::styled(
-        format!(
-            "v{} · 默认极简，一切按需扩展。快是特性，省是特性，顺是特性。",
-            env!("CARGO_PKG_VERSION")
-        ),
-        dim,
-    )));
-    body.push_line(Line::from(""));
-    body.push_line(Line::from(Span::styled("快捷键", accent)));
-    body.push_line(Line::from(Span::styled(
-        format!(
-            "  {} {}  帮助        {}  退出        {}  清空",
-            labels.leader, labels.help, labels.quit, labels.clear
-        ),
-        dim,
-    )));
-    body.push_line(Line::from(Span::styled(
-        "  滚轮 / PageUp / PageDown  滚动消息",
-        dim,
-    )));
-    body.push_line(Line::from(""));
-    body.push_line(Line::from(Span::styled("输入", accent)));
-    body.push_line(Line::from(Span::styled(
-        "  Enter 发送 · Shift+Enter / Alt+Enter 换行 · 行尾 \\ + Enter 换行",
-        dim,
-    )));
-    body.push_line(Line::from(""));
-    body.push_line(Line::from(Span::styled("斜杠命令", accent)));
-    body.push_line(Line::from(Span::styled(
-        "  /help /clear /quit /exit /model /status /usage /models",
-        dim,
-    )));
-    body.push_line(Line::from(""));
-    body.push_line(Line::from(Span::styled(
-        "按任意键开始",
-        Style::default()
-            .fg(theme.prompt)
-            .add_modifier(Modifier::BOLD),
-    )));
-    frame.render_widget(Paragraph::new(body).block(block), panel);
 }
 
 fn centered_rect(width_percent: u16, height_percent: u16, area: Rect) -> Rect {
@@ -2241,8 +2527,8 @@ fn restore_terminal() -> io::Result<()> {
 #[derive(Debug)]
 enum InputMessage {
     Key(KeyEvent),
-    ScrollUp,
-    ScrollDown,
+    ScrollUp { column: u16, row: u16 },
+    ScrollDown { column: u16, row: u16 },
     Resize,
     Error(String),
 }
@@ -2299,8 +2585,14 @@ fn read_input(stop: Arc<AtomicBool>, sender: mpsc::Sender<InputMessage>) {
                 }
                 Ok(Event::Mouse(mouse)) => {
                     let message = match mouse.kind {
-                        MouseEventKind::ScrollUp => Some(InputMessage::ScrollUp),
-                        MouseEventKind::ScrollDown => Some(InputMessage::ScrollDown),
+                        MouseEventKind::ScrollUp => Some(InputMessage::ScrollUp {
+                            column: mouse.column,
+                            row: mouse.row,
+                        }),
+                        MouseEventKind::ScrollDown => Some(InputMessage::ScrollDown {
+                            column: mouse.column,
+                            row: mouse.row,
+                        }),
                         _ => None,
                     };
                     if let Some(message) = message {
@@ -2434,7 +2726,11 @@ mod tests {
         clear.output.push_str("old transcript");
         type_text(&mut clear, "/clear");
         assert_eq!(clear.reduce_key(key(KeyCode::Enter)), UiAction::None);
-        assert!(clear.output.is_empty());
+        assert!(
+            clear.output().starts_with("Grey v"),
+            "clear should leave header"
+        );
+        assert!(!clear.output().contains("old transcript"));
 
         assert_eq!(
             AppState::default().reduce_key(key(KeyCode::Enter)),
@@ -2658,29 +2954,23 @@ mod tests {
         assert_eq!(state.scroll(), 5);
         assert!(state.follows_output());
 
-        // 11 rows: 1 task + 3 input + 1 status leaves the conversation
-        // inner area 4 rows tall, matching the viewport used above.
-        let backend = TestBackend::new(30, 11);
+        // 7 rows: 1 separator + 1 input + 1 footer leaves conversation 4 rows tall,
+        // matching the viewport used above (borderless layout).
+        let backend = TestBackend::new(30, 7);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
-        let tail_row: String = terminal.backend().buffer().content[31..59]
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect();
+        let rows = rendered_rows(&terminal);
         assert!(
-            tail_row.contains("line-5"),
-            "non-zero scroll offset was not rendered: {tail_row:?}"
+            rows.iter().any(|row| row.contains("line-5")),
+            "non-zero scroll offset was not rendered: {rows:?}"
         );
 
         state.reduce_key(key(KeyCode::PageUp));
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
-        let row: String = terminal.backend().buffer().content[31..59]
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect();
+        let rows2 = rendered_rows(&terminal);
         assert!(
-            row.contains("line-0"),
-            "scroll offset was not rendered: {row:?}"
+            rows2.iter().any(|row| row.contains("line-0")),
+            "scroll offset was not rendered: {rows2:?}"
         );
     }
 
@@ -2696,18 +2986,15 @@ mod tests {
         for (i, row) in rows.iter().enumerate() {
             println!("[ROW {i}] {row:?}");
         }
-        // cursor should sit on the last line ("second line" -> col 11, row after the wrapped first line)
-        // real input inner width is 18 (20 - 2 borders); cursor at the end of
-        // the second logical line sits below the wrapped first line
-        let (column, row) = state.input_cursor_position(18, 2);
+        // borderless layout: input width is full frame width
+        let (column, row) = state.input_cursor_position(20, 2);
         assert_eq!(column, 11, "cursor column on the last line");
         assert_eq!(row, 2, "cursor row below the wrapped first line");
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
         let rows = rendered_rows(&terminal);
         assert!(
-            rows[5].contains("second line"),
-            "cursor line must be visible after auto-scroll, got {:?}",
-            rows[5]
+            rows.iter().any(|row| row.contains("second line")),
+            "cursor line must be visible after auto-scroll, got {rows:?}"
         );
     }
 
@@ -2738,13 +3025,11 @@ mod tests {
         config.theme.preset = "slate".into();
         config.theme.overrides.border = Some("#1f2937".into());
         config.theme.overrides.prompt = Some("red".into());
-        config.layout.input_lines = 6;
         config.completion.enabled = false;
         config.completion.long_running_steps = 2;
         config.completion.long_running_seconds = 45;
 
         let settings = TuiSettings::from(&config);
-        assert_eq!(settings.layout.input_lines, 6);
         assert!(!settings.completion.enabled);
         assert_eq!(settings.completion.long_running_steps, 2);
         assert_eq!(settings.completion.long_running_seconds, 45);
@@ -2820,68 +3105,6 @@ mod tests {
     }
 
     #[test]
-    fn task_line_sits_above_input_and_status_is_decluttered() {
-        let mut state = AppState {
-            current_task: Some("refactor parser".into()),
-            ..Default::default()
-        };
-        let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
-        terminal.draw(|frame| render(frame, &mut state)).unwrap();
-        let rows = rendered_rows(&terminal);
-        let task_index = rows
-            .iter()
-            .position(|row| row.contains("task: refactor parser"))
-            .expect("task line rendered");
-        let prompt_index = rows
-            .iter()
-            .position(|row| row.contains("> "))
-            .expect("input prompt rendered");
-        let status_index = rows
-            .iter()
-            .position(|row| row.contains("model:") && row.contains("branch:"))
-            .expect("status bar rendered");
-        assert!(task_index < prompt_index, "task line above input");
-        assert!(prompt_index < status_index, "status below input");
-        assert!(
-            rows.iter()
-                .all(|row| !row.contains("fps") && !row.contains("GREY")),
-            "status bar is decluttered"
-        );
-        assert!(
-            rows[status_index].contains(" [OK] "),
-            "status keeps error indicator"
-        );
-    }
-
-    #[test]
-    fn splash_renders_and_dismisses_on_any_key() {
-        let mut state = AppState {
-            show_splash: true,
-            ..Default::default()
-        };
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal.draw(|frame| render(frame, &mut state)).unwrap();
-        let rows = rendered_rows(&terminal);
-        assert!(
-            rows.iter().any(|row| row.contains("/models")),
-            "splash renders slash-command hints"
-        );
-        assert!(rows.iter().any(|row| row.contains("Grey")));
-
-        assert_eq!(state.reduce_key(key(KeyCode::Char('x'))), UiAction::None);
-        assert!(!state.show_splash);
-
-        let mut quitting = AppState {
-            show_splash: true,
-            ..Default::default()
-        };
-        assert_eq!(
-            quitting.reduce_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-            UiAction::Quit
-        );
-    }
-
-    #[test]
     fn slash_status_and_models_report_into_the_transcript() {
         let mut state = AppState {
             current_provider: Some("volcano".into()),
@@ -2936,34 +3159,44 @@ mod tests {
         let mut state = AppState::default();
         let mut terminal = Terminal::new(TestBackend::new(100, 10)).unwrap();
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
-        assert!(terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .any(|cell| cell.symbol() == "[" && cell.fg == Color::Green));
+        let rows = rendered_rows(&terminal);
+        let footer = rows.last().unwrap();
+        assert!(
+            footer.contains("↑") && footer.contains("↓"),
+            "footer should contain usage arrows, footer={footer:?}"
+        );
+        assert!(
+            !footer.contains("[OK]"),
+            "footer decluttered, no [OK], footer={footer:?}"
+        );
 
         let mut config = TuiConfig::default();
         config.completion.persistent = true;
         let mut held = AppState::with_settings(TuiSettings::from(&config));
         held.schedule_completion_notice("done".into());
-        terminal.draw(|frame| render(frame, &mut held)).unwrap();
-        assert!(terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .any(|cell| cell.symbol() == "[" && cell.fg == Color::Yellow));
+        assert!(
+            held.completion_notice().is_some(),
+            "persistent notice should be stored"
+        );
 
         state.reduce_agent_event(AgentEvent::Failed("boom".into()));
         terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        let rows_err = rendered_rows(&terminal);
+        let footer_err = rows_err.last().unwrap();
+        assert!(
+            footer_err.contains("ERR"),
+            "error footer should contain ERR, footer={footer_err:?}"
+        );
         let error = Color::Rgb(0xff, 0x7b, 0x72);
-        assert!(terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .any(|cell| cell.symbol() == "[" && cell.fg == error));
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .any(|cell| cell.fg == error),
+            "error color should appear"
+        );
     }
 
     #[test]
@@ -2998,6 +3231,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(dead_code)]
     fn completion_notice_persistence_controls_hold_and_repeat_interval() {
         let mut config = TuiConfig::default();
         config.completion.notify = true;
@@ -3014,6 +3248,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(dead_code)]
     fn completion_notice_is_cleared_on_new_turn() {
         let mut config = TuiConfig::default();
         config.completion.notify = true;
@@ -3332,5 +3567,451 @@ mod tests {
 
         assert!(!finished.recv_timeout(Duration::from_millis(250)).unwrap());
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn command_registry_covers_every_parsed_command() {
+        for spec in COMMANDS {
+            let parsed = SlashCommand::parse(&format!("/{}", spec.name));
+            assert_ne!(
+                parsed,
+                SlashCommand::Unknown(spec.name.to_string()),
+                "spec `{}` not matched by parse",
+                spec.name
+            );
+        }
+        assert_eq!(SlashCommand::parse("/?"), SlashCommand::Help);
+        assert_eq!(SlashCommand::parse("/exit"), SlashCommand::Quit);
+        assert_eq!(SlashCommand::parse("/tokens"), SlashCommand::Usage);
+        assert_eq!(SlashCommand::parse("/HELP"), SlashCommand::Help);
+        assert_eq!(SlashCommand::parse("  /clear  "), SlashCommand::Clear);
+        assert_eq!(
+            SlashCommand::parse("/model"),
+            SlashCommand::Model {
+                model: String::new()
+            }
+        );
+        assert_eq!(
+            SlashCommand::parse("/model gpt-5"),
+            SlashCommand::Model {
+                model: "gpt-5".into()
+            }
+        );
+        assert_eq!(
+            SlashCommand::parse("/bogus"),
+            SlashCommand::Unknown("bogus".into())
+        );
+    }
+
+    #[allow(clippy::field_reassign_with_default)]
+    fn with_popup_state(models: &[&str]) -> AppState {
+        let mut state = AppState::default();
+        state.available_models = models.iter().map(|s| s.to_string()).collect();
+        state
+    }
+
+    #[test]
+    fn completion_popup_filters_by_prefix_and_wraps_navigation() {
+        let mut popup = CompletionPopup::default();
+        popup.sync("/", &[]);
+        assert!(popup.open);
+        assert_eq!(popup.items.len(), COMMANDS.len());
+        popup.sync("/he", &[]);
+        assert!(popup.open);
+        assert_eq!(popup.items.len(), 1);
+        assert_eq!(popup.items[0].label, "/help");
+        popup.sync("/HE", &[]);
+        assert_eq!(popup.items.len(), 1);
+        let mut popup2 = CompletionPopup::default();
+        popup2.sync("/?", &[]);
+        assert!(popup2.open);
+        assert!(popup2.items.iter().any(|item| item.label == "/help"));
+        let mut empty = CompletionPopup::default();
+        empty.sync("/bogus", &[]);
+        assert!(!empty.open);
+        assert!(empty.items.is_empty());
+        let mut spaced = CompletionPopup::default();
+        spaced.sync("/help foo", &[]);
+        assert!(!spaced.open);
+        let mut nav = CompletionPopup::default();
+        nav.sync("/", &[]);
+        let len = nav.items.len();
+        assert!(len >= 2);
+        assert_eq!(nav.selected, 0);
+        nav.select_next();
+        assert_eq!(nav.selected, 1);
+        nav.select_prev();
+        assert_eq!(nav.selected, 0);
+        nav.select_prev();
+        assert_eq!(nav.selected, len - 1);
+    }
+
+    #[test]
+    fn completion_accept_replaces_input_and_resyncs() {
+        let mut state = with_popup_state(&[]);
+        for ch in "/mod".chars() {
+            state.reduce_key(key(KeyCode::Char(ch)));
+        }
+        assert!(state.popup.open, "popup should be open for /mod");
+        let replaces = state.popup.selected_item().unwrap().replaces.clone();
+        state.accept_completion();
+        assert_eq!(state.input(), replaces);
+        assert_eq!(state.input(), "/model ");
+    }
+
+    #[test]
+    fn popup_keys_navigate_accept_and_dismiss() {
+        let mut state = with_popup_state(&[]);
+        for ch in "/".chars() {
+            state.reduce_key(key(KeyCode::Char(ch)));
+        }
+        assert!(state.popup.open);
+        state.reduce_key(key(KeyCode::Down));
+        assert_eq!(state.popup.selected, 1);
+        state.reduce_key(key(KeyCode::Up));
+        assert_eq!(state.popup.selected, 0);
+        state.reduce_key(key_with(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert_eq!(state.popup.selected, 1);
+        state.reduce_key(key_with(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert_eq!(state.popup.selected, 0);
+        let before = state.popup.selected_item().unwrap().replaces.clone();
+        state.reduce_key(key(KeyCode::Tab));
+        assert_eq!(state.input(), before);
+        let mut state2 = with_popup_state(&[]);
+        for ch in "/h".chars() {
+            state2.reduce_key(key(KeyCode::Char(ch)));
+        }
+        assert!(state2.popup.open);
+        state2.reduce_key(key(KeyCode::Esc));
+        assert!(!state2.popup.open);
+    }
+
+    #[test]
+    fn enter_accepts_or_executes_exact_match() {
+        let mut state = with_popup_state(&[]);
+        for ch in "/hel".chars() {
+            state.reduce_key(key(KeyCode::Char(ch)));
+        }
+        assert!(state.popup.open);
+        assert_eq!(state.reduce_key(key(KeyCode::Enter)), UiAction::None);
+        assert_eq!(state.input(), "/help");
+        assert_eq!(state.reduce_key(key(KeyCode::Enter)), UiAction::None);
+        assert!(state.show_help);
+    }
+
+    #[test]
+    fn completion_popup_renders_above_input_and_highlights_selection() {
+        let mut state = AppState::default();
+        for ch in "/".chars() {
+            state.reduce_key(key(KeyCode::Char(ch)));
+        }
+        assert!(state.popup.open);
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        let rows = rendered_rows(&terminal);
+        assert!(
+            rows.iter().any(|row| row.contains("/help")),
+            "popup should render /help label, rows={rows:?}"
+        );
+        // wide chars occupy two cells; TestBackend inserts a filler space between them
+        assert!(
+            rows.iter()
+                .any(|row| row.replace(' ', "").contains("显示帮助")),
+            "popup should render description, rows={rows:?}"
+        );
+        state.reduce_key(key(KeyCode::Down));
+        let mut terminal2 = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal2.draw(|frame| render(frame, &mut state)).unwrap();
+        let rows2 = rendered_rows(&terminal2);
+        assert!(rows2.iter().any(|row| row.contains("/help")));
+    }
+
+    #[test]
+    fn model_secondary_completion_lists_available_models() {
+        let mut state = AppState {
+            available_models: vec!["gpt-5".into(), "claude-4".into(), "gemini-2".into()],
+            ..Default::default()
+        };
+        for ch in "/model ".chars() {
+            state.reduce_key(key(KeyCode::Char(ch)));
+        }
+        assert!(state.popup.open, "second-level popup should be open");
+        assert_eq!(state.popup.items.len(), 3);
+        state.reduce_key(key(KeyCode::Char('g')));
+        assert_eq!(state.popup.items.len(), 2);
+        state.reduce_key(key(KeyCode::Tab));
+        assert_eq!(state.input(), "/model gpt-5");
+    }
+
+    #[test]
+    fn startup_header_precedes_transcript_and_survives_clear() {
+        let header_state = AppState::with_settings(TuiSettings::default());
+        assert!(
+            header_state.output().starts_with("Grey v"),
+            "header missing, output={:?}",
+            header_state.output()
+        );
+        assert!(header_state.output().contains("帮助"));
+        assert!(header_state.output().contains("/"));
+        let mut cleared = AppState::with_settings(TuiSettings::default());
+        cleared.append_output("old transcript\n");
+        cleared.input.text = "/clear".into();
+        cleared.input.cursor_chars = cleared.input.text.chars().count();
+        assert_eq!(cleared.reduce_key(key(KeyCode::Enter)), UiAction::None);
+        assert!(
+            cleared.output().starts_with("Grey v"),
+            "header should be re-inserted after /clear, output={:?}",
+            cleared.output()
+        );
+        assert!(!cleared.output().contains("old transcript"));
+    }
+
+    #[test]
+    fn no_splash_state_or_render_path_remains() {
+        let mut state = AppState::with_settings(TuiSettings::default());
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        let rows = rendered_rows(&terminal);
+        assert!(
+            rows.iter().all(|row| !row.contains("▄▄▄▄▄▄▄")),
+            "splash avatar should not be rendered"
+        );
+        assert!(rows.iter().any(|row| row.contains("Grey v")));
+    }
+
+    #[test]
+    fn input_area_height_clamps_to_frame_40_percent() {
+        assert_eq!(input_area_height(0, 20), 1);
+        assert_eq!(input_area_height(1, 20), 1);
+        assert_eq!(input_area_height(5, 20), 5);
+        assert_eq!(input_area_height(12, 20), 8);
+        assert_eq!(input_area_height(8, 20), 8);
+        assert_eq!(input_area_height(10, 1), 1);
+        assert_eq!(input_area_height(10, 5), 2);
+    }
+
+    #[test]
+    fn input_area_grows_with_content_and_scrolls_beyond_max() {
+        let mut state = AppState::with_settings(TuiSettings::default());
+        state.input.text = "hello".into();
+        state.input.cursor_chars = 5;
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        // single line input should not be scrolled
+        assert_eq!(state.input_scroll, 0);
+        let mut tall = AppState::with_settings(TuiSettings::default());
+        tall.input.text = (0..12)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        tall.input.cursor_chars = tall.input.text.chars().count();
+        let mut terminal2 = Terminal::new(TestBackend::new(40, 14)).unwrap();
+        terminal2.draw(|frame| render(frame, &mut tall)).unwrap();
+        // 40% * 14 = 5, 12 visual rows clamped to 5 so input_scroll should be >0
+        assert!(
+            tall.input_scroll > 0,
+            "overflow should scroll, input_scroll={}",
+            tall.input_scroll
+        );
+    }
+
+    #[test]
+    fn format_tokens_abbreviates_thousands() {
+        assert_eq!(format_tokens(0), "0");
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(1000), "1.0k");
+        assert_eq!(format_tokens(1532), "1.5k");
+        assert_eq!(format_tokens(10000), "10.0k");
+    }
+
+    #[test]
+    fn truncate_to_width_keeps_within_limit() {
+        assert_eq!(truncate_to_width("hello", 10), "hello");
+        assert_eq!(truncate_to_width("hello", 5), "hello");
+        let truncated = truncate_to_width("hello world", 8);
+        assert!(UnicodeWidthStr::width(truncated.as_str()) <= 8);
+        assert!(truncated.ends_with('…'));
+    }
+
+    #[test]
+    fn footer_shows_usage_model_branch_two_end_layout() {
+        let mut state = AppState::with_settings(TuiSettings::default());
+        state.total_input_tokens = 1500;
+        state.total_output_tokens = 42;
+        state.current_provider = Some("openai".into());
+        state.current_model = Some("gpt-5".into());
+        state.branch = Some("main".into());
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        let rows = rendered_rows(&terminal);
+        let footer = rows.last().unwrap();
+        assert!(
+            footer.contains("↑1.5k ↓42"),
+            "left usage stats, footer={footer:?}"
+        );
+        assert!(
+            footer.contains("(openai) gpt-5 (main)"),
+            "right identity, footer={footer:?}"
+        );
+    }
+
+    #[test]
+    fn footer_truncates_right_side_on_narrow_terminal() {
+        let mut state = AppState::with_settings(TuiSettings::default());
+        state.current_provider = Some("openai".into());
+        state.current_model = Some("a-very-long-model-name-that-overflows".into());
+        state.branch = Some("main".into());
+        let mut terminal = Terminal::new(TestBackend::new(30, 10)).unwrap();
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        let rows = rendered_rows(&terminal);
+        let footer = rows.last().unwrap();
+        assert!(
+            footer.contains('…'),
+            "right side truncated, footer={footer:?}"
+        );
+        assert!(footer.contains("↑0 ↓0"), "left side kept");
+    }
+
+    #[test]
+    fn conversation_has_no_borders_and_separator_divides_input() {
+        let mut state = AppState::with_settings(TuiSettings::default());
+        state.append_output("hello transcript");
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        terminal.draw(|frame| render(frame, &mut state)).unwrap();
+        let rows = rendered_rows(&terminal);
+        assert!(
+            rows.iter()
+                .all(|row| !row.contains('┌') && !row.contains('┐')),
+            "no box-drawing borders, rows={rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.starts_with('─')),
+            "separator line, rows={rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .all(|row| !row.contains(" fps") && !row.contains("GREY")),
+            "status decluttered"
+        );
+    }
+
+    #[test]
+    fn wheel_routes_by_pointer_region_and_input_overflow() {
+        let mut state = AppState::with_settings(TuiSettings::default());
+        state.total_input_tokens = 0;
+        state.total_output_tokens = 0;
+        state.last_layout = Some(LayoutRects {
+            conversation: Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 6,
+            },
+            input: Rect {
+                x: 0,
+                y: 7,
+                width: 40,
+                height: 2,
+            },
+            popup: None,
+        });
+        state.scroll = 0;
+        state.max_scroll = 20;
+        state.scroll_at(5, 2, MOUSE_SCROLL_LINES);
+        assert_eq!(
+            state.scroll, 3,
+            "wheel over conversation scrolls transcript"
+        );
+        state.input.text = "hi".into();
+        state.input.cursor_chars = 2;
+        state.input_scroll = 0;
+        state.input_scroll_manual = false;
+        state.scroll_at(5, 8, MOUSE_SCROLL_LINES);
+        assert_eq!(
+            state.scroll, 6,
+            "wheel over non-overflow input falls through"
+        );
+        assert_eq!(state.input_scroll, 0);
+        let mut over = AppState::with_settings(TuiSettings::default());
+        over.input.text = (0..6)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        over.input.cursor_chars = over.input.text.chars().count();
+        over.last_layout = Some(LayoutRects {
+            conversation: Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 6,
+            },
+            input: Rect {
+                x: 0,
+                y: 7,
+                width: 40,
+                height: 2,
+            },
+            popup: None,
+        });
+        over.scroll = 5;
+        over.max_scroll = 10;
+        over.input_scroll = 0;
+        over.input_scroll_manual = false;
+        over.scroll_at(5, 8, MOUSE_SCROLL_LINES);
+        assert_eq!(
+            over.input_scroll, 3,
+            "wheel over overflow input scrolls input"
+        );
+        assert_eq!(over.scroll, 5, "conversation untouched");
+        over.scroll_at(5, 8, -MOUSE_SCROLL_LINES);
+        assert_eq!(over.input_scroll, 0);
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn wheel_over_popup_navigates_selection() {
+        let mut state = AppState::with_settings(TuiSettings::default());
+        state.available_models = vec!["a".into(), "b".into(), "c".into()];
+        for ch in "/".chars() {
+            state.reduce_key(key(KeyCode::Char(ch)));
+        }
+        assert!(state.popup.open);
+        let popup_rect = Rect {
+            x: 0,
+            y: 4,
+            width: 20,
+            height: 3,
+        };
+        state.last_layout = Some(LayoutRects {
+            conversation: Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 4,
+            },
+            input: Rect {
+                x: 0,
+                y: 7,
+                width: 40,
+                height: 2,
+            },
+            popup: Some(popup_rect),
+        });
+        assert_eq!(state.popup.selected, 0);
+        state.scroll_at(2, 5, MOUSE_SCROLL_LINES);
+        assert_eq!(state.popup.selected, 1);
+        state.scroll_at(2, 5, -MOUSE_SCROLL_LINES);
+        assert_eq!(state.popup.selected, 0);
+    }
+
+    #[test]
+    fn editing_resets_input_manual_scroll() {
+        let mut state = AppState::with_settings(TuiSettings::default());
+        state.input_scroll_manual = true;
+        state.reduce_key(key(KeyCode::Char('a')));
+        assert!(
+            !state.input_scroll_manual,
+            "editing should reset manual flag"
+        );
     }
 }

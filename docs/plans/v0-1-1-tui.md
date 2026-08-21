@@ -50,3 +50,15 @@
 - 扩展 package 体系（Pi 式 extensions + 主题 + prompt 模板打包共享）
 - `/reload` 自我修改
 - 其余体验中产生的新需求
+
+## 人工审核后意见（已落地 2026-08-21）
+
+1. TUI冗杂，不够简洁清新清晰；开屏页面很丑，不如Opencode和Pi那样简单明了 → ✅ 已落地：删全屏 splash 改 Pi 式 header（`a272ecf`），去边框+分隔线+Pi式footer（`fb78b5b`）
+2. 输入栏目没有换行 之有换页，感觉根因是固定了输入栏和输出栏的大小，可以调整 → ✅ 已落地：输入区自适应高度 40% clamp（`67ee511`）
+3. '/'命令没有类似LSP的自动补全和提示，需添加；‘/’没有独立选择框，我要的是和Neovim差不多的使用体验 → ✅ 已落地：Neovim式浮窗补全+`/model`二级（`2c61014` `0c43427`）
+4. 状态栏不清晰，没有显示模型，分支，输入token和输出token；这个状态的排版也有问题，可以参考Pi的插件？ → ✅ 已落地：Pi式两端footer `↑in ↓out` 左、` (provider) model (branch)` 右，超宽截断（`fb78b5b`）
+5. 滚轮支持 → ✅ 已落地：按区域分流 popup/input/会话（`f02dae0`）
+6. 其他功能还没有尝试，等我尝试过后再说； → ⏳ 待体验
+
+> 关联 spec：`docs/superpowers/specs/2026-08-21-v0-1-1-tui-simplify-design.md`
+> 关联 plan：`docs/superpowers/plans/2026-08-21-v0-1-1-tui-simplify.md`
