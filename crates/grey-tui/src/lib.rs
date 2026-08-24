@@ -97,6 +97,7 @@ struct RenderTheme {
     error: Color,
     success: Color,
     warning: Color,
+    path: Color,
 }
 
 #[derive(Debug, Clone)]
@@ -117,6 +118,7 @@ impl TuiTheme {
                 error: Color::Rgb(0xff, 0x7b, 0x72),
                 success: Color::Green,
                 warning: Color::Yellow,
+                path: Color::Rgb(0xf0, 0xc6, 0x74),
             },
             "slate" => RenderTheme {
                 border: Color::Blue,
@@ -128,6 +130,7 @@ impl TuiTheme {
                 error: Color::LightRed,
                 success: Color::Green,
                 warning: Color::Yellow,
+                path: Color::Yellow,
             },
             "sunset" => RenderTheme {
                 border: Color::DarkGray,
@@ -139,6 +142,7 @@ impl TuiTheme {
                 error: Color::LightRed,
                 success: Color::Green,
                 warning: Color::Yellow,
+                path: Color::Yellow,
             },
             "mono" => RenderTheme {
                 border: Color::White,
@@ -150,6 +154,7 @@ impl TuiTheme {
                 error: Color::LightRed,
                 success: Color::Green,
                 warning: Color::Yellow,
+                path: Color::Yellow,
             },
             _ => RenderTheme {
                 border: Color::Blue,
@@ -161,6 +166,7 @@ impl TuiTheme {
                 error: Color::LightRed,
                 success: Color::Green,
                 warning: Color::Yellow,
+                path: Color::Yellow,
             },
         };
         apply_theme_override(&mut theme, &config.overrides);
@@ -969,6 +975,11 @@ pub struct AppState {
     popup_rect: Option<Rect>,
     last_layout: Option<LayoutRects>,
     input_scroll_manual: bool,
+    // Tool log folding: default collapsed, expand on click/Ctrl+E
+    expanded_blocks: std::collections::HashSet<u64>,
+    next_block_id: u64,
+    pending_block_id: Option<u64>,
+    last_block_id: Option<u64>,
 }
 
 #[allow(dead_code)]
@@ -1020,6 +1031,10 @@ impl Default for AppState {
             popup_rect: None,
             last_layout: None,
             input_scroll_manual: false,
+            expanded_blocks: std::collections::HashSet::new(),
+            next_block_id: 0,
+            pending_block_id: None,
+            last_block_id: None,
         }
     }
 }
@@ -1076,6 +1091,128 @@ impl AppState {
 
     fn total_usage(&self) -> (u64, u64) {
         (self.total_input_tokens, self.total_output_tokens)
+    }
+
+    /// Folded display text: tool blocks collapsed by default.
+    fn folded_output(&self) -> String {
+        let mut out = String::new();
+        let mut rest = self.output.as_str();
+        while let Some(start) = rest.find('\x01') {
+            out.push_str(&rest[..start]);
+            let after = &rest[start + 1..];
+            if let Some(id_end) = after.find('\x01') {
+                let id_str = &after[..id_end];
+                if let Ok(id) = id_str.parse::<u64>() {
+                    let block_start = start + 1 + id_end + 1;
+                    let end_marker = format!("\x02{id}\x02");
+                    if let Some(end_pos) = rest[block_start..].find(&end_marker) {
+                        let block_content = &rest[block_start..block_start + end_pos];
+                        if self.expanded_blocks.contains(&id) {
+                            let mut lines = block_content.split('\n');
+                            if let Some(first) = lines.next() {
+                                out.push_str("▾ ");
+                                out.push_str(first);
+                                out.push('\n');
+                            }
+                            for line in lines {
+                                out.push_str(line);
+                                out.push('\n');
+                            }
+                        } else {
+                            let title = block_content
+                                .lines()
+                                .rev()
+                                .find(|l| l.starts_with("[tool:"))
+                                .unwrap_or("[tool]");
+                            let count = block_content
+                                .lines()
+                                .filter(|l| !l.is_empty() && !l.starts_with("[tool:"))
+                                .count();
+                            if count > 0 {
+                                out.push_str(&format!("▸ {title} ({} lines)\n", count));
+                            } else {
+                                out.push_str(&format!("▸ {title}\n"));
+                            }
+                        }
+                        rest = &rest[block_start + end_pos + end_marker.len()..];
+                        continue;
+                    }
+                }
+            }
+            out.push('\x01');
+            rest = &rest[start + 1..];
+        }
+        out.push_str(rest);
+        // strip stray markers
+        out.replace('\x02', "")
+    }
+
+    fn toggle_block(&mut self, id: u64) {
+        if !self.expanded_blocks.remove(&id) {
+            self.expanded_blocks.insert(id);
+        }
+        self.dirty = true;
+    }
+
+    fn toggle_last_block(&mut self) {
+        if let Some(id) = self.last_block_id {
+            self.toggle_block(id);
+        }
+    }
+
+    fn ordered_block_ids(&self) -> Vec<u64> {
+        let mut ids = Vec::new();
+        let mut rest = self.output.as_str();
+        while let Some(start) = rest.find('\x01') {
+            let after = &rest[start + 1..];
+            if let Some(id_end) = after.find('\x01') {
+                if let Ok(id) = after[..id_end].parse::<u64>() {
+                    let block_start = start + 1 + id_end + 1;
+                    let end_marker = format!("\x02{id}\x02");
+                    if rest[block_start..].contains(&end_marker) {
+                        ids.push(id);
+                        if let Some(pos) = rest[block_start..].find(&end_marker) {
+                            rest = &rest[block_start + pos + end_marker.len()..];
+                            continue;
+                        }
+                    }
+                }
+            }
+            rest = &rest[start + 1..];
+        }
+        ids
+    }
+
+    /// Handle mouse click in conversation area; returns true if a fold was toggled.
+    fn handle_click(&mut self, column: u16, row: u16) -> bool {
+        let Some(rects) = self.last_layout else {
+            return false;
+        };
+        if !rect_contains(rects.conversation, column, row) {
+            return false;
+        }
+        let width = rects.conversation.width.max(1) as usize;
+        let target_wrap_row = (row - rects.conversation.y) as u32 + self.scroll as u32;
+        let folded = self.folded_output();
+        let ordered = self.ordered_block_ids();
+        let mut wrap_row: u32 = 0;
+        let mut title_idx = 0usize;
+        for line in folded.split('\n') {
+            let is_title = line.starts_with("▸ ") || line.starts_with("▾ ");
+            let rows = wrap_input_line(line, width).len().max(1) as u32;
+            if is_title {
+                if title_idx < ordered.len() {
+                    let id = ordered[title_idx];
+                    if target_wrap_row >= wrap_row && target_wrap_row < wrap_row + rows {
+                        self.toggle_block(id);
+                        return true;
+                    }
+                }
+                title_idx += 1;
+            }
+            wrap_row += rows;
+        }
+        false
     }
 
     fn model_info(&self) -> Option<(&str, &str)> {
@@ -1145,6 +1282,9 @@ impl AppState {
     fn clear_output(&mut self) {
         self.clear_completion_notice();
         self.output.clear();
+        self.expanded_blocks.clear();
+        self.pending_block_id = None;
+        self.last_block_id = None;
         self.pending_completion_bell = None;
         self.status = "output cleared".into();
         self.scroll = 0;
@@ -1446,6 +1586,12 @@ impl AppState {
             return UiAction::None;
         }
 
+        // Ctrl+E toggles latest tool block fold (default collapsed)
+        if key.code == KeyCode::Char('e') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.toggle_last_block();
+            return UiAction::None;
+        }
+
         if self.settings.keys.scroll_up.matches(key) {
             let previous = self.scroll;
             self.scroll = previous.saturating_sub(SCROLL_PAGE_LINES);
@@ -1554,6 +1700,13 @@ impl AppState {
         }
 
         let changed = match key.code {
+            // Shift+Enter 在部分终端（如 Kaku/WezTerm）被绑定为发送一个字面 `\n`，
+            // raw mode 下 crossterm 将其解析为 Ctrl+J；这里统一按换行处理。
+            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.popup.open = false;
+                self.input.insert_newline();
+                true
+            }
             KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.input.insert(character);
                 true
@@ -1620,8 +1773,12 @@ impl AppState {
                 self.status = "streaming".into();
             }
             AgentEvent::ToolStarted(call) => {
+                let id = self.next_block_id;
+                self.next_block_id += 1;
+                self.pending_block_id = Some(id);
+                self.last_block_id = Some(id);
                 self.append_output(&format!(
-                    "\n[tool:start] {} {}\n",
+                    "\n\x01{id}\x01[tool:start] {} {}\n",
                     call.name, call.arguments
                 ));
                 self.status_error = false;
@@ -1629,8 +1786,14 @@ impl AppState {
             }
             AgentEvent::ToolFinished(result) => {
                 let outcome = if result.success { "ok" } else { "failed" };
+                let id = self.pending_block_id.take().unwrap_or_else(|| {
+                    let id = self.next_block_id;
+                    self.next_block_id += 1;
+                    id
+                });
+                self.last_block_id = Some(id);
                 self.append_output(&format!(
-                    "[tool:{outcome}] {}\n{}\n",
+                    "[tool:{outcome}] {}\n{}\x02{id}\x02\n",
                     result.name, result.output
                 ));
                 self.status_error = false;
@@ -1728,7 +1891,8 @@ impl AppState {
     /// Recompute the maximum scroll from the exact wrapped paragraph height.
     pub fn update_viewport(&mut self, content_width: u16, content_height: u16) {
         let theme = self.settings.theme.colors.clone();
-        let line_count = Paragraph::new(markdown_text(&self.output, &theme))
+        let display = self.folded_output();
+        let line_count = Paragraph::new(markdown_text(&display, &theme))
             .wrap(Wrap { trim: false })
             .line_count(content_width.max(1));
         self.max_scroll = line_count
@@ -1880,6 +2044,9 @@ async fn run_loop<B: Backend>(
                     }
                     InputMessage::ScrollDown { column, row } => {
                         state.scroll_at(column, row, MOUSE_SCROLL_LINES)
+                    }
+                    InputMessage::Click { column, row } => {
+                        state.handle_click(column, row);
                     }
                     InputMessage::Resize => state.note_resize(),
                     InputMessage::Error(error) => anyhow::bail!("reading terminal input: {error}"),
@@ -2095,7 +2262,8 @@ fn render(frame: &mut Frame<'_>, state: &mut AppState) {
     .split(frame.area());
 
     state.update_viewport(chunks[0].width, chunks[0].height);
-    let conversation = Paragraph::new(markdown_text(state.output.as_str(), &theme))
+    let display = state.folded_output();
+    let conversation = Paragraph::new(markdown_text(&display, &theme))
         .wrap(Wrap { trim: false })
         .scroll((state.scroll, 0));
     frame.render_widget(conversation, chunks[0]);
@@ -2232,6 +2400,35 @@ fn render_completion_popup(
     Some(area)
 }
 
+fn is_path_token(token: &str) -> bool {
+    // strip trailing punctuation
+    let t = token.trim_matches(|c: char| {
+        matches!(
+            c,
+            ',' | '.' | ';' | ':' | '!' | '?' | ')' | ']' | '"' | '\''
+        )
+    });
+    if t.is_empty() || t.len() < 3 {
+        return false;
+    }
+    // must contain '/' or end with known source ext; exclude version-like v0.1.1
+    const EXTS: &[&str] = &[
+        ".rs", ".py", ".ts", ".js", ".tsx", ".jsx", ".go", ".toml", ".json", ".md", ".lua", ".sh",
+        ".zsh", ".yaml", ".yml", ".css", ".html", ".c", ".h", ".cpp", ".lisp", ".rb", ".java",
+        ".kt", ".swift",
+    ];
+    if t.contains('/') {
+        // require at least one segment has '.' or length>2
+        return t.chars().any(|c| c == '.' || c == '/') && !t.starts_with("http");
+    }
+    for ext in EXTS {
+        if t.ends_with(ext) && t.len() > ext.len() {
+            return true;
+        }
+    }
+    false
+}
+
 fn markdown_text(source: &str, theme: &RenderTheme) -> Text<'static> {
     use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
     let accent = Style::default().fg(theme.accent);
@@ -2353,7 +2550,34 @@ fn markdown_text(source: &str, theme: &RenderTheme) -> Text<'static> {
                         list_depth,
                         quote_depth,
                     );
-                    line.push(Span::styled(content.to_string(), style));
+                    let path_style = style.fg(theme.path);
+                    // Inline path highlighting for bare paths in plain text
+                    let mut remaining = content.as_ref();
+                    while !remaining.is_empty() {
+                        // find next token boundary (whitespace)
+                        let next_ws = remaining.find(|c: char| c.is_whitespace());
+                        let (token, rest) = match next_ws {
+                            Some(idx) => (&remaining[..idx], &remaining[idx..]),
+                            None => (remaining, ""),
+                        };
+                        if !token.is_empty() {
+                            if is_path_token(token) {
+                                line.push(Span::styled(token.to_string(), path_style));
+                            } else {
+                                line.push(Span::styled(token.to_string(), style));
+                            }
+                        }
+                        if !rest.is_empty() {
+                            // push whitespace run as-is
+                            let ws_end = rest
+                                .find(|c: char| !c.is_whitespace())
+                                .unwrap_or(rest.len());
+                            line.push(Span::styled(rest[..ws_end].to_string(), style));
+                            remaining = &rest[ws_end..];
+                        } else {
+                            remaining = "";
+                        }
+                    }
                 }
             }
             Event::Code(content) => {
@@ -2390,6 +2614,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, state: &AppState, theme: &RenderTh
             " {} / {} / 滚轮  滚动消息",
             labels.scroll_up, labels.scroll_down
         )),
+        Line::from(" Ctrl+E / 点击 ▸  展开/收起工具日志"),
         Line::from(""),
         Line::from("斜杠命令"),
         Line::from(""),
@@ -2529,6 +2754,7 @@ enum InputMessage {
     Key(KeyEvent),
     ScrollUp { column: u16, row: u16 },
     ScrollDown { column: u16, row: u16 },
+    Click { column: u16, row: u16 },
     Resize,
     Error(String),
 }
@@ -2590,6 +2816,10 @@ fn read_input(stop: Arc<AtomicBool>, sender: mpsc::Sender<InputMessage>) {
                             row: mouse.row,
                         }),
                         MouseEventKind::ScrollDown => Some(InputMessage::ScrollDown {
+                            column: mouse.column,
+                            row: mouse.row,
+                        }),
+                        MouseEventKind::Down(_) => Some(InputMessage::Click {
                             column: mouse.column,
                             row: mouse.row,
                         }),
@@ -2801,6 +3031,20 @@ mod tests {
         assert_eq!(Command::parse("/status"), Command::Status);
         assert_eq!(Command::parse("/models"), Command::Models);
         assert_eq!(Command::parse("/wat"), Command::Unknown("wat".into()));
+    }
+
+    #[test]
+    fn ctrl_j_newline_supports_kaku_shift_enter_mapping() {
+        // Kaku/WezTerm 把 Shift+Enter 绑定为 SendString('\n')，raw mode 下 crossterm
+        // 解析为 Ctrl+J（Char('j') + CONTROL）。它应等价于换行而非被丢弃。
+        let mut state = AppState::default();
+        type_text(&mut state, "alpha");
+        assert_eq!(
+            state.reduce_key(key_with(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+            UiAction::None
+        );
+        type_text(&mut state, "beta");
+        assert_eq!(state.input(), "alpha\nbeta");
     }
 
     #[test]
@@ -4013,5 +4257,69 @@ mod tests {
             !state.input_scroll_manual,
             "editing should reset manual flag"
         );
+    }
+
+    #[test]
+    fn tool_block_folds_by_default_and_expands_on_toggle() {
+        let mut state = AppState::default();
+        // Simulate tool call
+        state.reduce_agent_event(AgentEvent::ToolStarted(ToolCall {
+            id: "call_1".into(),
+            name: "glob".into(),
+            arguments: serde_json::json!({"pattern": "*.rs"}),
+        }));
+        state.reduce_agent_event(AgentEvent::ToolFinished(ToolResult {
+            call_id: "call_1".into(),
+            name: "glob".into(),
+            success: true,
+            output: "crates/grey-core/src/lib.rs\ncrates/grey-tui/src/lib.rs\n".into(),
+        }));
+        let folded = state.folded_output();
+        assert!(
+            folded.contains("▸ [tool:ok] glob"),
+            "collapsed should show summary, got {folded:?}"
+        );
+        assert!(
+            !folded.contains("crates/grey-core"),
+            "collapsed should hide paths"
+        );
+        // toggle expand
+        let id = state.last_block_id.unwrap();
+        state.toggle_block(id);
+        let expanded = state.folded_output();
+        assert!(expanded.contains("▾"), "expanded prefix, got {expanded:?}");
+        assert!(
+            expanded.contains("crates/grey-core"),
+            "expanded shows paths"
+        );
+    }
+
+    #[test]
+    fn ctrl_e_toggles_last_tool_block() {
+        let mut state = AppState::default();
+        state.reduce_agent_event(AgentEvent::ToolStarted(ToolCall {
+            id: "c1".into(),
+            name: "grep".into(),
+            arguments: serde_json::json!({}),
+        }));
+        state.reduce_agent_event(AgentEvent::ToolFinished(ToolResult {
+            call_id: "c1".into(),
+            name: "grep".into(),
+            success: true,
+            output: "src/main.rs:1: hello\n".into(),
+        }));
+        assert!(state.folded_output().contains("▸"));
+        state.reduce_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert!(state.folded_output().contains("▾"), "Ctrl+E should expand");
+    }
+
+    #[test]
+    fn is_path_token_detects_paths() {
+        assert!(is_path_token("crates/grey-tui/src/lib.rs"));
+        assert!(is_path_token("src/main.rs"));
+        assert!(is_path_token("README.md"));
+        assert!(!is_path_token("v0.1.1"));
+        assert!(!is_path_token("hello"));
+        assert!(!is_path_token("world,"));
     }
 }
