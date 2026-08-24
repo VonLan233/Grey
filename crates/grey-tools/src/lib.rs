@@ -358,7 +358,7 @@ impl ToolExecutor for LspTools {
         vec![
             ToolDefinition {
                 name: "lsp_diagnostics".into(),
-                description: "Run LSP diagnostics for a workspace file and return findings.".into(),
+                description: "LSP diagnostics.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -372,9 +372,7 @@ impl ToolExecutor for LspTools {
             },
             ToolDefinition {
                 name: "lsp_definition".into(),
-                description:
-                    "Run LSP definition lookup for a workspace file and return target locations."
-                        .into(),
+                description: "LSP definition lookup.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -390,9 +388,7 @@ impl ToolExecutor for LspTools {
             },
             ToolDefinition {
                 name: "lsp_references".into(),
-                description:
-                    "Run LSP reference lookup for a workspace file and return project-wide usages."
-                        .into(),
+                description: "LSP references.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -1532,7 +1528,7 @@ fn definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "read_file".into(),
-            description: "Read a UTF-8 file inside the workspace, optionally by line range.".into(),
+            description: "Read file by path, optional line range.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1547,8 +1543,7 @@ fn definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "edit_file".into(),
-            description: "Atomically replace one exact string in an existing workspace file."
-                .into(),
+            description: "Edit file: replace one exact string.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1563,8 +1558,7 @@ fn definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "bash".into(),
-            description: "Run a shell command in the workspace with a bounded timeout and output."
-                .into(),
+            description: "Run shell command with timeout.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1578,8 +1572,7 @@ fn definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "glob".into(),
-            description: "List workspace files matching a glob while respecting ignore files."
-                .into(),
+            description: "List files by glob.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1593,8 +1586,7 @@ fn definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "grep".into(),
-            description: "Search UTF-8 workspace files with a regular expression and line numbers."
-                .into(),
+            description: "Search files by regex.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
