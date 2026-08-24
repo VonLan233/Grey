@@ -2307,13 +2307,18 @@ fn render(frame: &mut Frame<'_>, state: &mut AppState) {
     frame.render_widget(input, chunks[2]);
     if input_inner.width > 0 && input_inner.height > 0 {
         let (cursor_column, cursor_row) = state.input_cursor_position(input_width, prompt_width);
+        // Only the very first visual row (row 0) has "> " prompt.
+        let cursor_x_offset = if cursor_row == 0 {
+            prompt_width + cursor_column
+        } else {
+            cursor_column
+        };
         let cursor_row = cursor_row.saturating_sub(usize::from(state.input_scroll));
         let cursor_y = input_inner.y.saturating_add(
             cursor_row.min(usize::from(input_inner.height.saturating_sub(1))) as u16,
         );
         let cursor_x = input_inner.x.saturating_add(
-            (prompt_width + cursor_column).min(usize::from(input_inner.width.saturating_sub(1)))
-                as u16,
+            cursor_x_offset.min(usize::from(input_inner.width.saturating_sub(1))) as u16,
         );
         frame.set_cursor_position((cursor_x, cursor_y));
     }
