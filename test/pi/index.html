@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>黑洞 · Black Hole</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #000;
+  }
+  canvas {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+  }
+</style>
+</head>
+<body>
+<canvas id="bh"></canvas>
+<script>
+(() => {
+  'use strict';
+
+  const canvas = document.getElementById('bh');
+  const ctx = canvas.getContext('2d');
+  let W = 0, H = 0, cx = 0, cy = 0;
+
+  /* ---------- responsive sizing (devicePixelRatio aware) ---------- */
+  function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    cx = W / 2;
+    cy = H / 2;
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  /* ---------- starfield ---------- */
+  const STAR_N = Math.max(260, Math.floor((W * H) / 2600));
+  const palette = ['255,255,255', '210,225,255', '255,230,200', '190,210,255'];
+  const stars = [];
+  for (let i = 0; i < STAR_N; i++) {
+    stars.push({
+      x: Math.random(), y: Math.random(),          // normalized coords
+      r: 0.4 + Math.random() * 1.1,                // radius px
+      a: 0.3 + Math.random() * 0.7,                // base alpha
+      s: 0.5 + Math.random() * 1.8,                // twinkle speed
+      p: Math.random() * Math.PI * 2,              // twinkle phase
+      c: palette[(Math.random() * palette.length) | 0],
+      drift: 0.012 + Math.random() * 0.02,         // slow parallax (per second, normalized)
+    });
+  }
+
+  /* ---------- black hole metrics ---------- */
+  // sizes scale with the smaller viewport dimension → responsive
+  const minDim = () => Math.min(W, H);
+  const R_H    = () => minDim() * 0.12;   // event horizon
+  const R_PH   = () => R_H() * 2.6;       // photon ring (≈ 2.6 Schwarzschild radii)
+  const R_DISK = () => R_H() * 3.4;       // accretion disk outer radius
+
+  const TILT = 0.32;       // disk squash factor (viewing angle)
+  const DISK_ROT = 0.55;   // disk axis rotation in the screen plane
+
+  /* ---------- gravity lensing: stars inside the photon ring get
+     collapsed onto a shimmering ring around the black hole ---------- */
+  function drawStars(t) {
+    const rp = R_PH();
+    for (const s of stars) {
+      // slow parallax drift
+      s.x += s.drift * (1 / 60);
+      if (s.x > 1) s.x -= 1;
+
+      const x = s.x * W, y = s.y * H;
+      let dx = x - cx, dy = y - cy;
+      const d = Math.hypot(dx, dy);
+      let tx = x, ty = y;
+      let alpha = s.a * (0.55 + 0.45 * Math.sin(t * s.s * 0.001 + s.p));
+
+      if (d < rp) {
+        const ang = Math.atan2(dy, dx);
+        const r = rp * (0.93 + 0.08 * Math.sin(s.p * 3.1)); // jitter → shimmer
+        tx = cx + Math.cos(ang) * r;
+        ty = cy + Math.sin(ang) * r;
+        alpha *= 0.75;
+      }
+
+      ctx.globalAlpha = Math.min(1, alpha);
+      ctx.fillStyle = 'rgba(' + s.c + ',1)';
+      ctx.beginPath();
+      ctx.arc(tx, ty, s.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  /* ---------- accretion disk (tilted ellipse + doppler gradient + rotating hot bands) ---------- */
+  function drawDisk(t) {
+    const rh = R_H(), rp = R_PH(), rd = R_DISK();
+
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(DISK_ROT);
+    ctx.scale(1, TILT);
+
+    // radial shading: hot near the horizon, cooling & fading outward
+    const rg = ctx.createRadialGradient(0, 0, rh * 0.6, 0, 0, rd);
+    rg.addColorStop(0.00, 'rgba(255,235,200,1)');
+    rg.addColorStop(0.16, 'rgba(255,200,120,0.95)');
+    rg.addColorStop(0.38, 'rgba(235,130,55,0.6)');
+    rg.addColorStop(0.62, 'rgba(150,60,30,0.28)');
+    rg.addColorStop(0.85, 'rgba(80,28,16,0.10)');
+    rg.addColorStop(1.00, 'rgba(20,6,4,0)');
+    ctx.fillStyle = rg;
+    ctx.beginPath();
+    ctx.arc(0, 0, rd, 0, Math.PI * 2);
+    ctx.fill();
+
+    // doppler beaming: left edge (approaching us) brighter than right
+    const dg = ctx.createLinearGradient(-rd, 0, rd, 0);
+    dg.addColorStop(0.00, 'rgba(255,245,225,0.35)');
+    dg.addColorStop(0.45, 'rgba(255,190,120,0.12)');
+    dg.addColorStop(0.55, 'rgba(120,50,25,0)');
+    dg.addColorStop(1.00, 'rgba(40,12,8,0.10)');
+    ctx.fillStyle = dg;
+    ctx.beginPath();
+    ctx.arc(0, 0, rd, 0, Math.PI * 2);
+    ctx.fill();
+
+    // rotating hot bands, clipped to the disk so they read as 3D
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(0, 0, rd, 0, Math.PI * 2);
+    ctx.clip();
+
+    const bandR = rp * 1.25;
+    const spread = Math.PI * 0.5;
+    const baseAng = t * 0.00035;
+    for (let k = 0; k < 2; k++) {
+      const a0 = baseAng + k * Math.PI;
+      ctx.beginPath();
+      ctx.arc(0, 0, bandR, a0, a0 + spread);
+      ctx.lineWidth = rd * 0.16;
+      ctx.lineCap = 'round';
+      ctx.strokeStyle = 'rgba(255,200,120,0.32)';
+      ctx.shadowColor = 'rgba(255,180,90,0.85)';
+      ctx.shadowBlur = 16;
+      ctx.stroke();
+    }
+    ctx.restore();
+    ctx.restore();
+  }
+
+  /* ---------- photon ring (thin bright ring + soft glow) ---------- */
+  function drawPhotonRing() {
+    const rp = R_PH();
+    ctx.save();
+    ctx.translate(cx, cy);
+
+    // soft glow peaking at the ring radius
+    const glow = ctx.createRadialGradient(0, 0, rp * 0.5, 0, 0, rp * 1.45);
+    glow.addColorStop(0.00, 'rgba(0,0,0,0)');
+    glow.addColorStop(0.62, 'rgba(255,160,90,0.08)');
+    glow.addColorStop(0.82, 'rgba(255,210,150,0.30)');
+    glow.addColorStop(0.90, 'rgba(255,250,235,0.55)');
+    glow.addColorStop(1.00, 'rgba(0,0,0,0)');
+    ctx.fillStyle = glow;
+    ctx.beginPath();
+    ctx.arc(0, 0, rp * 1.45, 0, Math.PI * 2);
+    ctx.fill();
+
+    // sharp luminous ring
+    ctx.strokeStyle = 'rgba(255,240,210,0.9)';
+    ctx.lineWidth = 2.4;
+    ctx.shadowColor = 'rgba(255,200,120,0.9)';
+    ctx.shadowBlur = 14;
+    ctx.beginPath();
+    ctx.arc(0, 0, rp, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  /* ---------- event horizon (pure black disc) ---------- */
+  function drawHorizon() {
+    const rh = R_H();
+    ctx.save();
+    ctx.translate(cx, cy);
+    // soft dark rim to ease the edge against the glow
+    const rim = ctx.createRadialGradient(0, 0, rh * 0.7, 0, 0, rh * 1.02);
+    rim.addColorStop(0.00, 'rgba(0,0,0,1)');
+    rim.addColorStop(0.82, 'rgba(0,0,0,1)');
+    rim.addColorStop(1.00, 'rgba(0,0,0,0)');
+    ctx.fillStyle = rim;
+    ctx.beginPath();
+    ctx.arc(0, 0, rh * 1.02, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  /* ---------- ambient glow cast by the accretion light ---------- */
+  function drawAmbient() {
+    const rd = R_DISK();
+    const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, rd * 1.8);
+    g.addColorStop(0.00, 'rgba(255,120,60,0.10)');
+    g.addColorStop(0.45, 'rgba(120,50,30,0.05)');
+    g.addColorStop(1.00, 'rgba(0,0,0,0)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  /* ---------- main loop ---------- */
+  let t = 0;
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    t += dt;
+
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+
+    drawAmbient();
+    drawStars(t);
+    drawDisk(t);
+    drawPhotonRing();
+    drawHorizon();
+
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
