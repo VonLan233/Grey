@@ -39,7 +39,7 @@ pub struct ProviderEntry {
     pub version: String,
     #[serde(default)]
     pub max_tokens: u32,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub include_usage: bool,
     #[serde(default)]
     pub models: Vec<ModelEntry>,
@@ -130,6 +130,10 @@ pub struct SkillConfig {
 }
 
 fn default_skill_enabled() -> bool {
+    true
+}
+
+fn default_true() -> bool {
     true
 }
 

@@ -267,9 +267,19 @@ struct StreamFunction {
 
 #[derive(Debug, Deserialize)]
 struct UsageShape {
-    #[serde(default)]
+    #[serde(
+        default,
+        alias = "input_tokens",
+        alias = "promptTokens",
+        alias = "inputTokens"
+    )]
     prompt_tokens: u64,
-    #[serde(default)]
+    #[serde(
+        default,
+        alias = "output_tokens",
+        alias = "completionTokens",
+        alias = "outputTokens"
+    )]
     completion_tokens: u64,
 }
 
