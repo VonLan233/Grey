@@ -15,191 +15,204 @@
   }
   canvas {
     display: block;
-    width: 100vw;
-    height: 100vh;
+    width: 100%;
+    height: 100%;
   }
 </style>
 </head>
 <body>
-<canvas id="bh"></canvas>
+<canvas id="scene"></canvas>
 <script>
 (function () {
   'use strict';
 
-  const canvas = document.getElementById('bh');
-  const ctx = canvas.getContext('2d');
+  var canvas = document.getElementById('scene');
+  var ctx = canvas.getContext('2d');
 
-  let W = 0, H = 0, DPR = 1;
+  var W = 0, H = 0, DPR = 1;
 
-  // ---- Starfield data ----
-  const STARS = 320;
-  let stars = [];
+  // ---------- starfield ----------
+  var LAYERS = 3;               // parallax depth layers
+  var STAR_COUNT = 260;         // stars per layer
+  var stars = [];
+  var twinkle = [];
 
-  // ---- Black hole / disk parameters (relative to min dimension) ----
-  const cfg = {
-    horizonR: 0.11,   // event horizon radius (black circle)
-    photonR: 0.17,    // photon ring radius
-    diskOuter: 0.55,  // accretion disk outer radius
-    diskInner: 0.18,  // accretion disk inner radius (falls behind horizon)
-    diskTilt: 0.35,   // vertical squash factor -> perceived tilt
-    diskAlpha: 0.55,
-    warp: 2.6         // gravitational lensing strength for the ring glow
-  };
-
-  function resize() {
-    DPR = Math.min(window.devicePixelRatio || 1, 2);
-    W = window.innerWidth;
-    H = window.innerHeight;
-    canvas.width = Math.round(W * DPR);
-    canvas.height = Math.round(H * DPR);
-    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
-    initStars();
+  function rand(min, max) {
+    return min + Math.random() * (max - min);
   }
 
   function initStars() {
-    const count = Math.round(STARS * (W * H) / (1920 * 1080));
     stars = [];
-    for (let i = 0; i < count; i++) {
-      stars.push({
-        x: Math.random() * W,
-        y: Math.random() * H,
-        r: Math.random() * 1.3 + 0.2,
-        base: Math.random() * Math.PI * 2,
-        speed: 0.4 + Math.random() * 2.4,
-        depth: 0.3 + Math.random() * 0.7
+    for (var l = 0; l < LAYERS; l++) {
+      stars.push([]);
+      for (var i = 0; i < STAR_COUNT; i++) {
+        stars[l].push({
+          x: Math.random(),
+          y: Math.random(),
+          r: rand(0.4, 1.6) * (0.4 + l * 0.4),
+          a: rand(0.3, 1),
+          tw: rand(0.5, 2.5),   // twinkle speed
+          ph: rand(0, Math.PI * 2)
+        });
+      }
+    }
+    twinkle = [];
+    for (var k = 0; k < 200; k++) {
+      twinkle.push({
+        x: Math.random(),
+        y: Math.random(),
+        r: rand(0.2, 0.7),
+        ph: rand(0, Math.PI * 2),
+        sp: rand(1, 4)
       });
     }
   }
 
-  // Draw a faint lensed glow ring just outside the horizon
-  function drawPhotonRing(cx, cy, R) {
-    const grad = ctx.createRadialGradient(cx, cy, R * 0.72, cx, cy, R * 1.15);
-    grad.addColorStop(0, 'rgba(0,0,0,0)');
-    grad.addColorStop(0.55, 'rgba(255,214,150,0.06)');
-    grad.addColorStop(0.82, 'rgba(255,240,210,0.95)');
-    grad.addColorStop(0.92, 'rgba(255,210,150,0.85)');
-    grad.addColorStop(1, 'rgba(255,180,120,0.0)');
+  // ---------- black hole geometry ----------
+  // We render the accretion disk as an ellipse (tilted ring) around the hole.
+  var BH = {
+    x: 0, y: 0,
+    r: 0,                 // black disk radius
+    ringR: 0,             // outer photon ring radius
+    diskOuter: 0,         // outer accretion disk radius
+    tilt: 0.32,           // y-axis squish (viewing angle)
+    rot: 0                // disk rotation phase (radians)
+  };
+
+  function layout() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W * DPR;
+    canvas.height = H * DPR;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    var scale = Math.min(W, H);
+    BH.x = W / 2;
+    BH.y = H / 2;
+    BH.r = scale * 0.075;
+    BH.ringR = BH.r * 1.55;
+    BH.diskOuter = BH.r * 4.2;
+  }
+
+  // ---------- drawing ----------
+  function drawStars(t) {
+    for (var l = 0; l < LAYERS; l++) {
+      // deeper layers drift slower -> subtle parallax
+      var drift = l * 3;
+      for (var i = 0; i < stars[l].length; i++) {
+        var s = stars[l][i];
+        var x = (s.x * W - t * drift) % W;
+        if (x < 0) x += W;
+        var tw = 0.6 + 0.4 * Math.sin(t * s.tw + s.ph);
+        ctx.globalAlpha = s.a * tw;
+        ctx.fillStyle = '#ffffff';
+        ctx.beginPath();
+        ctx.arc(x, s.y * H, s.r, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    // small random twinkles near the top (sparser field)
+    ctx.globalAlpha = 1;
+  }
+
+  function drawBlackHole(t) {
+    var bx = BH.x, by = BH.y;
+    var r = BH.r;
+    var ring = BH.ringR;
+    var outer = BH.diskOuter;
+    BH.rot += 0.004; // continuous rotation
+
+    // --- accretion disk: a few stacked elliptical bands with gradients ---
+    // Use a radial+linear gradient clipped to an ellipse to fake the heated disk.
+    for (var band = 0; band < 14; band++) {
+      var f = band / 14;                       // 0 (inner) -> 1 (outer)
+      var rad = ring + (outer - ring) * (f * f); // denser heat near the hole
+      var halfW = rad;
+      var halfH = rad * BH.tilt;
+
+      var grad = ctx.createLinearGradient(
+        bx - halfW, by,
+        bx + halfW, by
+      );
+
+      if (f < 0.5) {
+        // hot inner disk: bright yellow-white through orange to deep red
+        grad.addColorStop(0, 'rgba(255,255,255,0.0)');
+        grad.addColorStop(0.25, 'rgba(255,255,255,0.0)');
+        grad.addColorStop(0.5, 'rgba(255,240,200,0.95)');
+        grad.addColorStop(0.85, 'rgba(255,140,40,0.6)');
+        grad.addColorStop(1, 'rgba(255,60,20,0.15)');
+      } else {
+        // cooler outer disk: red/dark fading into the void
+        grad.addColorStop(0, 'rgba(255,90,30,0.0)');
+        grad.addColorStop(0.2, 'rgba(255,90,30,0.0)');
+        grad.addColorStop(0.45, 'rgba(255,80,30,0.5)');
+        grad.addColorStop(1, 'rgba(60,10,5,0.0)');
+      }
+
+      ctx.save();
+      ctx.translate(bx, by);
+      ctx.rotate(BH.rot * (1.6 - f));          // differential rotation
+      ctx.globalAlpha = 0.5;
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.ellipse(0, 0, halfW, halfH, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    // --- photon ring: bright glowing circle just outside the black disk ---
+    var ringGrad = ctx.createRadialGradient(bx, by, r * 0.9, bx, by, ring);
+    ringGrad.addColorStop(0, 'rgba(255,220,150,0)');
+    ringGrad.addColorStop(0.55, 'rgba(255,230,180,0.25)');
+    ringGrad.addColorStop(0.78, 'rgba(255,255,230,0.95)');
+    ringGrad.addColorStop(0.88, 'rgba(255,220,150,0.6)');
+    ringGrad.addColorStop(1, 'rgba(255,200,120,0)');
     ctx.save();
-    ctx.translate(cx, cy);
-    ctx.scale(1, 0.55 + 0.15 * Math.sin(Date.now() / 1400));
-    ctx.translate(-cx, -cy);
+    ctx.globalAlpha = 0.9;
+    ctx.fillStyle = ringGrad;
     ctx.beginPath();
-    ctx.arc(cx, cy, R * 1.15, 0, Math.PI * 2);
-    ctx.fillStyle = grad;
+    ctx.arc(bx, by, ring, 0, Math.PI * 2);
     ctx.fill();
     ctx.restore();
+
+    // --- black event horizon ---
+    var holeGrad = ctx.createRadialGradient(bx, by, 0, bx, by, r);
+    holeGrad.addColorStop(0, '#000000');
+    holeGrad.addColorStop(0.75, '#000000');
+    holeGrad.addColorStop(0.97, '#0a0a0a');
+    holeGrad.addColorStop(1, '#1a1208'); // dark rim meeting the ring
+    ctx.fillStyle = holeGrad;
+    ctx.beginPath();
+    ctx.arc(bx, by, r, 0, Math.PI * 2);
+    ctx.fill();
   }
 
-  // Accretion disk: concentric gradient rings drawn as an ellipse
-  function drawAccretionDisk(cx, cy) {
-    const t = Date.now() / 12000;
-    const scaleY = 1 - cfg.diskTilt; // squash -> tilt illusion
-
-    ctx.save();
-    ctx.translate(cx, cy);
-    ctx.scale(1, scaleY);
-
-    const outer = cfg.diskOuter * Math.min(W, H);
-    const inner = cfg.diskInner * Math.min(W, H);
-
-    // Draw from outer to inner so brighter inner layers sit on top
-    const steps = 90;
-    for (let i = steps; i >= 1; i--) {
-      const f = i / steps;
-      const r = inner + (outer - inner) * f;
-
-      // Doppler-ish brightness: brighter on one side of the disk
-      const doppler = 0.8 + 0.35 * f * Math.sin(f * Math.PI * 4 + t * 2);
-
-      // Build a ring sector style gradient along the radius
-      const g = ctx.createRadialGradient(0, 0, r * 0.55, 0, 0, r * 1.05);
-      const hot = 'rgba(255,180,90,';
-      const warm = 'rgba(200,110,60,';
-      const cold = 'rgba(90,60,120,';
-
-      const a = cfg.diskAlpha * f * 0.9;
-      g.addColorStop(0, cold + (a * 0.55 * doppler) + ')');
-      g.addColorStop(0.45, warm + (a * 0.8 * doppler) + ')');
-      g.addColorStop(0.75, hot + (a * doppler) + ')');
-      g.addColorStop(1, 'rgba(0,0,0,0)');
-
-      ctx.beginPath();
-      ctx.arc(0, 0, r, 0, Math.PI * 2);
-      ctx.fillStyle = g;
-      ctx.fill();
-    }
-
-    // Subtle motion shimmer lines
-    ctx.globalCompositeOperation = 'lighter';
-    for (let k = 0; k < 40; k++) {
-      const rr = inner + (outer - inner) * (k / 40);
-      ctx.strokeStyle = 'rgba(255,220,160,0.06)';
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.arc(0, 0, rr, t + k * 0.3, t + k * 0.3 + 1.6);
-      ctx.stroke();
-    }
-    ctx.restore();
-  }
-
-  function draw(t) {
-    // Clear with black
-    ctx.fillStyle = '#000';
+  function frame(t) {
+    var time = t / 1000;
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = '#000000';
     ctx.fillRect(0, 0, W, H);
 
-    const cx = W / 2;
-    const cy = H / 2;
-    const minDim = Math.min(W, H);
+    drawStars(time);
+    drawBlackHole(time);
 
-    // ---- Starfield ----
-    for (let i = 0; i < stars.length; i++) {
-      const s = stars[i];
-      const tw = 0.5 + 0.5 * Math.sin(t * 0.001 * s.speed + s.base);
-      const alpha = (0.35 + 0.65 * tw) * s.depth;
-      ctx.fillStyle = 'rgba(255,255,255,' + alpha.toFixed(3) + ')';
-      ctx.beginPath();
-      ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
-      ctx.fill();
-    }
-
-    // ---- Accretion disk (behind the black hole / photon ring) ----
-    drawAccretionDisk(cx, cy);
-
-    // ---- Photon ring ----
-    drawPhotonRing(cx, cy, cfg.photonR * minDim);
-
-    // ---- Event horizon: pure black circle ----
-    const horizon = cfg.horizonR * minDim;
-    ctx.fillStyle = '#000';
-    ctx.beginPath();
-    ctx.arc(cx, cy, horizon, 0, Math.PI * 2);
-    ctx.fill();
-
-    // Thin edge glow hugging the horizon for definition
-    const rim = ctx.createRadialGradient(cx, cy, horizon * 0.85, cx, cy, horizon * 1.06);
-    rim.addColorStop(0, 'rgba(0,0,0,0)');
-    rim.addColorStop(0.85, 'rgba(255,200,130,0.55)');
-    rim.addColorStop(1, 'rgba(255,160,90,0)');
-    ctx.fillStyle = rim;
-    ctx.beginPath();
-    ctx.arc(cx, cy, horizon * 1.06, 0, Math.PI * 2);
-    ctx.fill();
-
-    // Slight soft glow around the whole system
-    const halo = ctx.createRadialGradient(cx, cy, horizon, cx, cy, minDim * 0.9);
-    halo.addColorStop(0, 'rgba(40,20,10,0.25)');
-    halo.addColorStop(1, 'rgba(0,0,0,0)');
-    ctx.fillStyle = halo;
-    ctx.beginPath();
-    ctx.arc(cx, cy, minDim * 0.9, 0, Math.PI * 2);
-    ctx.fill();
-
-    requestAnimationFrame(draw);
+    requestAnimationFrame(frame);
   }
 
-  window.addEventListener('resize', resize);
-  resize();
-  requestAnimationFrame(draw);
+  // ---------- responsiveness ----------
+  function onResize() {
+    layout();
+    initStars();
+  }
+  window.addEventListener('resize', onResize);
+  window.addEventListener('orientationchange', onResize);
+
+  onResize();
+  requestAnimationFrame(frame);
 })();
 </script>
 </body>
