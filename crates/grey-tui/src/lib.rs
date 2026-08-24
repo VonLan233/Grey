@@ -1093,12 +1093,19 @@ impl AppState {
         (self.total_input_tokens, self.total_output_tokens)
     }
 
-    /// Folded display text: tool blocks collapsed by default.
+    /// Folded display text: tool blocks + LLM path lists collapsed by default.
     fn folded_output(&self) -> String {
-        let mut out = String::new();
+        let (s, _) = self.folded_with_order();
+        s
+    }
+
+    fn folded_with_order(&self) -> (String, Vec<u64>) {
+        // Pass 1: tool blocks
+        let mut intermediate = String::new();
+        let mut order: Vec<u64> = Vec::new();
         let mut rest = self.output.as_str();
         while let Some(start) = rest.find('\x01') {
-            out.push_str(&rest[..start]);
+            intermediate.push_str(&rest[..start]);
             let after = &rest[start + 1..];
             if let Some(id_end) = after.find('\x01') {
                 let id_str = &after[..id_end];
@@ -1107,16 +1114,17 @@ impl AppState {
                     let end_marker = format!("\x02{id}\x02");
                     if let Some(end_pos) = rest[block_start..].find(&end_marker) {
                         let block_content = &rest[block_start..block_start + end_pos];
+                        order.push(id);
                         if self.expanded_blocks.contains(&id) {
                             let mut lines = block_content.split('\n');
                             if let Some(first) = lines.next() {
-                                out.push_str("▾ ");
-                                out.push_str(first);
-                                out.push('\n');
+                                intermediate.push_str("▾ ");
+                                intermediate.push_str(first);
+                                intermediate.push('\n');
                             }
                             for line in lines {
-                                out.push_str(line);
-                                out.push('\n');
+                                intermediate.push_str(line);
+                                intermediate.push('\n');
                             }
                         } else {
                             let title = block_content
@@ -1129,9 +1137,9 @@ impl AppState {
                                 .filter(|l| !l.is_empty() && !l.starts_with("[tool:"))
                                 .count();
                             if count > 0 {
-                                out.push_str(&format!("▸ {title} ({} lines)\n", count));
+                                intermediate.push_str(&format!("▸ {title} ({} lines)\n", count));
                             } else {
-                                out.push_str(&format!("▸ {title}\n"));
+                                intermediate.push_str(&format!("▸ {title}\n"));
                             }
                         }
                         rest = &rest[block_start + end_pos + end_marker.len()..];
@@ -1139,12 +1147,51 @@ impl AppState {
                     }
                 }
             }
-            out.push('\x01');
+            intermediate.push('\x01');
             rest = &rest[start + 1..];
         }
-        out.push_str(rest);
-        // strip stray markers
-        out.replace('\x02', "")
+        intermediate.push_str(rest);
+        intermediate = intermediate.replace('\x02', "");
+        // Pass 2: LLM bare path lists (consecutive path lines) — also collapsible
+        let lines: Vec<&str> = intermediate.split('\n').collect();
+        let mut out = String::new();
+        let mut i = 0;
+        while i < lines.len() {
+            if is_path_line(lines[i]) {
+                let start = i;
+                while i < lines.len() && is_path_line(lines[i]) {
+                    i += 1;
+                }
+                let block_len = i - start;
+                if block_len >= 3 {
+                    let block_content = lines[start..i].join("\n");
+                    let id = llm_block_id(&block_content);
+                    order.push(id);
+                    if self.expanded_blocks.contains(&id) {
+                        out.push_str(&format!("▾ {} files\n", block_len));
+                        for l in &lines[start..i] {
+                            out.push_str(l);
+                            out.push('\n');
+                        }
+                    } else {
+                        out.push_str(&format!("▸ {} files ({} lines)\n", block_len, block_len));
+                    }
+                    continue;
+                } else {
+                    for l in &lines[start..i] {
+                        out.push_str(l);
+                        out.push('\n');
+                    }
+                    continue;
+                }
+            }
+            out.push_str(lines[i]);
+            if i + 1 < lines.len() {
+                out.push('\n');
+            }
+            i += 1;
+        }
+        (out, order)
     }
 
     fn toggle_block(&mut self, id: u64) {
@@ -1155,32 +1202,18 @@ impl AppState {
     }
 
     fn toggle_last_block(&mut self) {
+        let (_, order) = self.folded_with_order();
+        if let Some(&id) = order.last() {
+            self.toggle_block(id);
+            return;
+        }
         if let Some(id) = self.last_block_id {
             self.toggle_block(id);
         }
     }
 
     fn ordered_block_ids(&self) -> Vec<u64> {
-        let mut ids = Vec::new();
-        let mut rest = self.output.as_str();
-        while let Some(start) = rest.find('\x01') {
-            let after = &rest[start + 1..];
-            if let Some(id_end) = after.find('\x01') {
-                if let Ok(id) = after[..id_end].parse::<u64>() {
-                    let block_start = start + 1 + id_end + 1;
-                    let end_marker = format!("\x02{id}\x02");
-                    if rest[block_start..].contains(&end_marker) {
-                        ids.push(id);
-                        if let Some(pos) = rest[block_start..].find(&end_marker) {
-                            rest = &rest[block_start + pos + end_marker.len()..];
-                            continue;
-                        }
-                    }
-                }
-            }
-            rest = &rest[start + 1..];
-        }
-        ids
+        self.folded_with_order().1
     }
 
     /// Handle mouse click in conversation area; returns true if a fold was toggled.
@@ -1193,8 +1226,7 @@ impl AppState {
         }
         let width = rects.conversation.width.max(1) as usize;
         let target_wrap_row = (row - rects.conversation.y) as u32 + self.scroll as u32;
-        let folded = self.folded_output();
-        let ordered = self.ordered_block_ids();
+        let (folded, ordered) = self.folded_with_order();
         let mut wrap_row: u32 = 0;
         let mut title_idx = 0usize;
         for line in folded.split('\n') {
@@ -2405,6 +2437,34 @@ fn render_completion_popup(
     Some(area)
 }
 
+fn llm_block_id(content: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    content.hash(&mut h);
+    // avoid collision with tool ids (small ints) by offsetting to high range
+    h.finish() % 900_000 + 1_000_000_000
+}
+
+fn is_path_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // strip common list prefixes
+    let stripped = trimmed
+        .trim_start_matches(|c| matches!(c, '-' | '*' | '•'))
+        .trim_start_matches(|c: char| c.is_ascii_digit())
+        .trim_start_matches(|c| matches!(c, '.' | ')'))
+        .trim();
+    if stripped.is_empty() {
+        return false;
+    }
+    // first token after prefix should be a path
+    let first_tok = stripped.split_whitespace().next().unwrap_or("");
+    is_path_token(first_tok)
+}
+
 fn is_path_token(token: &str) -> bool {
     // strip trailing punctuation
     let t = token.trim_matches(|c: char| {
@@ -2824,10 +2884,12 @@ fn read_input(stop: Arc<AtomicBool>, sender: mpsc::Sender<InputMessage>) {
                             column: mouse.column,
                             row: mouse.row,
                         }),
-                        MouseEventKind::Down(_) => Some(InputMessage::Click {
-                            column: mouse.column,
-                            row: mouse.row,
-                        }),
+                        MouseEventKind::Down(_) | MouseEventKind::Up(_) => {
+                            Some(InputMessage::Click {
+                                column: mouse.column,
+                                row: mouse.row,
+                            })
+                        }
                         _ => None,
                     };
                     if let Some(message) = message {
@@ -4326,5 +4388,32 @@ mod tests {
         assert!(!is_path_token("v0.1.1"));
         assert!(!is_path_token("hello"));
         assert!(!is_path_token("world,"));
+    }
+
+    #[test]
+    fn llm_path_list_is_folded_by_default() {
+        let mut state = AppState::default();
+        // Simulate LLM delta that lists files as plain text
+        state.append_output(
+            "Here are files:\ncrates/grey-core/src/lib.rs\ncrates/grey-tui/src/lib.rs\ncrates/grey-tools/src/lib.rs\nDone.\n",
+        );
+        let folded = state.folded_output();
+        assert!(
+            folded.contains("▸ 3 files"),
+            "LLM list should be collapsed, got {folded:?}"
+        );
+        assert!(
+            !folded.contains("crates/grey-core"),
+            "collapsed hides paths"
+        );
+        // expand via toggle
+        let (_, order) = state.folded_with_order();
+        let id = *order.last().unwrap();
+        state.toggle_block(id);
+        let expanded = state.folded_output();
+        assert!(
+            expanded.contains("crates/grey-core"),
+            "expanded shows paths"
+        );
     }
 }
