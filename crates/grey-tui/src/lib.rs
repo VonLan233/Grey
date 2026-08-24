@@ -975,11 +975,12 @@ pub struct AppState {
     popup_rect: Option<Rect>,
     last_layout: Option<LayoutRects>,
     input_scroll_manual: bool,
-    // Tool log folding: default collapsed, expand on click/Ctrl+E
+    // Tool log folding: default collapsed, expand on click/Ctrl+E/Ctrl+O + Up/Down nav (Pi/Opencode style)
     expanded_blocks: std::collections::HashSet<u64>,
     next_block_id: u64,
     pending_block_id: Option<u64>,
     last_block_id: Option<u64>,
+    selected_fold: Option<usize>,
 }
 
 #[allow(dead_code)]
@@ -1035,6 +1036,7 @@ impl Default for AppState {
             next_block_id: 0,
             pending_block_id: None,
             last_block_id: None,
+            selected_fold: None,
         }
     }
 }
@@ -1115,10 +1117,13 @@ impl AppState {
                     if let Some(end_pos) = rest[block_start..].find(&end_marker) {
                         let block_content = &rest[block_start..block_start + end_pos];
                         order.push(id);
+                        let is_selected = self.selected_fold == Some(order.len() - 1);
+                        let collapsed_marker = if is_selected { "▶ " } else { "▸ " };
+                        let expanded_marker = if is_selected { "▼ " } else { "▾ " };
                         if self.expanded_blocks.contains(&id) {
                             let mut lines = block_content.split('\n');
                             if let Some(first) = lines.next() {
-                                intermediate.push_str("▾ ");
+                                intermediate.push_str(expanded_marker);
                                 intermediate.push_str(first);
                                 intermediate.push('\n');
                             }
@@ -1137,9 +1142,12 @@ impl AppState {
                                 .filter(|l| !l.is_empty() && !l.starts_with("[tool:"))
                                 .count();
                             if count > 0 {
-                                intermediate.push_str(&format!("▸ {title} ({} lines)\n", count));
+                                intermediate.push_str(&format!(
+                                    "{collapsed_marker}{title} ({} lines)\n",
+                                    count
+                                ));
                             } else {
-                                intermediate.push_str(&format!("▸ {title}\n"));
+                                intermediate.push_str(&format!("{collapsed_marker}{title}\n"));
                             }
                         }
                         rest = &rest[block_start + end_pos + end_marker.len()..];
@@ -1167,14 +1175,20 @@ impl AppState {
                     let block_content = lines[start..i].join("\n");
                     let id = llm_block_id(&block_content);
                     order.push(id);
+                    let is_selected = self.selected_fold == Some(order.len() - 1);
+                    let collapsed_marker = if is_selected { "▶ " } else { "▸ " };
+                    let expanded_marker = if is_selected { "▼ " } else { "▾ " };
                     if self.expanded_blocks.contains(&id) {
-                        out.push_str(&format!("▾ {} files\n", block_len));
+                        out.push_str(&format!("{expanded_marker}{} files\n", block_len));
                         for l in &lines[start..i] {
                             out.push_str(l);
                             out.push('\n');
                         }
                     } else {
-                        out.push_str(&format!("▸ {} files ({} lines)\n", block_len, block_len));
+                        out.push_str(&format!(
+                            "{collapsed_marker}{} files ({} lines)\n",
+                            block_len, block_len
+                        ));
                     }
                     continue;
                 } else {
@@ -1216,6 +1230,42 @@ impl AppState {
         self.folded_with_order().1
     }
 
+    fn move_fold_selection(&mut self, delta: i32) {
+        let order = self.ordered_block_ids();
+        if order.is_empty() {
+            self.selected_fold = None;
+            return;
+        }
+        let next = match self.selected_fold {
+            None => {
+                if delta > 0 {
+                    0
+                } else {
+                    order.len() - 1
+                }
+            }
+            Some(idx) => {
+                let len = order.len() as i32;
+                ((idx as i32 + delta).rem_euclid(len)) as usize
+            }
+        };
+        self.selected_fold = Some(next);
+        self.dirty = true;
+    }
+
+    fn toggle_selected_fold(&mut self) -> bool {
+        let order = self.ordered_block_ids();
+        if order.is_empty() {
+            return false;
+        }
+        let idx = self.selected_fold.unwrap_or(order.len() - 1);
+        if idx < order.len() {
+            self.toggle_block(order[idx]);
+            return true;
+        }
+        false
+    }
+
     /// Handle mouse click in conversation area; returns true if a fold was toggled.
     fn handle_click(&mut self, column: u16, row: u16) -> bool {
         let Some(rects) = self.last_layout else {
@@ -1230,7 +1280,10 @@ impl AppState {
         let mut wrap_row: u32 = 0;
         let mut title_idx = 0usize;
         for line in folded.split('\n') {
-            let is_title = line.starts_with("▸ ") || line.starts_with("▾ ");
+            let is_title = line.starts_with("▸ ")
+                || line.starts_with("▾ ")
+                || line.starts_with("▶ ")
+                || line.starts_with("▼ ");
             let rows = wrap_input_line(line, width).len().max(1) as u32;
             if is_title {
                 if title_idx < ordered.len() {
@@ -1317,6 +1370,7 @@ impl AppState {
         self.expanded_blocks.clear();
         self.pending_block_id = None;
         self.last_block_id = None;
+        self.selected_fold = None;
         self.pending_completion_bell = None;
         self.status = "output cleared".into();
         self.scroll = 0;
@@ -1618,9 +1672,43 @@ impl AppState {
             return UiAction::None;
         }
 
-        // Ctrl+E toggles latest tool block fold (default collapsed)
-        if key.code == KeyCode::Char('e') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.toggle_last_block();
+        // Pi: Ctrl+O (and Ctrl+E alias) toggles selected fold or last (targeted)
+        if (key.code == KeyCode::Char('o') || key.code == KeyCode::Char('e'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            if self.selected_fold.is_some() {
+                self.toggle_selected_fold();
+            } else {
+                self.toggle_last_block();
+            }
+            return UiAction::None;
+        }
+
+        // Opencode/Pi style: when input empty, Up/Down navigates folds
+        if self.input.text.is_empty() && !self.ordered_block_ids().is_empty() {
+            match key.code {
+                KeyCode::Up => {
+                    self.move_fold_selection(-1);
+                    return UiAction::None;
+                }
+                KeyCode::Down => {
+                    self.move_fold_selection(1);
+                    return UiAction::None;
+                }
+                _ => {}
+            }
+        }
+
+        // Enter on empty input with a selected fold toggles it (no submit)
+        if self.selected_fold.is_some()
+            && key.code == KeyCode::Enter
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+            && self.input.text.is_empty()
+            && !self.popup.open
+        {
+            self.toggle_selected_fold();
             return UiAction::None;
         }
 
@@ -2679,7 +2767,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, state: &AppState, theme: &RenderTh
             " {} / {} / 滚轮  滚动消息",
             labels.scroll_up, labels.scroll_down
         )),
-        Line::from(" Ctrl+E / 点击 ▸  展开/收起工具日志"),
+        Line::from(" Up/Down 空输入时浏览折叠  Enter/Ctrl+O 展开/收起 (点击亦可)"),
         Line::from(""),
         Line::from("斜杠命令"),
         Line::from(""),
@@ -4388,6 +4476,33 @@ mod tests {
         assert!(!is_path_token("v0.1.1"));
         assert!(!is_path_token("hello"));
         assert!(!is_path_token("world,"));
+    }
+
+    #[test]
+    fn fold_selection_navigates_and_toggles() {
+        let mut state = AppState::default();
+        for i in 0..2 {
+            state.reduce_agent_event(AgentEvent::ToolStarted(ToolCall {
+                id: format!("c{i}"),
+                name: "glob".into(),
+                arguments: serde_json::json!({}),
+            }));
+            state.reduce_agent_event(AgentEvent::ToolFinished(ToolResult {
+                call_id: format!("c{i}"),
+                name: "glob".into(),
+                success: true,
+                output: "a.rs\nb.rs\nc.rs\n".into(),
+            }));
+        }
+        assert_eq!(state.ordered_block_ids().len(), 2);
+        // Up/Down cycles selection
+        state.reduce_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(state.selected_fold, Some(0));
+        state.reduce_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(state.selected_fold, Some(1));
+        // Enter toggles selected
+        state.reduce_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(state.folded_output().contains("▼") || state.folded_output().contains("▾"));
     }
 
     #[test]
