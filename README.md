@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="https://github.com/VonLan233/Grey/actions/workflows/ci.yml"><img src="https://github.com/VonLan233/Grey/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-  <img src="https://img.shields.io/badge/version-v0.1.0-blue" alt="Version" />
+  <img src="https://img.shields.io/badge/version-v0.1.1-blue" alt="Version" />
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License" />
   <img src="https://img.shields.io/badge/rust-1.97.1-orange" alt="Rust" />
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey" alt="Platform" />
@@ -58,10 +58,11 @@ Grey 是一个用 Rust 写的 Coding Agent Harness：同一套 Core 同时服务
 - OpenAI Chat Completions 兼容协议、Anthropic Messages API、离线 Mock Provider
 - 可靠 SSE 跨分片解析、流式工具调用聚合和错误传播
 
-**省 Token 与成本**
+**省 Token 与成本（v0.1.1 实测）**
+- 空载 `hello`：`1387→1325` input（-4.5%），黑洞页 `24264→10411` input（**-57%**），比同模型 Pi 少 13% input / 70% output；工具描述精简 + `include_usage` 默认开，`deepseek-v4-flash` 现正确计费
 - system / history / tool / input 分区预算、工具输出截断、滚动摘要与可审计裁剪事件
 - SQLite 请求缓存（TTL / LRU / provider 隔离）与 `--no-cache` 控制
-- 每会话 token/cost usage 记录，跨调用累积，`usage show/summary` 查询
+- 每会话 token/cost usage 记录，跨调用累积，`usage show/summary` 查询（`volcano` 已补 `cost_per_1m`）
 
 **多 Provider 与路由**
 - 动态 `[[providers]]` 注册表、planning / coding / fast / default 路由、CLI 覆盖
@@ -120,8 +121,8 @@ grey --help
 也可以直接从 [GitHub Releases](https://github.com/VonLan233/Grey/releases) 下载发布包：
 
 ```bash
-tar -xzf grey-0.1.0-darwin-aarch64.tar.gz
-cp grey-0.1.0-darwin-aarch64/bin/grey /usr/local/bin/grey
+tar -xzf grey-0.1.1-darwin-aarch64.tar.gz
+cp grey-0.1.1-darwin-aarch64/bin/grey /usr/local/bin/grey
 ```
 
 ## CLI 速览
@@ -409,7 +410,7 @@ cargo build --workspace --release --locked
 3. **P4** LSP 语义工具、文档与图片
 4. **P5** ✅ 可定制布局、主题与完成提醒
 5. **P6** ✅ Hook 生命周期、Loop / Goal、插件与性能门禁
-6. **P7** 🚧 跨平台打包与 v1.0 发布（当前 v0.1.0）
+6. **P7** 🚧 跨平台打包与 v1.0 发布（当前 v0.1.1）
 
 ## 许可证
 

@@ -1017,7 +1017,7 @@ dependencies = [
 
 [[package]]
 name = "grey-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1040,7 +1040,7 @@ dependencies = [
 
 [[package]]
 name = "grey-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1064,7 +1064,7 @@ dependencies = [
 
 [[package]]
 name = "grey-lsp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "lsp-types",
@@ -1075,7 +1075,7 @@ dependencies = [
 
 [[package]]
 name = "grey-provider"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1097,7 +1097,7 @@ dependencies = [
 
 [[package]]
 name = "grey-tools"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1118,7 +1118,7 @@ dependencies = [
 
 [[package]]
 name = "grey-tui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "crossterm",
